@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   dmg:
-    runs-on: macos-14
+    runs-on: macos-15 # arm64; macos-14 images are retired ("macos-14-arm64-us-default is not supported")
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
