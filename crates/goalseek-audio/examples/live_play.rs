@@ -21,7 +21,10 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use goalseek_audio::{Output, PlayState, Player, PlayerEvent};
-use goalseek_core::{Core, CoreEvent, Credentials, PlayTicket, SearchHit, Settings};
+use goalseek_core::{Core, CoreEvent, Credentials, PlayTicket, SearchHit, SearchId, Settings};
+
+/// Peers tried before giving up.
+const MAX_CANDIDATES: usize = 5;
 
 fn main() -> ExitCode {
     match run() {
@@ -89,16 +92,123 @@ fn wait_core<T>(
             Err(RecvTimeoutError::Timeout) => {
                 return Err(format!("timed out waiting for {what}"));
             }
-            Err(RecvTimeoutError::Disconnected) => return Err("core stopped".into()),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err("core stopped".into());
+            }
         }
     }
 }
 
-fn pick_flac(hits: &[SearchHit]) -> Option<SearchHit> {
+fn distinct_flac_users(hits: &[SearchHit]) -> usize {
     hits.iter()
         .filter(|h| h.file.extension() == "flac" && h.file.size > 0)
-        .max_by_key(|h| (h.free_slot, h.speed))
+        .map(|h| h.file.username.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+/// Best untried FLAC (free slot, then speed). Users not tried yet come first; users who only
+/// queued us are a last resort (a queue place is per file and another file may start at
+/// once); users who failed or timed out are never retried.
+fn next_candidate(
+    hits: &[SearchHit],
+    tried_files: &BTreeSet<(String, String)>,
+    queued_users: &BTreeSet<String>,
+    bad_users: &BTreeSet<String>,
+) -> Option<SearchHit> {
+    hits.iter()
+        .filter(|h| h.file.extension() == "flac" && h.file.size > 0)
+        .filter(|h| !bad_users.contains(&h.file.username))
+        .filter(|h| !tried_files.contains(&(h.file.username.clone(), h.file.path.clone())))
+        .max_by_key(|h| {
+            (
+                !queued_users.contains(&h.file.username),
+                h.free_slot,
+                h.speed,
+            )
+        })
         .cloned()
+}
+
+/// Why a candidate was given up on.
+enum Skip {
+    /// The peer queued us (place > 0).
+    Queued(u32),
+    /// Failed, timed out or unreachable.
+    Failed(String),
+}
+
+/// How a candidate's transfer got going.
+enum Begun {
+    /// Bytes are arriving: `(bytes, total)` from the first progress event.
+    Progress(u64, u64),
+    /// Already complete (tiny file / fast peer).
+    Done(PathBuf),
+}
+
+/// ▶ one candidate and wait until its peer starts sending. Gives up (and cancels the transfer)
+/// on a remote queue place > 0, a failure, or `timeout` without data.
+fn try_candidate(
+    core: &Core,
+    events: &Receiver<CoreEvent>,
+    hit: &SearchHit,
+    timeout: Duration,
+    t0: Instant,
+    search: SearchId,
+    hits: &mut Vec<SearchHit>,
+) -> Result<(PlayTicket, Begun), Skip> {
+    let ticket = core.play_fetch(&hit.file);
+    let at = || t0.elapsed().as_secs_f64();
+    let end = Instant::now() + timeout;
+    let give_up = |why: Skip| {
+        core.cancel(ticket.id);
+        Err(why)
+    };
+    loop {
+        let Some(left) = end.checked_duration_since(Instant::now()) else {
+            return give_up(Skip::Failed(format!(
+                "no data within {} s",
+                timeout.as_secs()
+            )));
+        };
+        match events.recv_timeout(left) {
+            // Late search results widen the choice for the next attempt.
+            Ok(CoreEvent::SearchResults { search: s, hits: h }) if s == search => {
+                hits.extend(h);
+            }
+            Ok(CoreEvent::TransferQueued { id, .. }) if id == ticket.id => {
+                println!("[{:>6.2}s]   queued locally", at());
+            }
+            Ok(CoreEvent::TransferRemoteQueued { id, place }) if id == ticket.id => {
+                println!("[{:>6.2}s]   remote queue place {place:?}", at());
+                if let Some(p) = place.filter(|&p| p > 0) {
+                    return give_up(Skip::Queued(p));
+                }
+            }
+            Ok(CoreEvent::TransferProgress {
+                id, bytes, total, ..
+            }) if id == ticket.id => {
+                return Ok((ticket, Begun::Progress(bytes, total)));
+            }
+            Ok(CoreEvent::TransferDone { id, path }) if id == ticket.id => {
+                return Ok((ticket, Begun::Done(path)));
+            }
+            Ok(CoreEvent::TransferFailed { id, reason }) if id == ticket.id => {
+                return give_up(Skip::Failed(format!("failed: {reason}")));
+            }
+            Ok(CoreEvent::TransferCancelled { id }) if id == ticket.id => {
+                return Err(Skip::Failed("cancelled".into()));
+            }
+            Ok(CoreEvent::Disconnected { reason, .. }) => {
+                return Err(Skip::Failed(format!("disconnected: {reason:?}")));
+            }
+            Ok(CoreEvent::Error { context, message }) => {
+                eprintln!("core error ({context}): {message}");
+            }
+            Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Err(Skip::Failed("core stopped".into())),
+        }
+    }
 }
 
 fn run() -> Result<(), String> {
@@ -113,6 +223,7 @@ fn run() -> Result<(), String> {
         return Err("GOALSEEK_USER and GOALSEEK_PASS must be set".into());
     };
     let play_secs = env_num("GOALSEEK_PLAY_SECS", 30);
+    let start_secs = env_num("GOALSEEK_START_SECS", 15);
     let search_secs = env_num("GOALSEEK_SEARCH_SECS", 15);
 
     let work = std::env::var_os("GOALSEEK_WORK_DIR").map_or_else(
@@ -142,8 +253,8 @@ fn run() -> Result<(), String> {
         t_login.elapsed().as_secs_f64()
     );
 
-    // Search: take batches until the window closes or a FLAC with a free slot shows up and the
-    // search has run a few seconds.
+    // Search: take batches until the window closes, or (after a few seconds) enough distinct
+    // FLAC users to choose from. The search stays open during the attempts below.
     let t_search = Instant::now();
     let search = core.search(&query);
     let mut hits: Vec<SearchHit> = Vec::new();
@@ -154,39 +265,91 @@ fn run() -> Result<(), String> {
         |ev| match ev {
             CoreEvent::SearchResults { search: s, hits: h } if s == search => {
                 hits.extend(h);
-                let good = hits
-                    .iter()
-                    .any(|h| h.free_slot && h.file.extension() == "flac");
-                (good && t_search.elapsed() > Duration::from_secs(4)).then_some(())
+                (distinct_flac_users(&hits) >= MAX_CANDIDATES
+                    && t_search.elapsed() > Duration::from_secs(4))
+                .then_some(())
             }
             CoreEvent::SearchFinished { search: s, .. } if s == search => Some(()),
             _ => None,
         },
     )
     .or_else(|e| if hits.is_empty() { Err(e) } else { Ok(()) })?;
-    core.cancel_search(search);
-    let hit = pick_flac(&hits).ok_or_else(|| {
-        format!(
+    if distinct_flac_users(&hits) == 0 {
+        core.cancel_search(search);
+        return Err(format!(
             "no FLAC among {} hits for {query:?} after {:.1} s",
             hits.len(),
             t_search.elapsed().as_secs_f64()
-        )
-    })?;
+        ));
+    }
     println!(
-        "picked: {} — {} ({} bytes, free slot {}, speed {} B/s) from {} hits",
-        hit.file.username,
-        hit.file.path,
-        hit.file.size,
-        hit.free_slot,
-        hit.speed,
-        hits.len()
+        "{} hits from {} FLAC users so far; up to {MAX_CANDIDATES} attempts ({start_secs} s start \
+         timeout each)",
+        hits.len(),
+        distinct_flac_users(&hits)
     );
 
-    // ▶
+    // ▶: first candidate whose peer starts sending wins.
     let player = Player::new(Output::Device);
     let player_events = player.subscribe();
     let t_play = Instant::now();
-    let ticket: PlayTicket = core.play_fetch(&hit.file);
+    let mut started = None;
+    let mut tried_files = BTreeSet::new();
+    let (mut queued_users, mut bad_users) = (BTreeSet::new(), BTreeSet::new());
+    for n in 1..=MAX_CANDIDATES {
+        let Some(hit) = next_candidate(&hits, &tried_files, &queued_users, &bad_users) else {
+            println!(
+                "[{:>6.2}s] no untried FLAC candidates left",
+                t_play.elapsed().as_secs_f64()
+            );
+            break;
+        };
+        tried_files.insert((hit.file.username.clone(), hit.file.path.clone()));
+        println!(
+            "[{:>6.2}s] attempt {n}/{MAX_CANDIDATES}: {} — {} ({} bytes, free slot {}, speed {} \
+             B/s; {} FLAC users known)",
+            t_play.elapsed().as_secs_f64(),
+            hit.file.username,
+            hit.file.path,
+            hit.file.size,
+            hit.free_slot,
+            hit.speed,
+            distinct_flac_users(&hits)
+        );
+        let t_attempt = Instant::now();
+        let timeout = Duration::from_secs(start_secs);
+        match try_candidate(&core, &events, &hit, timeout, t_play, search, &mut hits) {
+            Ok((ticket, begun)) => {
+                started = Some((hit, ticket, begun, t_attempt));
+                break;
+            }
+            Err(Skip::Queued(place)) => {
+                println!(
+                    "[{:>6.2}s]   skipped {}: remote queue place {place}",
+                    t_play.elapsed().as_secs_f64(),
+                    hit.file.username
+                );
+                queued_users.insert(hit.file.username);
+            }
+            Err(Skip::Failed(why)) => {
+                println!(
+                    "[{:>6.2}s]   skipped {}: {why}",
+                    t_play.elapsed().as_secs_f64(),
+                    hit.file.username
+                );
+                bad_users.insert(hit.file.username);
+            }
+        }
+    }
+    core.cancel_search(search);
+    let Some((hit, ticket, begun, t_attempt)) = started else {
+        core.logout();
+        return Err(format!(
+            "no candidate started sending ({} attempts)",
+            tried_files.len()
+        ));
+    };
+    println!("peer: {} — {}", hit.file.username, hit.file.path);
     println!("cache path: {}", ticket.part_path.display());
     if ticket.part_path.starts_with(&settings.download_dir)
         || ticket.final_path.starts_with(&settings.download_dir)
@@ -195,9 +358,26 @@ fn run() -> Result<(), String> {
         return Err("play_fetch must target the cache dir, not downloads".into());
     }
 
-    let mut t_first_byte: Option<Instant> = None;
+    let t_first_byte = Instant::now();
     let mut t_first_audio: Option<Instant> = None;
     let mut done_path: Option<PathBuf> = None;
+    match begun {
+        Begun::Progress(bytes, total) => {
+            println!(
+                "[{:>6.2}s] transfer started ({bytes}/{total} B); starting player",
+                t_play.elapsed().as_secs_f64()
+            );
+            player.play(&ticket.final_path, total.max(hit.file.size));
+        }
+        Begun::Done(path) => {
+            println!(
+                "[{:>6.2}s] transfer already complete; starting player",
+                t_play.elapsed().as_secs_f64()
+            );
+            player.play(&path, std::fs::metadata(&path).map_or(0, |m| m.len()));
+            done_path = Some(path);
+        }
+    }
     let mut last_print = Instant::now();
     let deadline_no_audio = Duration::from_secs(120);
     let mut outcome: Result<(), String> = Ok(());
@@ -214,17 +394,7 @@ fn run() -> Result<(), String> {
                     t_play.elapsed().as_secs_f64()
                 );
             }
-            Ok(CoreEvent::TransferProgress {
-                id, bytes, total, ..
-            }) if id == ticket.id => {
-                if t_first_byte.is_none() {
-                    t_first_byte = Some(Instant::now());
-                    println!(
-                        "[{:>6.2}s] transfer started ({bytes}/{total} B); starting player",
-                        t_play.elapsed().as_secs_f64()
-                    );
-                    player.play(&ticket.final_path, total.max(hit.file.size));
-                }
+            Ok(CoreEvent::TransferProgress { id, total, .. }) if id == ticket.id => {
                 if let Some(h) = player.source_handle() {
                     if total > 0 && total != h.total_size() {
                         h.set_total_size(total);
@@ -238,10 +408,6 @@ fn run() -> Result<(), String> {
                     t_play.elapsed().as_secs_f64(),
                     path.display()
                 );
-                if t_first_byte.is_none() {
-                    t_first_byte = Some(Instant::now());
-                    player.play(&path, std::fs::metadata(&path).map_or(0, |m| m.len()));
-                }
                 done_path = Some(path);
             }
             Ok(CoreEvent::TransferFailed { id, reason }) if id == ticket.id => {
@@ -249,10 +415,6 @@ fn run() -> Result<(), String> {
                     "[{:>6.2}s] transfer failed: {reason}",
                     t_play.elapsed().as_secs_f64()
                 );
-                if t_first_byte.is_none() {
-                    outcome = Err(format!("transfer failed before any data: {reason}"));
-                    break;
-                }
                 player.fail_source(reason);
             }
             Ok(CoreEvent::TransferCancelled { id }) if id == ticket.id => {
@@ -279,11 +441,12 @@ fn run() -> Result<(), String> {
                     let now = Instant::now();
                     t_first_audio = Some(now);
                     println!(
-                        "[{:>6.2}s] FIRST AUDIO: {:.2} s after ▶, {:.2} s after first byte \
-                         (duration {:?})",
+                        "[{:>6.2}s] FIRST AUDIO: {:.2} s after first ▶, {:.2} s after ▶ on \
+                         this peer, {:.2} s after its first byte (duration {:?})",
                         t_play.elapsed().as_secs_f64(),
                         (now - t_play).as_secs_f64(),
-                        t_first_byte.map_or(f64::NAN, |t| (now - t).as_secs_f64()),
+                        (now - t_attempt).as_secs_f64(),
+                        (now - t_first_byte).as_secs_f64(),
                         duration_secs
                     );
                 }
@@ -348,11 +511,14 @@ fn run() -> Result<(), String> {
         downloads_after.len(),
         done_path.as_ref().unwrap_or(&ticket.part_path).display()
     );
-    if let (Some(a), Some(b)) = (t_first_audio, t_first_byte) {
+    if let Some(a) = t_first_audio {
         println!(
-            "time-to-first-audio: {:.2} s from ▶ ({:.2} s from first byte)",
+            "time-to-first-audio: {:.2} s from first ▶ ({:.2} s from ▶ on peer {}, {:.2} s from \
+             its first byte)",
             (a - t_play).as_secs_f64(),
-            (a - b).as_secs_f64()
+            (a - t_attempt).as_secs_f64(),
+            hit.file.username,
+            (a - t_first_byte).as_secs_f64()
         );
     }
     outcome

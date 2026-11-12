@@ -606,6 +606,7 @@ fn ticker(ctl: &Ctl) {
             return;
         }
         let g = &ctl.growing;
+        g.refresh();
 
         // Stall detection (only while actually waiting for bytes).
         let threshold = Duration::from_millis(ctl.stall_ms.load(Ordering::SeqCst));

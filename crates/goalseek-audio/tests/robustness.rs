@@ -118,6 +118,21 @@ fn events_are_pushed_in_order_with_position_ticks() {
     );
     assert!((3.0..=5.5).contains(&rate), "tick rate {rate}");
     assert!(ticks.windows(2).all(|w| w[1] >= w[0]), "ticks monotonic");
+    // The download (1 MB/s) finishes long before playback; the buffered fraction must follow
+    // it even though the decoder is held back by the real-time output (regression: it used to
+    // freeze at the decoder's read-ahead point).
+    let full_at = events.iter().find_map(|e| match e {
+        PlayerEvent::PositionTick {
+            position_secs,
+            buffered_fraction,
+        } if *buffered_fraction >= 1.0 => Some(*position_secs),
+        _ => None,
+    });
+    println!("[cp1] buffered_fraction reached 1.0 at position {full_at:?} s");
+    assert!(
+        full_at.is_some_and(|p| p < 2.0),
+        "buffered fraction stale: {full_at:?}"
+    );
     assert!(*ticks.last().unwrap() > 5.0);
     assert!(wakes.load(Ordering::SeqCst) >= events.len());
     assert!(elapsed.as_secs_f64() > 5.5, "played in real time");

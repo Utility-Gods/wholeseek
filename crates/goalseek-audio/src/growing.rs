@@ -98,6 +98,8 @@ struct Shared {
     waiting_since: Mutex<Option<Instant>>,
     failed: Mutex<Option<String>>,
     notice: Mutex<Option<String>>,
+    /// Clone of the reader's fd, so observers can see the file grow while the decoder is idle.
+    watch: Mutex<Option<File>>,
     lock: Mutex<()>,
     wake: Condvar,
 }
@@ -195,6 +197,34 @@ impl GrowingHandle {
             .then(|| lock(&self.0.last_growth).elapsed())
     }
 
+    /// Re-check how much of the file is on disk (cheap `fstat` on the open file). The reader
+    /// only does this when it runs out of data, so observers (the player's ticker) call this to
+    /// keep [`buffered_bytes`](Self::buffered_bytes) current while the decoder is held back by
+    /// the output. Completion is still decided by the reader.
+    pub fn refresh(&self) {
+        if self.is_complete() {
+            return;
+        }
+        let len = match &*lock(&self.0.watch) {
+            Some(f) => match f.metadata() {
+                Ok(m) => m.len(),
+                Err(_) => return,
+            },
+            None => return,
+        };
+        let total = self.total_size();
+        if total != UNKNOWN_SIZE && len > total {
+            *lock(&self.0.notice) = Some(format!(
+                "download larger than announced ({total} B); waiting for completion"
+            ));
+            self.0.total.store(UNKNOWN_SIZE, Ordering::SeqCst);
+        }
+        let avail = len.min(self.total_size());
+        if self.0.buffered.fetch_max(avail, Ordering::SeqCst) < avail {
+            *lock(&self.0.last_growth) = Instant::now();
+        }
+    }
+
     /// Report that the download failed. Reads of already-downloaded bytes still succeed; a read
     /// that would wait for more returns [`SourceFailed`].
     pub fn fail(&self, reason: impl Into<String>) {
@@ -280,6 +310,7 @@ impl GrowingFile {
                 waiting_since: Mutex::new(None),
                 failed: Mutex::new(None),
                 notice: Mutex::new(None),
+                watch: Mutex::new(None),
                 lock: Mutex::new(()),
                 wake: Condvar::new(),
             }),
@@ -343,6 +374,7 @@ impl GrowingFile {
             // Prefer the final file (download complete), then the in-progress part.
             for p in [&self.final_path, &self.part_path] {
                 if let Ok(f) = File::open(p) {
+                    *lock(&self.shared.watch) = f.try_clone().ok();
                     self.file = Some(f);
                     self.file_cursor = None;
                     break;
@@ -361,7 +393,9 @@ impl GrowingFile {
             match std::fs::metadata(&self.final_path) {
                 Ok(m) => {
                     if m.len() > len {
-                        self.file = Some(File::open(&self.final_path)?);
+                        let f = File::open(&self.final_path)?;
+                        *lock(&self.shared.watch) = f.try_clone().ok();
+                        self.file = Some(f);
                         self.file_cursor = None;
                         len = m.len();
                     }
