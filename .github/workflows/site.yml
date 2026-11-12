@@ -1,0 +1,30 @@
+name: Site
+
+# Deploys site/ to Cloudflare Workers (wholeseek.utilitygods.com) on every push
+# to main that touches site/. Needs repo secrets CLOUDFLARE_API_TOKEN (Workers
+# Scripts: Edit + Workers Routes: Edit on utilitygods.com) and CLOUDFLARE_ACCOUNT_ID.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["site/**", ".github/workflows/site.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: site
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: site
+          command: deploy

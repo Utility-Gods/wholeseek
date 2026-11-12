@@ -1,9 +1,14 @@
 // wholeseek.utilitygods.com: static page served by Cloudflare Workers (no server code).
-// Cloudflare Workers Builds deploys this from the repo: root directory "site",
-// deploy command "npx wrangler deploy", build watch path "site/*".
+// Deployed by .github/workflows/site.yml on pushes to main that touch site/.
 {
   "name": "wholeseek-site",
   "compatibility_date": "2026-11-01",
+  // The utilitygods.com zone has a catch-all "*/*" route (the store ingress), which
+  // beats custom domains; the explicit route below is more specific and wins.
+  "routes": [
+    { "pattern": "wholeseek.utilitygods.com", "custom_domain": true },
+    { "pattern": "wholeseek.utilitygods.com/*", "zone_name": "utilitygods.com" }
+  ],
   "assets": {
     "directory": "./public",
     "not_found_handling": "404-page"
