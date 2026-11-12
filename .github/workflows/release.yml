@@ -17,7 +17,7 @@ jobs:
     runs-on: macos-15 # arm64; macos-14 images are retired ("macos-14-arm64-us-default is not supported")
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Rust toolchain (rust-toolchain.toml)
         run: |
@@ -33,7 +33,7 @@ jobs:
         id: dmg
         run: packaging/macos/build-dmg.sh
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ steps.dmg.outputs.name }}
           path: ${{ steps.dmg.outputs.dmg }}
@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Rust toolchain (rust-toolchain.toml)
         run: |
@@ -76,7 +76,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libasound2-dev libdbus-1-dev librsvg2-bin
+            pkg-config libasound2-dev libdbus-1-dev librsvg2-bin \
+            libxkbcommon-dev libxkbcommon-x11-dev # xkbcommon crate links -lxkbcommon
 
       - name: Build tarball
         id: tar
@@ -87,7 +88,7 @@ jobs:
           objdump -T target/release/wholeseek | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
           ldd target/release/wholeseek
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ steps.tar.outputs.name }}
           path: ${{ steps.tar.outputs.tarball }}
