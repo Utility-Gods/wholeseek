@@ -11,7 +11,7 @@ use crate::{H, W, poll, view};
 
 fn rt() -> Runtime<App> {
     let mut rt = Runtime::new(
-        App::demo(),
+        folders_view(App::demo()),
         view::view,
         (W, H),
         Env {
@@ -23,6 +23,21 @@ fn rt() -> Runtime<App> {
     rt.on_key = Some(crate::on_key);
     rt.frame(0.0);
     rt
+}
+
+/// The layout most tests were written against: folders by user, in availability order.
+/// (The album view and relevance order have tests of their own.)
+fn folders_view(mut s: App) -> App {
+    use crate::tabs::{ResultsLayout, SortBy};
+    s.last_filters.layout = ResultsLayout::Folders;
+    s.last_filters.sort = SortBy::Availability;
+    for t in &mut s.tabs {
+        if let Some(st) = t.search_mut() {
+            st.filters.layout = ResultsLayout::Folders;
+            st.filters.sort = SortBy::Availability;
+        }
+    }
+    s
 }
 
 fn run(rt: &mut Runtime<App>, secs: f64) {
@@ -2055,7 +2070,7 @@ fn overflowing(rt: &Runtime<App>, width: f32) -> Vec<String> {
 /// and a user tab, plus `extra` more search tabs.
 fn strip_scene(w: f32, h: f32, scale: f32, extra: usize) -> Runtime<App> {
     let mut rt = Runtime::new(
-        App::demo(),
+        folders_view(App::demo()),
         view::view,
         (w, h),
         Env {
@@ -2583,7 +2598,7 @@ fn user_tabs_list_files_in_the_same_natural_order() {
 /// The "hollow lights" results in a `w`-point-wide window.
 fn searched_at(w: f32) -> Runtime<App> {
     let mut rt = Runtime::new(
-        App::demo(),
+        folders_view(App::demo()),
         view::view,
         (w, 900.0),
         Env {
@@ -2621,7 +2636,7 @@ fn rect_of(rt: &Runtime<App>, key: &str) -> [f32; 4] {
 
 #[test]
 fn the_inspector_opens_on_a_selection_and_closes_with_x_or_esc() {
-    use crate::view::{INSPECTOR_W, TABLE_MAX_W};
+    use crate::view::{INSPECTOR_W, RESULTS_MAX_W};
     let mut rt = searched_at(1920.0);
     assert!(
         rt.find("details").is_none(),
@@ -2630,7 +2645,7 @@ fn the_inspector_opens_on_a_selection_and_closes_with_x_or_esc() {
     assert_eq!(rect_of(&rt, "results")[2], 1920.0, "results get the window");
     let row0 = rect_of(&rt, "row-0");
     assert!(
-        row0[0] + row0[2] <= TABLE_MAX_W + 0.5,
+        row0[0] + row0[2] <= RESULTS_MAX_W + 0.5,
         "the table is capped"
     );
 
@@ -2638,6 +2653,11 @@ fn the_inspector_opens_on_a_selection_and_closes_with_x_or_esc() {
     let d = rect_of(&rt, "details");
     assert_eq!((d[0], d[2]), (1920.0 - INSPECTOR_W, INSPECTOR_W));
     assert_eq!(rect_of(&rt, "row-0"), row0, "the table doesn't move");
+    assert!(
+        d[0] - (row0[0] + row0[2]) <= 150.0,
+        "the table reaches (nearly) to the inspector: gap {}",
+        d[0] - (row0[0] + row0[2])
+    );
 
     click(&mut rt, "details-close");
     assert!(rt.find("details").is_none());
@@ -3176,7 +3196,8 @@ fn tab_order_is_query_filter_chips_results() {
         order.push(focused(&rt).unwrap_or_default());
     }
     assert_eq!(order[0], "filter", "{order:?}");
-    assert!(order[1].starts_with("fmt-"), "{order:?}");
+    assert_eq!(order[1], "sort", "{order:?}");
+    assert!(order[2].starts_with("fmt-"), "{order:?}");
 }
 
 #[test]
@@ -3407,6 +3428,18 @@ fn keep_while_an_album_plays_keeps_the_album_folder_with_the_setting_off() {
     click(&mut rt, "keep");
     assert!(calls(&rt).contains(&Call::Download(lone.clone())));
     assert_eq!(rt.state.download_of(&lone).unwrap().dest, Some(root));
+}
+
+#[test]
+fn set_sort_orders_the_shown_tab_and_new_tabs_follow() {
+    use crate::tabs::SortBy;
+    let mut rt = searched();
+    rt.update(|s, _| {
+        s.run_menu(crate::menu::MenuAction::SetSort(SortBy::Size));
+    });
+    assert_eq!(rt.state.tab().search().unwrap().filters.sort, SortBy::Size);
+    assert_eq!(rt.state.last_filters.sort, SortBy::Size);
+    assert!(rt.state.menu.is_none());
 }
 
 #[test]
@@ -3679,4 +3712,623 @@ fn show_in_list_with_its_tab_closed_uses_another_tab_or_opens_the_folder() {
     assert!(!rt.state.reveal);
     let j = browse_row(&rt, &f);
     assert!(rt.find(&format!("file-{j}/play/eq")).is_some());
+}
+
+// ---- search batch: broadened searches, wishlist, sort --------------------------------------------
+
+#[test]
+fn a_broadened_search_says_what_it_shows_and_keeps_the_typed_title() {
+    let mut rt = searched_at(1280.0);
+    assert!(
+        rt.find("broadened").is_none(),
+        "an ordinary search says nothing"
+    );
+    rt.update(|s, _| s.search_for("hollów lights"));
+    run(&mut rt, 1.6);
+    assert!(!sv(&rt).hits.is_empty(), "found by the broader query");
+    assert_eq!(
+        text_of(&rt, "broadened-to").as_deref(),
+        Some("hollow lights")
+    );
+    assert_eq!(rt.state.tab().title(), "hollów lights");
+    assert_nothing_clipped(&rt, 1280.0);
+}
+
+#[test]
+fn the_star_puts_the_search_on_the_wishlist_and_saves() {
+    let mut rt = searched_at(1280.0);
+    click(&mut rt, "wish");
+    assert!(calls(&rt).contains(&Call::WishlistAdd("hollow lights".into())));
+    assert_eq!(demo_settings(&rt).wishlist, ["hollow lights"]);
+    assert!(
+        store_calls(&rt)
+            .iter()
+            .any(|c| matches!(c, StoreCall::SaveSettings(s) if s.wishlist == ["hollow lights"]))
+    );
+    assert!(
+        rt.state.wished("Hollow  Lights"),
+        "case and spaces don't matter"
+    );
+    click(&mut rt, "wish");
+    assert!(calls(&rt).contains(&Call::WishlistRemove("hollow lights".into())));
+    assert!(demo_settings(&rt).wishlist.is_empty());
+    assert!(
+        store_calls(&rt)
+            .iter()
+            .any(|c| matches!(c, StoreCall::SaveSettings(s) if s.wishlist.is_empty()))
+    );
+}
+
+#[test]
+fn sorting_orders_users_and_folders() {
+    use crate::tabs::SortBy;
+    let rt = searched_at(1280.0);
+    let v = sv(&rt);
+    let sorted_groups = |by: SortBy| {
+        let mut g = v.groups(&crate::tabs::Filters::default());
+        v.sort_groups(&mut g, by);
+        g
+    };
+    let order = |by: SortBy| -> Vec<String> {
+        sorted_groups(by)
+            .iter()
+            .flat_map(|g| {
+                g.folders
+                    .iter()
+                    .map(|(d, _)| d.rsplit('\\').next().unwrap().to_string())
+            })
+            .collect()
+    };
+    let size = |d: &str| -> u64 {
+        v.hits
+            .iter()
+            .filter(|h| h.file.folder().ends_with(d))
+            .map(|h| h.file.size)
+            .sum()
+    };
+    let by_size = order(SortBy::Size);
+    let first_size = size(&by_size[0]);
+    assert!(by_size.iter().all(|d| size(d) <= first_size), "{by_size:?}");
+    let by_name = order(SortBy::Name);
+    let groups = sorted_groups(SortBy::Name);
+    let firsts: Vec<String> = groups
+        .iter()
+        .map(|g| g.folders[0].0.rsplit('\\').next().unwrap().to_lowercase())
+        .collect();
+    let mut sorted = firsts.clone();
+    sorted.sort_by(|a, b| crate::tabs::natural_cmp(a, b));
+    assert_eq!(firsts, sorted, "{by_name:?}");
+    // Every order lists the same folders.
+    let mut all = order(SortBy::Availability);
+    all.sort();
+    for by in SortBy::ALL {
+        let mut o = order(by);
+        o.sort();
+        assert_eq!(o, all, "{by:?}");
+        assert_eq!(SortBy::from_name(by.name()), Some(by));
+    }
+    // Relevance (the default): a folder whose file names hold the words beats one that
+    // only has them in a parent folder.
+    assert_eq!(crate::tabs::Filters::default().sort, SortBy::Relevance);
+}
+
+// ---- the album view ------------------------------------------------------------------------------
+
+/// "hollow lights" in the album view, relevance order (the app's defaults).
+fn albums_at(w: f32) -> Runtime<App> {
+    let mut rt = searched_at(w);
+    rt.update(|s, _| {
+        s.last_filters.layout = crate::tabs::ResultsLayout::Albums;
+        s.last_filters.sort = crate::tabs::SortBy::Relevance;
+        let st = s.tab_mut().search_mut().unwrap();
+        st.filters.layout = crate::tabs::ResultsLayout::Albums;
+        st.filters.sort = crate::tabs::SortBy::Relevance;
+    });
+    run(&mut rt, 0.1);
+    rt
+}
+
+/// The text of the element keyed `key` inside the element keyed `parent`.
+fn text_in(rt: &Runtime<App>, parent: &str, key: &str) -> Option<String> {
+    let p = format!("/{parent}/");
+    rt.elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some(key) && e.path.contains(&p))
+        .and_then(|e| e.text)
+}
+
+fn album_titles(rt: &Runtime<App>) -> Vec<String> {
+    (0..20)
+        .filter_map(|i| text_in(rt, &format!("album-{i}"), "title"))
+        .collect()
+}
+
+fn sort_label(rt: &Runtime<App>) -> Option<String> {
+    rt.elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some("sort"))
+        .and_then(|e| e.label)
+}
+
+#[test]
+fn albums_and_relevance_are_the_defaults() {
+    let f = crate::tabs::Filters::default();
+    assert_eq!(f.layout, crate::tabs::ResultsLayout::Albums);
+    assert_eq!(f.sort, crate::tabs::SortBy::Relevance);
+}
+
+#[test]
+fn the_album_view_merges_copies_and_acts_on_the_best_one() {
+    let mut rt = albums_at(1920.0);
+    let titles = album_titles(&rt);
+    assert!(
+        titles.contains(&"Coastline (2019)".to_string()),
+        "{titles:?}"
+    );
+    assert!(rt.find("columns").is_none(), "no file columns over albums");
+    assert!(rt.find("single-0").is_some(), "single files below");
+    let i = titles.iter().position(|t| t == "Coastline (2019)").unwrap();
+    // Click selects alice's copy: the inspector shows it.
+    click(&mut rt, &format!("album-{i}"));
+    assert_eq!(rt.state.tab().group, Some(("alice".into(), COAST.into())));
+    assert_eq!(
+        text_of(&rt, "details-title").as_deref(),
+        Some("Coastline (2019)")
+    );
+    // ▶ plays the copy in track order; ↓ downloads its folder.
+    click(&mut rt, &format!("album-{i}/play"));
+    let q: Vec<String> = rt
+        .state
+        .queue
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .map(|it| it.file.basename().to_string())
+        .collect();
+    assert_eq!(
+        q.first().map(String::as_str),
+        Some("01 Northern Glass.flac")
+    );
+    assert_eq!(q.len(), 6);
+    click(&mut rt, &format!("album-{i}/download"));
+    assert!(calls(&rt).contains(&Call::DownloadFolder("alice".into(), COAST.into())));
+    assert_nothing_clipped(&rt, 1920.0);
+}
+
+#[test]
+fn chips_and_the_filter_narrow_the_albums() {
+    let mut rt = albums_at(1280.0);
+    let all = album_titles(&rt).len();
+    click(&mut rt, "fmt-mp3");
+    let mp3 = album_titles(&rt);
+    assert!(!mp3.is_empty() && mp3.len() < all, "{mp3:?}");
+    for i in 0..mp3.len() {
+        let meta = text_in(&rt, &format!("album-{i}"), "meta").unwrap();
+        assert!(meta.starts_with("MP3"), "{meta}");
+    }
+    click(&mut rt, "fmt-mp3");
+    type_find(&mut rt, "ferry");
+    assert_eq!(album_titles(&rt), ["Night Ferry EP (2021)"]);
+}
+
+#[test]
+fn the_inspector_lists_other_copies_and_switches_to_one() {
+    let mut rt = albums_at(1920.0);
+    let titles = album_titles(&rt);
+    let i = titles
+        .iter()
+        .position(|t| t.contains("[24-96]"))
+        .expect("the album two users have");
+    assert!(
+        text_in(&rt, &format!("album-{i}"), "meta")
+            .unwrap()
+            .ends_with("2 copies")
+    );
+    click(&mut rt, &format!("album-{i}"));
+    let first = rt.state.tab().group.clone().unwrap();
+    assert!(rt.find("details-copies").is_some());
+    click(&mut rt, "copy-0");
+    let second = rt.state.tab().group.clone().unwrap();
+    assert_ne!(first.0, second.0, "the other user's copy");
+    assert!(rt.find("details").is_some());
+}
+
+#[test]
+fn the_sort_menu_orders_the_albums_and_new_tabs_follow() {
+    let mut rt = albums_at(1280.0);
+    assert_eq!(sort_label(&rt).as_deref(), Some("Sort: Relevance"));
+    click(&mut rt, "sort");
+    let m = rt.state.menu.as_ref().expect("sort menu");
+    assert_eq!(
+        m.ids(),
+        [
+            "sort-relevance",
+            "sort-availability",
+            "sort-size",
+            "sort-length",
+            "sort-name"
+        ]
+    );
+    click(&mut rt, "menu-sort-name");
+    let titles = album_titles(&rt);
+    let mut sorted = titles.clone();
+    sorted.sort_by(|a, b| crate::tabs::natural_cmp(&a.to_lowercase(), &b.to_lowercase()));
+    assert_eq!(titles, sorted);
+    assert_eq!(sort_label(&rt).as_deref(), Some("Sort: Name"));
+    // Folders, then a new tab: both choices carry over.
+    click(&mut rt, "layout-folders");
+    assert!(rt.find("album-0").is_none() && rt.find("folder-0-0").is_some());
+    click(&mut rt, "new-tab");
+    let f = &rt.state.tab().search().unwrap().filters;
+    assert_eq!(
+        (f.layout, f.sort),
+        (
+            crate::tabs::ResultsLayout::Folders,
+            crate::tabs::SortBy::Name
+        )
+    );
+}
+
+// ---- transfers drawer: History (Panels) ------------------------------------------------------
+
+fn history_open() -> Runtime<App> {
+    let mut rt = signed_in();
+    click(&mut rt, "transfers");
+    click(&mut rt, "view-history");
+    run(&mut rt, 0.1);
+    rt
+}
+
+fn history_names(rt: &Runtime<App>) -> Vec<String> {
+    rt.state
+        .hist
+        .rows
+        .iter()
+        .map(|r| crate::history::entry_file(&r.entry).basename().to_string())
+        .collect()
+}
+
+fn history_row_of(rt: &Runtime<App>, name: &str) -> usize {
+    history_names(rt)
+        .iter()
+        .position(|n| n == name)
+        .unwrap_or_else(|| panic!("no history row {name}"))
+}
+
+#[test]
+fn history_lists_past_downloads_newest_first_and_adds_each_that_ends() {
+    let mut rt = history_open();
+    assert_eq!(
+        history_names(&rt),
+        [
+            "03 Quiet Engines.flac",
+            "02 Wire Garden.flac",
+            "01 Paper Moons.flac",
+            "04 Breakwater (live).mp3",
+            "03 Tin Roof.flac",
+            "Hollow Lights - Low Tide Radio.mp3",
+            "A1 Signals.flac",
+        ]
+    );
+    assert!(rt.find("hist-0").is_some());
+    // The deleted file is "missing"; finished ones on disk have no tag.
+    let gone = history_row_of(&rt, "A1 Signals.flac");
+    assert!(!rt.state.hist.rows[gone].on_disk);
+    assert!(rt.find(&format!("hist-{gone}/tag")).is_some());
+    assert!(rt.find("hist-0/tag").is_none());
+
+    // A ↓ that finishes shows on top without reopening; a ▶ play never does.
+    rt.state.search_for("hollow lights");
+    run(&mut rt, 1.6);
+    rt.update(|s, _| s.set_drawer_view(crate::history::DrawerView::History));
+    let (_, f) = row_of(&rt, "alice", "01 Northern Glass.flac");
+    let (_, p) = row_of(&rt, "alice", "02 Salt Roads.flac");
+    rt.update(|s, _| s.play(&p));
+    rt.update(|s, _| {
+        s.download(&f);
+    });
+    run(&mut rt, 12.0);
+    let names = history_names(&rt);
+    assert_eq!(names[0], "01 Northern Glass.flac");
+    assert!(
+        !names.contains(&"02 Salt Roads.flac".to_string()),
+        "plays aren't history"
+    );
+    assert_eq!(
+        rt.state.hist.rows[0].entry.outcome,
+        wholeseek_core::Outcome::Done
+    );
+}
+
+#[test]
+fn history_search_narrows_and_more_pages_in() {
+    let mut rt = history_open();
+    rt.update(|s, _| s.hist.find.replace_text("lantern"));
+    run(&mut rt, 0.1);
+    assert_eq!(rt.state.hist.rows.len(), 4);
+    rt.update(|s, _| s.hist.find.replace_text("NIGHTBUS"));
+    run(&mut rt, 0.1);
+    assert_eq!(history_names(&rt), ["04 Breakwater (live).mp3"]);
+    rt.update(|s, _| s.hist.find.replace_text("zzz"));
+    run(&mut rt, 0.1);
+    assert!(rt.find("no-history").is_some());
+    assert!(!rt.state.hist.more);
+    assert!(rt.find("history-more").is_none());
+}
+
+#[test]
+fn history_rows_remove_retry_and_clear_with_a_confirm() {
+    let mut rt = history_open();
+    // Retry a failed one: a new ↓ of the same remote file.
+    let i = history_row_of(&rt, "03 Tin Roof.flac");
+    let path = rt.state.hist.rows[i].entry.remote_path.clone();
+    click(&mut rt, &format!("hist-{i}/retry"));
+    assert!(
+        calls(&rt)
+            .iter()
+            .any(|c| matches!(c, Call::Download(f) if f.path == path && f.username == "marten_k"))
+    );
+    // Remove one.
+    let id = rt.state.hist.rows[0].entry.id;
+    click(&mut rt, "hist-0/remove");
+    assert!(calls(&rt).contains(&Call::HistoryRemove(id)));
+    assert!(rt.state.hist.rows.iter().all(|r| r.entry.id != id));
+    // Clear asks first; Keep backs out.
+    click(&mut rt, "clear-history");
+    assert!(rt.find("confirm-clear").is_some());
+    click(&mut rt, "keep-history");
+    assert!(!calls(&rt).contains(&Call::HistoryClear));
+    assert!(!rt.state.hist.rows.is_empty());
+    click(&mut rt, "clear-history");
+    click(&mut rt, "confirm-clear-history");
+    assert!(calls(&rt).contains(&Call::HistoryClear));
+    assert!(rt.state.hist.rows.is_empty());
+    assert!(rt.find("no-history").is_some());
+    assert!(rt.find("clear-history").is_none());
+}
+
+#[test]
+fn an_unreadable_history_is_one_line_in_the_view_not_the_banner() {
+    let mut rt = history_open();
+    rt.update(|s, _| {
+        let e = wholeseek_core::CoreEvent::Error {
+            context: "history".into(),
+            message: "bad line 3".into(),
+        };
+        s.history_event(&e);
+        s.apply(e);
+    });
+    run(&mut rt, 0.1);
+    assert!(rt.state.error.is_none());
+    assert!(rt.find("history-error").is_some());
+    click(&mut rt, "view-active");
+    assert!(rt.find("history-error").is_none());
+}
+
+#[test]
+fn user_tab_rows_mark_files_downloaded_before() {
+    let mut rt = searched();
+    let (_, f) = row_of(&rt, "dj_ivo", "Hollow Lights - Low Tide Radio.mp3");
+    rt.update(|s, _| s.open_folder_of(&f));
+    run(&mut rt, 0.8);
+    let j = browse_row(&rt, &f);
+    assert!(rt.find(&format!("file-{j}/downloaded")).is_some());
+    let other = (0..8)
+        .filter(|&i| i != j)
+        .find(|i| rt.find(&format!("file-{i}")).is_some())
+        .expect("another row");
+    assert!(rt.find(&format!("file-{other}/downloaded")).is_none());
+}
+
+#[test]
+fn history_show_in_folder_selects_the_file_in_the_file_manager() {
+    let mut rt = history_open();
+    let local = rt.state.hist.rows[0]
+        .entry
+        .local_path
+        .clone()
+        .expect("done");
+    click(&mut rt, "hist-0/show");
+    assert_eq!(
+        rt.state.desktop_log.borrow().last(),
+        Some(&crate::desktop::DesktopCall::ShowItem(local))
+    );
+    // Gone from disk: no Show in folder, Copy path still.
+    let gone = history_row_of(&rt, "A1 Signals.flac");
+    assert!(rt.find(&format!("hist-{gone}/show")).is_none());
+    assert!(rt.find(&format!("hist-{gone}/copy")).is_some());
+}
+
+#[test]
+fn with_a_drawer_open_results_and_inspector_fit_beside_it() {
+    use crate::tabs::ResultsLayout;
+    let mut fails = Vec::new();
+    for w in [1000.0, 1280.0, 1500.0, 1920.0] {
+        for layout in [ResultsLayout::Albums, ResultsLayout::Folders] {
+            for select in [false, true] {
+                let mut rt = albums_at(w);
+                rt.update(|s, _| {
+                    s.panel = crate::app::Panel::Transfers;
+                    s.tab_mut().search_mut().unwrap().filters.layout = layout;
+                    if select {
+                        s.tab_mut().group = Some(("alice".into(), COAST.into()));
+                    }
+                });
+                run(&mut rt, 0.2);
+                let edge = w - crate::view::DRAWER_W - 1.0;
+                let bad: Vec<String> = rt
+                    .elements()
+                    .into_iter()
+                    .filter(|e| e.path.contains("/results-split/") && e.rect[2] > 0.0)
+                    .filter(|e| e.rect[0] < -0.5 || e.rect[0] + e.rect[2] > edge + 0.5)
+                    .map(|e| format!("{} {:?} {:?}", e.path, e.rect, e.text))
+                    .take(4)
+                    .collect();
+                if !bad.is_empty() {
+                    fails.push(format!(
+                        "{w} {layout:?} selected={select}:\n{}",
+                        bad.join("\n")
+                    ));
+                }
+                if select {
+                    assert!(rt.find("details").is_some(), "{w}: inspector shown");
+                }
+            }
+        }
+    }
+    assert!(fails.is_empty(), "{}", fails.join("\n\n"));
+}
+
+fn key(k: Key) -> KeyEvent {
+    KeyEvent {
+        key: k,
+        mods: Mods::default(),
+    }
+}
+
+fn recent_shown(rt: &Runtime<App>) -> Vec<String> {
+    (0..10)
+        .filter_map(|i| {
+            rt.elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some(&format!("recent-{i}")))
+                .and_then(|e| e.label)
+        })
+        .collect()
+}
+
+/// Searched "hollow lights", "night ferry", then "coastline", with the query box focused.
+fn with_recent() -> Runtime<App> {
+    let mut rt = searched();
+    for q in ["night ferry", "coastline"] {
+        rt.state.search_for(q);
+        run(&mut rt, 0.3);
+    }
+    rt.update(|_, tx| tx.focus("query", true));
+    run(&mut rt, 0.05);
+    rt
+}
+
+#[test]
+fn down_in_the_query_box_lists_recent_searches_newest_first() {
+    let mut rt = with_recent();
+    assert!(rt.find("recent").is_none(), "closed until ↓");
+    press(&mut rt, key(Key::Down));
+    assert_eq!(
+        recent_shown(&rt),
+        ["coastline", "night ferry", "hollow lights"]
+    );
+    press(&mut rt, key(Key::Escape));
+    assert!(rt.find("recent").is_none(), "Esc closes it");
+    // What's typed narrows the list.
+    rt.update(|s, _| s.tab_mut().search_mut().unwrap().edit.replace_text("ni"));
+    press(&mut rt, key(Key::Down));
+    assert_eq!(recent_shown(&rt), ["night ferry"]);
+}
+
+#[test]
+fn arrows_and_enter_search_a_recent_one_again() {
+    let mut rt = with_recent();
+    for _ in 0..3 {
+        press(&mut rt, key(Key::Down)); // open, then the 1st, then the 2nd
+    }
+    press(&mut rt, key(Key::Enter));
+    assert_eq!(calls(&rt).last(), Some(&Call::Search("night ferry".into())));
+    assert_eq!(sv(&rt).query, "night ferry");
+    assert!(rt.find("recent").is_none(), "searching closes the list");
+    assert_eq!(
+        rt.state.recent.items[0], "night ferry",
+        "it moves to the front"
+    );
+    // A click on an entry searches it too.
+    rt.update(|_, tx| tx.focus("query", true));
+    press(&mut rt, key(Key::Down));
+    click(&mut rt, "recent-2");
+    assert_eq!(sv(&rt).query, "hollow lights");
+}
+
+#[test]
+fn recent_searches_can_be_forgotten_one_by_one() {
+    let mut rt = with_recent();
+    press(&mut rt, key(Key::Down));
+    click(&mut rt, "recent-forget-1");
+    assert_eq!(
+        recent_shown(&rt),
+        ["coastline", "hollow lights"],
+        "still open"
+    );
+    press(&mut rt, key(Key::Down)); // highlights "coastline"
+    press(
+        &mut rt,
+        KeyEvent {
+            key: Key::Delete,
+            mods: Mods {
+                shift: true,
+                ..Mods::default()
+            },
+        },
+    );
+    assert_eq!(recent_shown(&rt), ["hollow lights"]);
+    assert_eq!(rt.state.recent.items, ["hollow lights"]);
+    assert_eq!(
+        count_calls(&rt, |c| matches!(c, Call::Search(_))),
+        3,
+        "forgetting doesn't search"
+    );
+}
+
+/// The open menu's rect touches its trigger: it starts within 4 pt below (or above, when
+/// flipped) the trigger, and overlaps it horizontally.
+fn assert_menu_by(rt: &Runtime<App>, trigger: &str) {
+    let b = rect_of(rt, trigger);
+    let m = rect_of(rt, "menu");
+    let below = (m[1] - (b[1] + b[3])).abs() <= 4.0;
+    let above = ((m[1] + m[3]) - b[1]).abs() <= 4.0;
+    let overlaps_x = m[0] < b[0] + b[2] && b[0] < m[0] + m[2];
+    assert!(
+        (below || above) && overlaps_x,
+        "menu {m:?} is not by its trigger {trigger} {b:?}"
+    );
+}
+
+#[test]
+fn every_more_menu_opens_by_its_button_in_both_layouts() {
+    use crate::tabs::ResultsLayout;
+    // Albums (the default): album rows, track rows, then the inspector's tracks.
+    let mut rt = albums_at(1280.0);
+    for key in [
+        "album-more-0",
+        "album-more-2",
+        "single-more-0",
+        "single-more-1",
+    ] {
+        click(&mut rt, key);
+        assert!(rt.state.menu.is_some(), "{key} opens a menu");
+        assert_menu_by(&rt, key);
+        rt.update(|s, _| s.menu = None);
+        run(&mut rt, 0.05);
+    }
+    click(&mut rt, "album-0");
+    click(&mut rt, "track-more-0");
+    assert_menu_by(&rt, "track-more-0");
+    rt.update(|s, _| s.menu = None);
+    // Folders: a file row's and a folder line's ⋯.
+    rt.update(|s, _| s.tab_mut().search_mut().unwrap().filters.layout = ResultsLayout::Folders);
+    run(&mut rt, 0.1);
+    let tab = rt.state.tab().id;
+    let f = sv(&rt).hits[0].file.clone();
+    for key in [
+        crate::view::files_more_key(tab, &f.path),
+        crate::view::files_more_key(tab, f.folder()),
+    ] {
+        rt.update(|s, _| s.tab_mut().group = Some((f.username.clone(), f.folder().to_string())));
+        rt.update(|s, _| s.tab_mut().selected = Some(f.path.clone()));
+        run(&mut rt, 0.05);
+        click(&mut rt, &key);
+        assert!(rt.state.menu.is_some(), "{key} opens a menu");
+        assert_menu_by(&rt, &key);
+        rt.update(|s, _| s.menu = None);
+        run(&mut rt, 0.05);
+    }
 }

@@ -6,11 +6,12 @@ use rune::{Cursor, El, FileDialogOptions, ScrollSpec, col, el, row, text};
 use wholeseek_core::UploadState;
 
 use super::{
-    META, accent, amber, button, field_box, green, hairline, icon_button, icons, input, progress,
-    red, section, tnum,
+    META, accent, amber, field_box, green, hairline, icon_button, icons, input, progress, red,
+    section, tnum,
 };
 use crate::app::{App, Conn, Panel, TState, Transfer};
 use crate::fmt;
+use crate::history::{DrawerView, HistoryRow};
 use crate::menu::MenuAnchor;
 use crate::transfers::{self, TFilter, TGroup};
 
@@ -49,23 +50,7 @@ fn panel(key: &str, title: &str, extra: El, body: El, t: &Theme) -> El {
         )
 }
 
-/// A small text action ("Cancel all").
-fn link(key: &str, label: &str, t: &Theme) -> El {
-    row()
-        .key(key.to_string())
-        .h(22.0)
-        .px(6.0)
-        .center_y()
-        .radius(4.0)
-        .hover(t.hover)
-        .press(t.press)
-        .cursor(Cursor::Pointer)
-        .role("button")
-        .label(label.to_string())
-        .child(text(label.to_string()).font(META).color(t.text_secondary))
-}
-
-/// [`link`] with an icon before its text.
+/// A small text action with an icon before its text ("Cancel all").
 fn link_icon(key: &str, icon: &'static rune::Icon, label: &str, t: &Theme) -> El {
     row()
         .key(key.to_string())
@@ -123,6 +108,9 @@ pub fn transfers(s: &App, t: &Theme) -> El {
         t,
     )
     .on_press(|s: &mut App| s.open_downloads());
+    if s.hist.view == DrawerView::History {
+        return panel("transfers-panel", "Transfers", open, history(s, t), t);
+    }
     let counts = transfers::counts(&s.transfers, &s.drawer.hidden);
     let live = s.live_count();
     let mut body = col().w_full().pb(12.0);
@@ -145,16 +133,17 @@ pub fn transfers(s: &App, t: &Theme) -> El {
                     .grow(1.0),
             )
             .child(
-                button("confirm-cancel-all", "Cancel all", true, t)
+                super::button_icon("confirm-cancel-all", &icons::X, "Cancel all", true, t)
                     .h(24.0)
                     .on_press(|s: &mut App| s.cancel_all()),
             )
             .child(
-                button("keep-transfers", "Keep", false, t)
+                super::button_icon("keep-transfers", &icons::CHECK, "Keep", false, t)
                     .h(24.0)
                     .on_press(|s: &mut App| s.keep_transfers()),
             );
     } else {
+        bar = bar.child(views(s, t)).child(el().grow(1.0));
         if live > 0 {
             bar = bar.child(
                 link_icon("cancel-all", &icons::X, "Cancel all", t)
@@ -250,6 +239,262 @@ pub fn transfers(s: &App, t: &Theme) -> El {
     panel("transfers-panel", "Transfers", open, body, t)
 }
 
+/// Active | History.
+fn views(s: &App, t: &Theme) -> El {
+    let mut seg = row()
+        .key("views")
+        .h(24.0)
+        .px(1.0)
+        .py(1.0)
+        .gap(1.0)
+        .center_y()
+        .radius(5.0)
+        .border(1.0, t.separator);
+    for (key, label, v) in [
+        ("view-active", "Active", DrawerView::Active),
+        ("view-history", "History", DrawerView::History),
+    ] {
+        let on = s.hist.view == v;
+        let mut c = row()
+            .key(key)
+            .h(20.0)
+            .px(8.0)
+            .center_y()
+            .radius(4.0)
+            .cursor(Cursor::Pointer)
+            .role("tab")
+            .label(label)
+            .checked(on)
+            .on_press(move |s: &mut App| s.set_drawer_view(v))
+            .child(
+                text(label)
+                    .font(META)
+                    .color(if on { t.text } else { t.text_secondary }),
+            );
+        c = if on {
+            c.fill(t.hover)
+        } else {
+            c.hover(t.hover)
+        };
+        seg = seg.child(c);
+    }
+    seg
+}
+
+// ---- history -------------------------------------------------------------------------------
+
+fn history(s: &App, t: &Theme) -> El {
+    let h = &s.hist;
+    let mut bar = row()
+        .key("bulk")
+        .h(32.0)
+        .w_full()
+        .px(8.0)
+        .gap(4.0)
+        .center_y();
+    if h.confirm_clear {
+        bar = bar
+            .child(
+                text("Clear the whole history?")
+                    .key("confirm-clear")
+                    .font(type_::LABEL)
+                    .color(t.text)
+                    .grow(1.0)
+                    .help("Files stay on disk"),
+            )
+            .child(
+                super::button_icon("confirm-clear-history", &icons::TRASH_2, "Clear", true, t)
+                    .h(24.0)
+                    .on_press(|s: &mut App| s.history_clear()),
+            )
+            .child(
+                super::button_icon("keep-history", &icons::X, "Keep", false, t)
+                    .h(24.0)
+                    .on_press(|s: &mut App| s.history_keep()),
+            );
+    } else {
+        bar = bar.child(views(s, t)).child(el().grow(1.0));
+        if !h.rows.is_empty() {
+            bar = bar.child(
+                link_icon("clear-history", &icons::TRASH_2, "Clear history", t)
+                    .help("Files stay on disk")
+                    .on_press(|s: &mut App| s.history_clear()),
+            );
+        }
+    }
+    let find = field_box(
+        "history-find",
+        input(&h.find, "Search history", t).on_edit(|s: &mut App| &mut s.hist.find),
+        t,
+    )
+    .w_full();
+    let mut body = col()
+        .w_full()
+        .pb(12.0)
+        .child(bar)
+        .child(row().w_full().px(10.0).pb(8.0).child(find))
+        .child(hairline(t));
+    if let Some(e) = &h.error {
+        body = body.child(
+            text("History unavailable")
+                .key("history-error")
+                .font(META)
+                .color(t.text_secondary)
+                .help(e.clone())
+                .px(14.0)
+                .pt(8.0),
+        );
+    }
+    if h.rows.is_empty() {
+        body = body.child(
+            text(if h.find.text.trim().is_empty() {
+                "No history"
+            } else {
+                "Nothing matches"
+            })
+            .key("no-history")
+            .font(type_::LABEL)
+            .color(t.text_secondary)
+            .px(14.0)
+            .pt(12.0),
+        );
+    }
+    let now = crate::history::unix_now();
+    for (i, r) in h.rows.iter().enumerate() {
+        body = body.child(history_row(i, r, now, t));
+    }
+    if h.more {
+        body = body.child(
+            row().px(8.0).pt(6.0).child(
+                link_icon("history-more", &icons::CHEVRON_DOWN, "Show more", t)
+                    .on_press(|s: &mut App| s.history_more()),
+            ),
+        );
+    }
+    body
+}
+
+fn history_row(i: usize, r: &HistoryRow, now: u64, t: &Theme) -> El {
+    use wholeseek_core::Outcome;
+    let e = &r.entry;
+    let file = crate::history::entry_file(e);
+    let (icon, color): (&'static rune::Icon, _) = match e.outcome {
+        Outcome::Done if r.on_disk => (&icons::CIRCLE_CHECK, green()),
+        Outcome::Done => (&icons::CIRCLE_CHECK, t.text_secondary),
+        Outcome::Failed => (&icons::CIRCLE_ALERT, red()),
+        Outcome::Cancelled => (&icons::CIRCLE_X, t.text_secondary),
+    };
+    let id = e.id;
+    let mut actions = row().gap(1.0).center_y().group_opacity(0.0, 1.0);
+    match (&e.local_path, e.outcome) {
+        (Some(p), Outcome::Done) => {
+            if r.on_disk {
+                let p1 = p.clone();
+                actions = actions.child(
+                    small(
+                        "show",
+                        icons::draw(&icons::FOLDER_OPEN, icons::MD, t.text),
+                        "Show in folder",
+                        t,
+                    )
+                    .on_press(move |s: &mut App| s.desktop.show_item(&p1)),
+                );
+            }
+            let p2 = p.display().to_string();
+            actions = actions.child(
+                small("copy", icons::copy(icons::MD, t.text), "Copy path", t)
+                    .on_press_tx(move |_: &mut App, tx| tx.copy(p2.clone())),
+            );
+        }
+        _ => {
+            actions = actions.child(
+                small(
+                    "retry",
+                    icons::retry(icons::MD, t.text),
+                    "Download again",
+                    t,
+                )
+                .on_press(move |s: &mut App| s.history_retry(id)),
+            );
+        }
+    }
+    actions = actions.child(
+        small(
+            "remove",
+            icons::close(icons::MD, t.text_secondary),
+            "Remove from history",
+            t,
+        )
+        .on_press(move |s: &mut App| s.history_remove(id)),
+    );
+    let mut meta = row()
+        .gap(6.0)
+        .center_y()
+        .child(user_link(&e.username, t))
+        .child(
+            text(format!(
+                "{} · {} · {}",
+                crate::history::ago(e.finished_at, now),
+                fmt::size(e.size),
+                fmt::quality(&file)
+            ))
+            .key("meta")
+            .font(tnum(META))
+            .color(t.text_secondary)
+            .truncate()
+            .shrink()
+            .help(crate::history::utc(e.finished_at)),
+        )
+        .child(el().grow(1.0));
+    let tag = match e.outcome {
+        Outcome::Done if !r.on_disk => Some(
+            text("missing")
+                .help("Moved or deleted since")
+                .color(t.text_secondary),
+        ),
+        Outcome::Failed => Some(
+            text("failed")
+                .help(e.reason.clone().unwrap_or_default())
+                .color(red()),
+        ),
+        Outcome::Cancelled => Some(text("cancelled").color(t.text_secondary)),
+        Outcome::Done => None,
+    };
+    if let Some(tag) = tag {
+        meta = meta.child(tag.key("tag").font(META));
+    }
+    let where_ = match &e.local_path {
+        Some(p) => format!("{}\n{}", fmt::crumbs(&e.remote_path), p.display()),
+        None => fmt::crumbs(&e.remote_path),
+    };
+    col()
+        .key(format!("hist-{i}"))
+        .w_full()
+        .px(10.0)
+        .py(6.0)
+        .gap(3.0)
+        .hover(t.hover)
+        .hover_group()
+        .child(
+            row()
+                .gap(6.0)
+                .center_y()
+                .child(icons::draw(icon, icons::SM, color).key("outcome"))
+                .child(
+                    text(file.basename().to_string())
+                        .key("hist-name")
+                        .font(type_::BODY)
+                        .color(t.text)
+                        .truncate()
+                        .grow(1.0)
+                        .shrink()
+                        .help(where_),
+                )
+                .child(actions),
+        )
+        .child(meta.pl(18.0))
+}
+
 fn group(s: &App, gi: usize, g: &TGroup, t: &Theme) -> El {
     let rows: Vec<&Transfer> = g.rows.iter().map(|&i| &s.transfers[i]).collect();
     let mut out = col().key(format!("group-{gi}")).w_full();
@@ -300,7 +545,8 @@ fn group(s: &App, gi: usize, g: &TGroup, t: &Theme) -> El {
     if finished {
         let (u, d) = (u.clone(), d.clone());
         actions = actions.child(
-            link("clear-group", "Clear", t).on_press(move |s: &mut App| s.clear_group(&u, &d)),
+            link_icon("clear-group", &icons::TRASH_2, "Clear", t)
+                .on_press(move |s: &mut App| s.clear_group(&u, &d)),
         );
     }
     let menu_items = s.group_items(&u, &d);
@@ -649,10 +895,6 @@ fn label(s: impl Into<String>, t: &Theme) -> El {
     text(s.into()).font(type_::BODY).color(t.text).truncate()
 }
 
-fn mini(key: &str, label: &str, t: &Theme) -> El {
-    button(key, label, false, t).h(24.0).px(8.0)
-}
-
 fn disabled(b: El, why: &str, t: &Theme) -> El {
     let _ = t;
     b.disabled(true)
@@ -744,7 +986,7 @@ pub fn settings(s: &App, t: &Theme) -> El {
                         .on_press(|s: &mut App| s.logout(false)),
                 )
                 .child(
-                    mini("forget", "Forget account", t)
+                    mini_icon("forget", &icons::USER_X, "Forget account", t)
                         .help("Remove the saved password")
                         .on_press(|s: &mut App| s.logout(true)),
                 ),
@@ -821,7 +1063,10 @@ pub fn settings(s: &App, t: &Theme) -> El {
                     .color(t.text_secondary)
                     .grow(1.0),
             )
-            .child(link("rescan", "Rescan", t).on_press(|s: &mut App| s.rescan())),
+            .child(
+                link_icon("rescan", &icons::REFRESH_CW, "Rescan", t)
+                    .on_press(|s: &mut App| s.rescan()),
+            ),
     );
     for (i, dir) in cfg.share_dirs.iter().enumerate() {
         let path = dir.display().to_string();
@@ -952,11 +1197,14 @@ pub fn settings(s: &App, t: &Theme) -> El {
                         .grow(1.0),
                 )
                 .child(
-                    button("port-reconnect", "Reconnect", true, t)
+                    super::button_icon("port-reconnect", &icons::REFRESH_CW, "Reconnect", true, t)
                         .h(24.0)
                         .on_press(|s: &mut App| s.confirm_port()),
                 )
-                .child(mini("port-undo", "Undo", t).on_press(|s: &mut App| s.undo_port())),
+                .child(
+                    mini_icon("port-undo", &icons::UNDO_2, "Undo", t)
+                        .on_press(|s: &mut App| s.undo_port()),
+                ),
         );
     }
     panel("settings-panel", "Settings", saved, body, t)
@@ -1045,14 +1293,12 @@ fn port_line(s: &App, t: &Theme) -> El {
             );
         }
     } else {
-        out = out
-            .child(status)
-            .child(
-                link("change-port", "Change", t).on_press_tx(|s: &mut App, tx| {
-                    s.settings_form.port_editing = true;
-                    tx.focus("set-port", true);
-                }),
-            );
+        out = out.child(status).child(
+            link_icon("change-port", &icons::PENCIL, "Change", t).on_press_tx(|s: &mut App, tx| {
+                s.settings_form.port_editing = true;
+                tx.focus("set-port", true);
+            }),
+        );
     }
     out
 }

@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use super::{App, Conn};
 use crate::session::{self, SaveDebouncer, Session, SessionTab};
-use crate::tabs::{BrowseView, Filters, SearchTab, Tab, TabKind, UserTab};
+use crate::tabs::{BrowseView, Filters, ResultsLayout, SearchTab, SortBy, Tab, TabKind, UserTab};
 
 #[derive(Default)]
 pub struct SessionState {
@@ -49,7 +49,8 @@ impl App {
                 filter: st.find.text.clone(),
                 formats: st.filters.formats.iter().map(|f| f.to_string()).collect(),
                 free_slot_only: st.filters.free_slot,
-                sort: None, // results have no sort control
+                sort: Some(st.filters.sort.name().to_string()),
+                layout: Some(layout_name(st.filters.layout).to_string()),
                 selected_group: t.group.as_ref().map(|(u, d)| format!("{u}\n{d}")),
             },
             TabKind::User(u) => SessionTab::User {
@@ -166,6 +167,13 @@ impl App {
     }
 }
 
+fn layout_name(l: ResultsLayout) -> &'static str {
+    match l {
+        ResultsLayout::Albums => "albums",
+        ResultsLayout::Folders => "folders",
+    }
+}
+
 /// A restored tab before anything is fetched.
 fn shell(t: &SessionTab) -> TabKind {
     match t {
@@ -174,10 +182,21 @@ fn shell(t: &SessionTab) -> TabKind {
             filter,
             formats,
             free_slot_only,
+            sort,
+            layout,
             ..
         } => {
+            // Unknown or missing names (older or newer files) keep the defaults.
             let mut filters = Filters {
                 free_slot: *free_slot_only,
+                sort: sort
+                    .as_deref()
+                    .and_then(SortBy::from_name)
+                    .unwrap_or_default(),
+                layout: match layout.as_deref() {
+                    Some("folders") => ResultsLayout::Folders,
+                    _ => ResultsLayout::Albums,
+                },
                 ..Filters::default()
             };
             filters.formats = FORMATS

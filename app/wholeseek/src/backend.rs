@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use wholeseek_core::{
-    Core, CoreEvent, Credentials, DownloadedKeys, PlayTicket, RemoteFile, SearchId, Settings,
-    TransferId,
+    Core, CoreEvent, Credentials, DownloadedKeys, HistoryEntry, HistoryQuery, PlayTicket,
+    RemoteFile, SearchId, Settings, TransferId,
 };
 
 use crate::demo::Call;
@@ -105,6 +105,25 @@ pub trait Backend {
     /// "Downloaded" mark. A shared set; fetch once per frame.
     fn downloaded_keys(&self) -> DownloadedKeys {
         DownloadedKeys::default()
+    }
+    /// Download history, newest first, filtered and paged (`Core::history`).
+    fn history(&self, _query: &HistoryQuery) -> Vec<HistoryEntry> {
+        Vec::new()
+    }
+    /// Forget one history entry; whether it was there.
+    fn history_remove(&mut self, _id: u64) -> bool {
+        false
+    }
+    /// Forget the whole history (files on disk stay).
+    ///
+    /// # Errors
+    /// The history file couldn't be rewritten (memory is cleared anyway).
+    fn history_clear(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    /// Whether a history entry's file is still on disk (a `stat`; visible rows only).
+    fn history_on_disk(&self, entry: &HistoryEntry) -> bool {
+        entry.exists_on_disk()
     }
     /// What happened to a recent search: what was typed, whether it was broadened (and to
     /// what).
@@ -235,6 +254,15 @@ impl Backend for RealBackend {
     }
     fn downloaded_keys(&self) -> DownloadedKeys {
         self.core.downloaded_keys()
+    }
+    fn history(&self, query: &HistoryQuery) -> Vec<HistoryEntry> {
+        self.core.history(query)
+    }
+    fn history_remove(&mut self, id: u64) -> bool {
+        self.core.history_remove(id)
+    }
+    fn history_clear(&mut self) -> Result<(), String> {
+        self.core.history_clear().map_err(|e| e.to_string())
     }
     fn search_info(&self, id: SearchId) -> Option<wholeseek_core::status::SearchInfo> {
         self.core.search_info(id)

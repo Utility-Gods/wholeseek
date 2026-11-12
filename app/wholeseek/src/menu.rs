@@ -58,6 +58,8 @@ pub enum MenuAction {
     Retry(TransferId),
     /// A format folded under "+N": select or unselect it in the shown search tab.
     ToggleFormat(&'static str),
+    /// The sort menu: order the shown search tab's results.
+    SetSort(crate::tabs::SortBy),
     /// A tab folded under the strip's "»": show it.
     ShowTab(usize),
 }
@@ -123,6 +125,7 @@ fn icon_for(id: &str) -> Option<&'static Icon> {
         "open-file" => &icons::EXTERNAL_LINK,
         "retry" => &icons::REFRESH_CW,
         "cancel" => &icons::X,
+        // Sort items: the view puts the check on the current one.
         _ => return None,
     })
 }

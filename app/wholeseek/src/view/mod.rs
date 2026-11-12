@@ -5,6 +5,7 @@
 //! changes at once (`instant_changes`); only hover/press colours move, in 60 ms.
 
 pub(crate) mod album_header;
+mod albums;
 pub(crate) mod art;
 mod details;
 mod files;
@@ -18,7 +19,12 @@ mod search;
 mod strip;
 mod user;
 #[cfg(test)]
-pub use details::{INSPECTOR_W, TABLE_MAX_W};
+pub use details::{INSPECTOR_W, RESULTS_MAX_W};
+pub use search::sort_items;
+
+/// The search batch still in progress (sort menu, album view): off until it is finished, so
+/// a release cut meanwhile shows none of it.
+pub const SEARCH_BATCH: bool = true;
 pub use files::more_key as files_more_key;
 pub use search::MAX_FORMAT_CHIPS;
 #[cfg(test)]
@@ -155,6 +161,9 @@ fn main(s: &App, t: &Theme) -> El {
         .child(body)
         .child(hairline(t))
         .child(player::strip(s, t));
+    if let Some(r) = search::recent_layer(s, t) {
+        page = page.child(r);
+    }
     // Last at the root: a context menu draws over everything and anchors to earlier keys.
     match menu::layer(s, t) {
         Some(m) => page.child(m),
@@ -257,32 +266,7 @@ pub fn icon_button(key: &str, icon: El, t: &Theme) -> El {
         .child(icon)
 }
 
-/// A text button; `primary` fills it with the accent.
-pub fn button(key: &str, label: &str, primary: bool, t: &Theme) -> El {
-    let b = row()
-        .key(key.to_string())
-        .h(28.0)
-        .px(12.0)
-        .center()
-        .radius(4.0)
-        .cursor(Cursor::Pointer)
-        .role("button")
-        .label(label.to_string())
-        .child(
-            text(label.to_string())
-                .font(type_::LABEL)
-                .color(if primary { pal::bg() } else { t.text }),
-        );
-    if primary {
-        b.fill(accent()).hover(hex(0xfdba74)).press(hex(0xf97316))
-    } else {
-        b.fill(t.hover)
-            .hover(t.control_track)
-            .press(t.control_track)
-    }
-}
-
-/// [`button`] with an icon before its label.
+/// A button: an icon, then its label; `primary` fills it with the accent.
 pub fn button_icon(
     key: &str,
     icon: &'static rune::Icon,

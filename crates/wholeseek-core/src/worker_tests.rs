@@ -2373,3 +2373,85 @@ fn history_survives_restart_and_clear_remove_work() {
     let h = harness_with(|st, _| st.data_dir = data.clone());
     assert!(history(&h).is_empty(), "clear persisted");
 }
+
+// ------------------------------------------- folder contents fan-out (covers + downloads)
+
+fn tiny_png() -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(4, 4, image::Rgb([251, 146, 60]));
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+/// Two "Download folder to…" of one folder, asked before the reply: one request each, one
+/// reply, both waiters expanded into their own root, one `FolderContents` event.
+#[test]
+fn one_folder_reply_reaches_every_folder_download() {
+    let mut h = harness();
+    let s = h.online();
+    let (a, b) = (h.tmp.path().join("a"), h.tmp.path().join("b"));
+    h.core.download_folder_to("alice", r"Music\Album", &a);
+    h.core.download_folder_to("alice", r"Music\Album", &b);
+    wait_until("2 requests", || s.st().folder_requests.len() == 2);
+    s.st().folders.insert(
+        ("alice".into(), r"Music\Album".into()),
+        vec![dir(r"Music\Album", &["01.flac", "02.flac"])],
+    );
+    h.want("contents", |e| {
+        matches!(e, CoreEvent::FolderContents { .. })
+    });
+    // Every file of both waiters is queued (the second copy of each is then refused by the
+    // one-transfer-per-file rule, G11 — that is the fetch's business, not the fan-out's).
+    for _ in 0..4 {
+        h.want("queued", |e| matches!(e, CoreEvent::TransferQueued { .. }));
+    }
+    h.none_within(Duration::from_millis(300), |e| {
+        matches!(e, CoreEvent::FolderContents { .. })
+    });
+    assert_eq!(s.st().downloads.len(), 2);
+}
+
+/// Download folder and a cover fetch of the same folder at once: both get the one reply; the
+/// cover image is not fetched twice while the folder download has it in flight.
+#[test]
+fn folder_download_and_cover_fetch_share_the_reply() {
+    let h = harness();
+    let s = h.online();
+    h.core.download_folder("alice", r"Music\Album");
+    h.core.fetch_cover("alice", r"Music\Album", None);
+    wait_until("2 requests", || s.st().folder_requests.len() == 2);
+    s.st().folders.insert(
+        ("alice".into(), r"Music\Album".into()),
+        vec![dir(r"Music\Album", &["01.flac", "cover.jpg"])],
+    );
+    h.want("contents", |e| {
+        matches!(e, CoreEvent::FolderContents { .. })
+    });
+    wait_until("2 folder downloads", || s.st().downloads.len() == 2);
+    h.none_within(Duration::from_millis(300), |e| {
+        matches!(e, CoreEvent::FolderContents { .. })
+    });
+    assert_eq!(
+        s.st().downloads.len(),
+        2,
+        "cover waits for the folder's copy"
+    );
+    let i = s
+        .st()
+        .downloads
+        .iter()
+        .position(|d| d.path.ends_with("cover.jpg"))
+        .unwrap();
+    let png = tiny_png();
+    s.progress(i, &png, png.len() as u64);
+    s.complete(i);
+    // Now the cover fetch gets its own copy, into the cover cache.
+    wait_until("cover download", || s.st().downloads.len() == 3);
+    let covers_dir = h.core.covers().dir().to_path_buf();
+    assert!(s.st().downloads[2].dir.starts_with(&covers_dir));
+    s.progress(2, &png, png.len() as u64);
+    s.complete(2);
+    wait_until("cover ready", || {
+        h.core.covers().cached("alice", r"Music\Album").is_some()
+    });
+}

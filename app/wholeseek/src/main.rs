@@ -13,12 +13,15 @@ mod actions;
 mod app;
 mod backend;
 mod demo;
+mod demo_history;
 mod desktop;
 mod fmt;
+mod history;
 mod menu;
 mod playback;
 mod profile;
 mod queue;
+mod recent;
 mod session;
 mod store;
 mod tabs;
@@ -52,6 +55,7 @@ fn init() -> App {
     }
     let (mut app, tx) = App::real();
     app.enable_session(session::default_path());
+    app.recent = recent::Recent::load(recent::default_path());
     if let Ok(mut slot) = BOOT_TX.lock() {
         *slot = Some(tx);
     }
@@ -281,6 +285,27 @@ fn scene_wide(s: &mut App) {
     tab.group = Some((f.username.clone(), f.folder().to_string()));
 }
 
+/// The album view with the album two users have selected: the inspector lists the other copy.
+fn scene_albums(s: &mut App) {
+    scene_results(s);
+    let f = demo_file("vinyl_rips", "A1 Northern Glass.flac");
+    s.tab_mut().group = Some((f.username.clone(), f.folder().to_string()));
+}
+
+/// The sort menu open over the album view.
+fn scene_sort_menu(s: &mut App) {
+    scene_results(s);
+    let by = s
+        .tab()
+        .search()
+        .map(|st| st.filters.sort)
+        .unwrap_or_default();
+    s.open_menu(
+        crate::menu::MenuAnchor::Key("sort".into()),
+        crate::view::sort_items(by),
+    );
+}
+
 /// Two folders used with "Download to…" before, as the menus then list them.
 fn demo_recent_dirs(s: &mut App) {
     s.commit_settings(|c| {
@@ -297,6 +322,7 @@ fn demo_recent_dirs(s: &mut App) {
 /// A file's ⋯ menu open in the results.
 fn scene_file_menu(s: &mut App) {
     scene_results(s);
+    folders_layout(s);
     demo_recent_dirs(s);
     let f = demo_file("alice", "03 Low Tide Radio.flac");
     let items = crate::menu::file_items(&f, false, &s.backend.settings().recent_download_dirs);
@@ -304,9 +330,26 @@ fn scene_file_menu(s: &mut App) {
     s.open_menu(crate::menu::MenuAnchor::Key(key), items);
 }
 
+/// File and folder ⋯ menus belong to the Folders layout (Albums is the default).
+fn folders_layout(s: &mut App) {
+    if let Some(st) = s.tab_mut().search_mut() {
+        st.filters.layout = crate::tabs::ResultsLayout::Folders;
+    }
+}
+
+/// An album row's ⋯ menu open in the (default) album view.
+fn scene_album_menu(s: &mut App) {
+    scene_results(s);
+    demo_recent_dirs(s);
+    let f = demo_file("alice", "01 Northern Glass.flac");
+    let items = s.folder_menu(&f.username, f.folder());
+    s.open_menu(crate::menu::MenuAnchor::Key("album-more-0".into()), items);
+}
+
 /// A folder line's ⋯ menu open in the results.
 fn scene_folder_menu(s: &mut App) {
     scene_results(s);
+    folders_layout(s);
     demo_recent_dirs(s);
     let folder = demo_file("alice", "02 Salt Roads.flac")
         .folder()
@@ -388,6 +431,12 @@ fn scene_transfers(s: &mut App) {
     s.toggle_panel(Panel::Transfers);
 }
 
+/// The transfers drawer's History: the seeded past downloads under the ones running now.
+fn scene_history(s: &mut App) {
+    scene_transfers(s);
+    s.set_drawer_view(crate::history::DrawerView::History);
+}
+
 /// The user's report: a search tab and a long-named user tab; the right cluster must show.
 fn scene_strip(s: &mut App) {
     s.demo_login();
@@ -448,6 +497,9 @@ fn main() {
         scenes: &[
             ("search-tab", scene_results),
             ("wide", scene_wide),
+            ("albums", scene_albums),
+            ("sort-menu", scene_sort_menu),
+            ("album-menu", scene_album_menu),
             ("jungle", scene_jungle),
             ("file-menu", scene_file_menu),
             ("folder-menu", scene_folder_menu),
@@ -458,6 +510,7 @@ fn main() {
             ("user-tab", scene_browse),
             ("three-tabs", scene_three_tabs),
             ("transfers-drawer", scene_transfers),
+            ("history", scene_history),
             ("player-buffering", scene_player_buffering),
             ("displaced", scene_displaced),
             ("settings", scene_settings),

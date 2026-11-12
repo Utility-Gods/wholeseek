@@ -121,7 +121,13 @@ pub fn view(h: &AlbumHeader, t: &Theme) -> El {
         }
     };
     let (u, d) = (h.username.to_string(), h.folder.to_string());
-    let mut actions = row().key(k("actions")).gap(6.0).center_y();
+    // Wraps onto a second line in a narrow container (the inspector) rather than clip.
+    let mut actions = row()
+        .key(k("actions"))
+        .w_full()
+        .flex_wrap()
+        .gap(6.0)
+        .center_y();
     if h.actions.play && h.files.iter().any(crate::tabs::is_playable) {
         actions = actions.child(
             action(

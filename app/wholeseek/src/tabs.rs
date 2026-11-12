@@ -38,6 +38,29 @@ pub struct SearchTab {
     pub filters: Filters,
     /// "Filter results": narrows the received results locally, per tab.
     pub find: Box<TextEdit>,
+    /// The album grouping of the listed hits, for (search, hit count, filters).
+    pub grouped: std::cell::RefCell<Option<Box<GroupedCache>>>,
+    /// The recent searches list under the query box, when open: `Some(i)` is the
+    /// highlighted entry (↑/↓), among those matching what's typed.
+    pub recent: Option<Option<usize>>,
+}
+
+/// How a search tab lists its results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResultsLayout {
+    /// One row per album (every user's copy merged), then single tracks.
+    #[default]
+    Albums,
+    /// Users, their folders, their files.
+    Folders,
+}
+
+/// [`SearchTab::grouped`]: what it was computed for, and the result.
+pub struct GroupedCache {
+    pub search: SearchId,
+    pub hits: usize,
+    pub filters: Filters,
+    pub grouped: std::rc::Rc<wholeseek_core::group::Grouped>,
 }
 
 impl SearchTab {
@@ -47,7 +70,39 @@ impl SearchTab {
             search: None,
             filters,
             find: Box::new(TextEdit::new("")),
+            grouped: Default::default(),
+            recent: None,
         }
+    }
+
+    /// The listed hits grouped into albums and tracks (cached until the results or the
+    /// filters change), each list in the filters' sort order.
+    pub fn grouped(
+        &self,
+        filters: &Filters,
+    ) -> Option<std::rc::Rc<wholeseek_core::group::Grouped>> {
+        let v = self.search.as_ref()?;
+        if let Some(c) = &*self.grouped.borrow()
+            && c.search == v.id
+            && c.hits == v.hits.len()
+            && &c.filters == filters
+        {
+            return Some(c.grouped.clone());
+        }
+        let shown: Vec<wholeseek_core::SearchHit> = (0..v.hits.len())
+            .filter(|&i| v.shows(i, filters))
+            .map(|i| v.hits[i].clone())
+            .collect();
+        let mut g = wholeseek_core::group::group_hits(&v.query, &shown);
+        sort_grouped(&mut g, filters.sort);
+        let g = std::rc::Rc::new(g);
+        *self.grouped.borrow_mut() = Some(Box::new(GroupedCache {
+            search: v.id,
+            hits: v.hits.len(),
+            filters: filters.clone(),
+            grouped: g.clone(),
+        }));
+        Some(g)
     }
 
     /// Whether the filter box holds any words.
@@ -98,6 +153,8 @@ pub struct RowIndex {
     pub format: Option<&'static str>,
     /// Position of its file name in natural order among all hits (sorting within folders).
     pub name_order: u32,
+    /// [`wholeseek_core::group::relevance`] of its path to the query.
+    pub relevance: u32,
 }
 
 /// Lowercased, accent-folded words of `s`, punctuation as separators and apostrophes
@@ -337,6 +394,62 @@ pub struct Filters {
     pub free_slot: bool,
     /// The filter box (per tab: never carried into a new tab).
     pub text: TextQuery,
+    /// How users and folders are ordered (carried into a new tab like the chips).
+    pub sort: SortBy,
+    /// Albums (merged across users) or folders by user (carried into a new tab too).
+    pub layout: ResultsLayout,
+}
+
+/// The sort menu: how the results' users and folders are ordered. Files inside a folder
+/// always go by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortBy {
+    /// Best match of the query words first (then availability).
+    #[default]
+    Relevance,
+    /// Free slot first, then faster (the core's ranking).
+    Availability,
+    /// Biggest folder first.
+    Size,
+    /// Longest folder first (total duration).
+    Length,
+    /// Folder name, A to Z.
+    Name,
+}
+
+impl SortBy {
+    pub const ALL: [SortBy; 5] = [
+        SortBy::Relevance,
+        SortBy::Availability,
+        SortBy::Size,
+        SortBy::Length,
+        SortBy::Name,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortBy::Relevance => "Relevance",
+            SortBy::Availability => "Availability",
+            SortBy::Size => "Size",
+            SortBy::Length => "Length",
+            SortBy::Name => "Name",
+        }
+    }
+
+    /// Stable name for the saved session (`"relevance"`, …).
+    pub fn name(self) -> &'static str {
+        match self {
+            SortBy::Relevance => "relevance",
+            SortBy::Availability => "availability",
+            SortBy::Size => "size",
+            SortBy::Length => "length",
+            SortBy::Name => "name",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<SortBy> {
+        SortBy::ALL.into_iter().find(|s| s.name() == name)
+    }
 }
 
 impl Filters {
@@ -389,6 +502,7 @@ impl SearchView {
                 key: search_key(h),
                 format: format_of(&h.file.path),
                 name_order,
+                relevance: wholeseek_core::group::relevance(&self.query, &h.file.path),
             })
             .collect();
         self.matched.take();
@@ -490,7 +604,58 @@ impl SearchView {
                 }
             }
         }
+        if indexed && crate::view::SEARCH_BATCH {
+            self.sort_groups(&mut groups, filters.sort);
+        }
         groups
+    }
+
+    /// Order users and their folders by `by`: a folder's score comes from its listed files,
+    /// a user's from their best folder. Stable, so ties keep the ranking (availability).
+    pub(crate) fn sort_groups(&self, groups: &mut [Group], by: SortBy) {
+        use std::cmp::Reverse;
+        // Higher sorts first; Name sorts by its own key below.
+        let score = |idx: &[usize]| -> u64 {
+            match by {
+                SortBy::Relevance => idx
+                    .iter()
+                    .map(|&i| u64::from(self.keys[i].relevance))
+                    .max()
+                    .unwrap_or(0),
+                SortBy::Size => idx.iter().map(|&i| self.hits[i].file.size).sum(),
+                SortBy::Length => idx
+                    .iter()
+                    .filter_map(|&i| self.hits[i].file.attrs.duration_secs)
+                    .map(u64::from)
+                    .sum(),
+                SortBy::Availability | SortBy::Name => 0,
+            }
+        };
+        let leaf = |folder: &str| folder.rsplit('\\').next().unwrap_or(folder).to_lowercase();
+        match by {
+            SortBy::Availability => {}
+            SortBy::Name => {
+                for g in groups.iter_mut() {
+                    g.folders
+                        .sort_by(|a, b| natural_cmp(&leaf(&a.0), &leaf(&b.0)));
+                }
+                groups.sort_by(|a, b| natural_cmp(&leaf(&a.folders[0].0), &leaf(&b.folders[0].0)));
+            }
+            _ => {
+                for g in groups.iter_mut() {
+                    g.folders.sort_by_cached_key(|(_, idx)| Reverse(score(idx)));
+                }
+                groups.sort_by_cached_key(|g| {
+                    Reverse(
+                        g.folders
+                            .iter()
+                            .map(|(_, idx)| score(idx))
+                            .max()
+                            .unwrap_or(0),
+                    )
+                });
+            }
+        }
     }
 
     pub fn visible(&self, filters: &Filters) -> usize {
@@ -739,4 +904,38 @@ pub fn is_audio(f: &RemoteFile) -> bool {
 /// audio but not playable).
 pub fn is_playable(f: &RemoteFile) -> bool {
     wholeseek_audio::is_playable(&f.path)
+}
+
+/// Albums and tracks in `by` order (they come in relevance order; stable, so ties keep it).
+fn sort_grouped(g: &mut wholeseek_core::group::Grouped, by: SortBy) {
+    use std::cmp::Reverse;
+    use wholeseek_core::group::Source;
+    let avail = |s: Option<&Source>| s.map_or((false, 0), |s| (s.free_slot, s.speed));
+    let size = |s: Option<&Source>| s.map_or(0, |s| s.files.iter().map(|f| f.size).sum::<u64>());
+    match by {
+        SortBy::Relevance => {}
+        SortBy::Availability => {
+            g.albums
+                .sort_by_cached_key(|a| Reverse(avail(a.best_source())));
+            g.tracks
+                .sort_by_cached_key(|t| Reverse(avail(t.best_source())));
+        }
+        SortBy::Size => {
+            g.albums
+                .sort_by_cached_key(|a| Reverse(size(a.best_source())));
+            g.tracks
+                .sort_by_cached_key(|t| Reverse(size(t.best_source())));
+        }
+        SortBy::Length => {
+            g.albums.sort_by_cached_key(|a| Reverse(a.key.total_secs()));
+            g.tracks
+                .sort_by_cached_key(|t| Reverse(t.key.duration_secs.unwrap_or(0)));
+        }
+        SortBy::Name => {
+            g.albums
+                .sort_by(|a, b| natural_cmp(&a.title.to_lowercase(), &b.title.to_lowercase()));
+            g.tracks
+                .sort_by(|a, b| natural_cmp(&a.title.to_lowercase(), &b.title.to_lowercase()));
+        }
+    }
 }

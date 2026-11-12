@@ -51,6 +51,8 @@ pub enum Call {
     ClearCache,
     WishlistAdd(String),
     WishlistRemove(String),
+    HistoryRemove(u64),
+    HistoryClear,
 }
 
 struct Peer {
@@ -410,6 +412,8 @@ pub struct DemoBackend {
     downloaded: wholeseek_core::DownloadedKeys,
     /// What each search was: typed, and what it was broadened to when nothing matched.
     infos: HashMap<SearchId, wholeseek_core::status::SearchInfo>,
+    /// The drawer's History: seeded, then every ↓ that ends.
+    history: crate::demo_history::DemoHistory,
 }
 
 /// A port the demo pretends another program holds: the session falls back to 45543.
@@ -423,8 +427,10 @@ impl DemoBackend {
             cache_dir: PathBuf::from("/home/demo/.cache/wholeseek"),
             ..Settings::default()
         };
+        let history = crate::demo_history::DemoHistory::seeded(&settings.download_dir);
         Self {
             settings,
+            history,
             next_id: 1,
             now: 0.0,
             calls: Vec::new(),
@@ -616,6 +622,33 @@ impl DemoBackend {
                     path: t.final_path.clone(),
                 });
             }
+        }
+    }
+
+    /// Every ↓ that ended in `events` goes in the history (▶ plays don't), as the core's
+    /// worker does before sending the event.
+    fn record_history(&mut self, events: &[CoreEvent]) {
+        use wholeseek_core::Outcome;
+        for e in events {
+            let (id, outcome, path, reason) = match e {
+                CoreEvent::TransferDone { id, path } => {
+                    (*id, Outcome::Done, Some(path.clone()), None)
+                }
+                CoreEvent::TransferFailed { id, reason } => {
+                    (*id, Outcome::Failed, None, Some(reason.clone()))
+                }
+                CoreEvent::TransferCancelled { id } => (*id, Outcome::Cancelled, None, None),
+                _ => continue,
+            };
+            let Some(t) = self
+                .transfers
+                .iter()
+                .find(|t| t.id == id && t.kind == TransferKind::Download)
+            else {
+                continue;
+            };
+            let file = t.file.clone();
+            self.history.record(id, &file, outcome, path, reason);
         }
     }
 
@@ -1090,6 +1123,28 @@ impl Backend for DemoBackend {
         self.downloaded.clone()
     }
 
+    fn history(&self, query: &wholeseek_core::HistoryQuery) -> Vec<wholeseek_core::HistoryEntry> {
+        self.history.query(query)
+    }
+
+    fn history_remove(&mut self, id: u64) -> bool {
+        self.calls.push(Call::HistoryRemove(id));
+        let removed = self.history.remove(id);
+        self.downloaded = std::sync::Arc::new(self.history.keys());
+        removed
+    }
+
+    fn history_clear(&mut self) -> Result<(), String> {
+        self.calls.push(Call::HistoryClear);
+        self.history.clear();
+        self.downloaded = std::sync::Arc::new(self.history.keys());
+        Ok(())
+    }
+
+    fn history_on_disk(&self, entry: &wholeseek_core::HistoryEntry) -> bool {
+        crate::demo_history::DemoHistory::on_disk(entry)
+    }
+
     fn search_info(&self, id: SearchId) -> Option<wholeseek_core::status::SearchInfo> {
         self.infos.get(&id).cloned()
     }
@@ -1187,6 +1242,7 @@ impl Backend for DemoBackend {
             }
         }
         self.step_transfers(&mut out);
+        self.record_history(&out);
         out
     }
 

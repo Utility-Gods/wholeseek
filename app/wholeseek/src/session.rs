@@ -34,6 +34,9 @@ pub enum SessionTab {
         /// Sort key name, `None` = default order.
         #[serde(default)]
         sort: Option<String>,
+        /// Results layout name (`"albums"`, `"folders"`), `None` = default.
+        #[serde(default)]
+        layout: Option<String>,
         #[serde(default)]
         selected_group: Option<String>,
     },
@@ -53,6 +56,7 @@ impl SessionTab {
             formats: Vec::new(),
             free_slot_only: false,
             sort: None,
+            layout: None,
             selected_group: None,
         }
     }
@@ -261,6 +265,7 @@ mod tests {
             formats: vec!["flac".into(), "mp3".into()],
             free_slot_only: true,
             sort: Some("relevance".into()),
+            layout: Some("folders".into()),
             selected_group: Some("xtal|tha".into()),
         };
         let browse = SessionTab::User {

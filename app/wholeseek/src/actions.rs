@@ -40,6 +40,13 @@ impl App {
         match action {
             MenuAction::Play(f) => self.play(&f),
             MenuAction::ShowTab(i) => self.activate(i),
+            // The session saves on its own: each tick diffs a snapshot of the tabs.
+            MenuAction::SetSort(by) => {
+                if let Some(st) = self.tab_mut().search_mut() {
+                    st.filters.sort = by;
+                    self.last_filters.sort = by;
+                }
+            }
             MenuAction::ToggleFormat(label) => {
                 if let Some(st) = self.tab_mut().search_mut() {
                     st.filters.toggle(label);

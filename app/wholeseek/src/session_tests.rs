@@ -9,7 +9,7 @@ use rune::{Env, Runtime};
 use crate::app::{App, Boot, Booted, Conn, Screen, Startup};
 use crate::demo::{Call, DemoBackend, FakePlayer, World};
 use crate::store::MemoryStore;
-use crate::tabs::TabKind;
+use crate::tabs::{ResultsLayout, SortBy, TabKind};
 use crate::{H, W, poll, view};
 use wholeseek_core::Credentials;
 
@@ -88,6 +88,8 @@ fn first_run(path: &Path) {
     st.filters.toggle("FLAC");
     st.filters.toggle("MP3");
     st.filters.free_slot = true;
+    st.filters.sort = SortBy::Size;
+    st.filters.layout = ResultsLayout::Folders;
     rt.state.tab_mut().group = Some(("alice".into(), COAST.into()));
     rt.state.open_user("alice");
     rt.state.active_browse_mut().unwrap().select(COAST);
@@ -141,6 +143,15 @@ fn quit_and_relaunch_restores_tabs_and_fetches_only_the_shown_one() {
     assert!(st.search.is_none(), "not searched until shown");
     assert_eq!(st.find.text, "coastline");
     assert!(st.filters.has("FLAC") && st.filters.has("MP3") && st.filters.free_slot);
+    assert_eq!(
+        (st.filters.sort, st.filters.layout),
+        (SortBy::Size, ResultsLayout::Folders)
+    );
+    let third = &rt.state.tabs[2].search().unwrap().filters;
+    assert_eq!(
+        (third.sort, third.layout),
+        (SortBy::default(), ResultsLayout::default())
+    );
     assert_eq!(rt.state.tabs[0].group, Some(("alice".into(), COAST.into())));
     rt.state.activate(0);
     run(&mut rt, 1.6);
@@ -189,6 +200,36 @@ fn corrupt_or_missing_session_starts_empty_and_is_replaced() {
     run(&mut rt, 1.0);
     assert_eq!(rt.state.tabs.len(), 1);
     assert!(fetches(&rt).is_empty());
+}
+
+#[test]
+fn unknown_or_missing_sort_and_layout_are_the_defaults() {
+    let d = dir("sortlayout");
+    let path = d.0.join("session.json");
+    let text = r#"{"version": 1, "active": 0, "tabs": [
+        {"kind": "search", "typed": "a", "sort": "loudness", "layout": "grid"},
+        {"kind": "search", "typed": "b"},
+        {"kind": "search", "typed": "c", "sort": "length", "layout": "folders"}]}"#;
+    std::fs::write(&path, text).unwrap();
+    let rt = launch(&path, true);
+    let got: Vec<_> = (0..3)
+        .map(|i| {
+            let f = &rt.state.tabs[i].search().unwrap().filters;
+            (f.sort, f.layout)
+        })
+        .collect();
+    let default = (SortBy::default(), ResultsLayout::default());
+    let c = (SortBy::Length, ResultsLayout::Folders);
+    assert_eq!(got, [default, default, c]);
+    // Saved back by name.
+    let saved = rt.state.session_snapshot();
+    let crate::session::SessionTab::Search { sort, layout, .. } = &saved.tabs[2] else {
+        panic!("search tab")
+    };
+    assert_eq!(
+        (sort.as_deref(), layout.as_deref()),
+        (Some("length"), Some("folders"))
+    );
 }
 
 #[test]

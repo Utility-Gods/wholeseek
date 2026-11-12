@@ -44,8 +44,13 @@ h1{font-size:34px;font-weight:650;line-height:1.1;letter-spacing:-.01em;margin:1
 .gh svg{width:16px;height:16px}
 .shot{margin:40px 0 0;border:1px solid #1e293b;border-radius:6px;overflow:hidden;background:#111a2c}
 .shot img{display:block;width:100%;height:auto}
+.shelf{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;text-align:left}
+.shelf figure{margin:0}
+.shelf .shot{margin:0}
+.shelf figcaption{color:#94a3b8;font-size:13.5px;margin-top:8px}
+.shelf figcaption b{color:#e2e8f0;font-weight:600}
 footer{max-width:1120px;margin:0 auto;padding:20px 24px 32px;color:#94a3b8;font-size:12.5px;text-align:center}
-@media (max-width:600px){main{padding:40px 16px 0}h1{font-size:30px}.tag{font-size:16px}.dl{flex-direction:column;align-items:stretch}.btn{min-width:0}.shot{margin-top:32px}}
+@media (max-width:600px){main{padding:40px 16px 0}h1{font-size:30px}.tag{font-size:16px}.dl{flex-direction:column;align-items:stretch}.btn{min-width:0}.shot{margin-top:32px}.shelf{grid-template-columns:1fr}.shelf .shot{margin:0}}
 </style>
 </head>
 <body>
@@ -71,7 +76,11 @@ footer{max-width:1120px;margin:0 auto;padding:20px 24px 32px;color:#94a3b8;font-
     Source on GitHub
   </a>
 
-  <div class="shot"><img src="/screenshot.webp" width="2560" height="1600" alt="wholeseek: search results grouped by user and album, format filters, and the player bar"></div>
+  <div class="shot"><img src="/screenshot.webp" width="2560" height="1600" alt="wholeseek: search results grouped into albums, with the selected album's details and the player bar"></div>
+  <div class="shelf">
+    <figure><div class="shot"><img src="/shot-browse.webp" width="2560" height="1600" loading="lazy" alt="Browsing a user's shared folders, with an album playing"></div><figcaption><b>Browse anyone's library.</b> Play a whole album before you keep it.</figcaption></figure>
+    <figure><div class="shot"><img src="/shot-history.webp" width="2560" height="1600" loading="lazy" alt="Transfers drawer showing download history"></div><figcaption><b>Every download, remembered.</b> Search your history and find files again.</figcaption></figure>
+  </div>
 </main>
 <footer>Not affiliated with Soulseek.</footer>
 </body>

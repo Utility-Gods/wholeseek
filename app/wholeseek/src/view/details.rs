@@ -23,6 +23,10 @@ pub const OVERLAY_BELOW: f32 = 1100.0;
 /// The results table never gets wider than this (the name column tops out near 680 pt), so
 /// Length, Size and Quality stay next to the names. A cap only: narrower windows shrink it.
 pub const TABLE_MAX_W: f32 = 1110.0;
+/// A search tab's results (rows, columns and the tools above them) are capped wider: on a
+/// big window they reach the inspector instead of leaving a gap, and the name column takes
+/// the room (Length, Size and Quality stay fixed to its right).
+pub const RESULTS_MAX_W: f32 = 1400.0;
 
 /// Whether the inspector lies over the results (narrow window) rather than beside them.
 pub fn overlays(s: &App) -> bool {
@@ -66,112 +70,33 @@ pub fn inspector(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> Option<El> {
         let card = super::art::above(s, username, folder, album_header::INSET, card, t);
         base.child(top(card, close))
     } else {
-        let header = album(username, folder, &files, free, speed, t);
-        base.child(top(header, close))
-            .child(hairline(t))
-            .child(tracks(s, tab, &files, t))
+        let header = album_header::view(
+            &album_header::AlbumHeader {
+                prefix: "details-",
+                username,
+                folder,
+                files: &files,
+                status: album_header::UserStatus {
+                    free_slot: Some(free),
+                    speed: Some(speed),
+                },
+                actions: album_header::Actions {
+                    play: true,
+                    download_to: true,
+                    browse_user: true,
+                },
+                inset: album_header::INSET,
+            },
+            t,
+        );
+        let header = super::art::above(s, username, folder, album_header::INSET, header, t);
+        let mut b = base.child(top(header, close));
+        if let Some(others) = other_copies(st, username, folder, t) {
+            b = b.child(hairline(t)).child(others);
+        }
+        b.child(hairline(t)).child(tracks(s, tab, &files, t))
     };
     Some(body)
-}
-
-/// The album's header: title, user line, summary, then the folder actions (wrapping in the
-/// narrow column). Same keys and content as [`album_header::view`] with prefix "details-".
-// TODO(inspector): use album_header::view once its actions row wraps.
-fn album(
-    username: &str,
-    folder: &str,
-    files: &[RemoteFile],
-    free: bool,
-    speed: u32,
-    t: &Theme,
-) -> El {
-    let name = folder.rsplit('\\').next().unwrap_or(folder).to_string();
-    let (u, d) = (username.to_string(), folder.to_string());
-    let run = |a: MenuAction| {
-        move |s: &mut App| {
-            s.run_menu(a.clone());
-        }
-    };
-    let mut actions = row()
-        .key("details-actions")
-        .w_full()
-        .flex_wrap()
-        .gap(6.0)
-        .center_y();
-    if files.iter().any(crate::tabs::is_playable) {
-        actions = actions.child(
-            action(
-                "details-play",
-                "Play album",
-                icons::draw(&icons::LIST_MUSIC, icons::MD, t.text),
-                t,
-            )
-            .on_press(run(MenuAction::PlayFolder {
-                username: u.clone(),
-                folder: d.clone(),
-            })),
-        );
-    }
-    let target = DlTarget::Folder {
-        username: u.clone(),
-        folder: d.clone(),
-    };
-    actions = actions
-        .child(
-            action(
-                "details-download",
-                "Download folder",
-                icons::down(icons::MD, t.text),
-                t,
-            )
-            .on_press(run(MenuAction::DownloadFolder {
-                username: u.clone(),
-                folder: d.clone(),
-            })),
-        )
-        .child(download_to_button(
-            target,
-            "Save this folder somewhere else",
-            t,
-        ))
-        .child(
-            action(
-                "details-browse",
-                "Browse user",
-                icons::user(icons::MD, t.text),
-                t,
-            )
-            .help(format!("{u}'s shares, at this folder"))
-            .on_press(run(MenuAction::OpenFolder {
-                username: u.clone(),
-                folder: d.clone(),
-                file: None,
-            })),
-        );
-    col()
-        .key("details-header")
-        .w_full()
-        .pl(album_header::INSET)
-        .pr(album_header::INSET)
-        .pt(14.0)
-        .pb(12.0)
-        .gap(8.0)
-        .child(
-            text(name)
-                .key("details-title")
-                .font(type_::TITLE)
-                .color(t.text)
-                .truncate()
-                .help(fmt::crumbs(folder)),
-        )
-        .child(who(username, free, speed, t))
-        .child(
-            text(album_header::summary(files))
-                .key("details-summary")
-                .font(tnum(META))
-                .color(t.text_secondary),
-        )
-        .child(actions)
 }
 
 /// "Download to…": the recent folders as a menu, or the folder picker when there are none.
@@ -195,6 +120,98 @@ fn download_to_button(target: DlTarget, help: &str, t: &Theme) -> El {
             );
         }
     })
+}
+
+/// The most other copies listed; the rest are counted.
+const MAX_COPIES: usize = 5;
+
+/// "Other copies": the same album at other users (any edition), best first; click shows
+/// that copy instead.
+fn other_copies(st: &SearchTab, username: &str, folder: &str, t: &Theme) -> Option<El> {
+    use super::albums::{edition_label, source_folder};
+    let g = st.grouped(&st.shown_filters())?;
+    let album = g.albums.iter().find(|a| {
+        a.editions
+            .iter()
+            .flat_map(|e| &e.sources)
+            .any(|s| s.username == username && source_folder(s) == folder)
+    })?;
+    let mut others: Vec<(
+        &wholeseek_core::group::Edition,
+        &wholeseek_core::group::Source,
+    )> = album
+        .editions
+        .iter()
+        .flat_map(|e| e.sources.iter().map(move |s| (e, s)))
+        .filter(|(_, s)| !(s.username == username && source_folder(s) == folder))
+        .collect();
+    if others.is_empty() {
+        return None;
+    }
+    others.sort_by_key(|(_, s)| (!s.free_slot, std::cmp::Reverse(s.speed)));
+    let n = others.len();
+    let mut c = col().key("details-copies").w_full().pt(8.0).pb(6.0).child(
+        row()
+            .px(album_header::INSET)
+            .h(22.0)
+            .gap(6.0)
+            .center_y()
+            .child(text("Other copies").font(META).color(t.text_secondary))
+            .child(text(n.to_string()).font(tnum(META)).color(t.text_secondary)),
+    );
+    for (i, (e, src)) in others.into_iter().take(MAX_COPIES).enumerate() {
+        let pick = (src.username.clone(), source_folder(src));
+        c = c.child(
+            row()
+                .key(format!("copy-{i}"))
+                .h(26.0)
+                .w_full()
+                .px(album_header::INSET)
+                .gap(8.0)
+                .center_y()
+                .hover(t.hover)
+                .cursor(Cursor::Pointer)
+                .role("button")
+                .help(fmt::crumbs(&src.folder))
+                .on_press(move |s: &mut App| {
+                    s.tab_mut().group = Some(pick.clone());
+                })
+                .child(el().size(6.0, 6.0).radius(3.0).fill(if src.free_slot {
+                    green()
+                } else {
+                    amber()
+                }))
+                .child(
+                    text(src.username.clone())
+                        .font(type_::LABEL)
+                        .color(t.text)
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                )
+                .child(el().grow(1.0))
+                .child(
+                    text(format!(
+                        "{} · {}",
+                        edition_label(e),
+                        fmt::speed(f64::from(src.speed))
+                    ))
+                    .font(tnum(META))
+                    .color(t.text_secondary),
+                ),
+        );
+    }
+    if n > MAX_COPIES {
+        c = c.child(
+            text(format!("{} more", n - MAX_COPIES))
+                .key("details-copies-more")
+                .font(META)
+                .color(t.text_secondary)
+                .px(album_header::INSET)
+                .pt(2.0),
+        );
+    }
+    Some(c)
 }
 
 /// The header with × in the top-right corner (the header's text stops short of it).
@@ -422,7 +439,22 @@ fn tracks(s: &App, tab: &Tab, files: &[RemoteFile], t: &Theme) -> El {
                     .h(24.0)
                     .center()
                     .child(download_cell(s, f, true, t)),
-            );
+            )
+            .child({
+                let f = f.clone();
+                super::albums::more_button(
+                    format!("track-more-{i}"),
+                    playing,
+                    move |s: &App| {
+                        crate::menu::file_items(
+                            &f,
+                            false,
+                            &s.backend.settings().recent_download_dirs,
+                        )
+                    },
+                    t,
+                )
+            });
         if playing {
             r = r.fill(accent().alpha(0.07));
         }

@@ -508,7 +508,9 @@ impl Worker {
         self.poll_uploads();
         self.poll_wishlist();
         let session = self.session();
-        self.covers.poll(session.as_deref());
+        let fetches = &self.fetches;
+        let busy = |u: &str, p: &str| fetches.contains_key(&(u.to_string(), p.to_string()));
+        self.covers.poll(session.as_deref(), &busy);
         self.publish();
     }
 
@@ -1296,6 +1298,49 @@ impl Worker {
 
     fn poll_folders(&mut self) {
         let Some(s) = self.session() else { return };
+        // Each folder-contents reply is taken once and goes to every waiter: all folder
+        // downloads of that (user, folder), each with its own root, and a cover fetch.
+        let mut asked: Vec<(String, String)> = Vec::new();
+        let waits = self
+            .folders
+            .iter()
+            .filter(|f| f.stage == FolderStage::Contents);
+        for (u, d) in waits
+            .map(|f| (f.username.clone(), f.folder.clone()))
+            .chain(self.covers.listing_waits())
+        {
+            if !asked.iter().any(|(au, ad)| *au == u && same_folder(ad, &d)) {
+                asked.push((u, d));
+            }
+        }
+        for (u, folder) in asked {
+            let Some(listing) = s.take_folder(&u, &folder) else {
+                continue;
+            };
+            let dirs = to_browse_dirs(&u, listing);
+            let (mine, rest): (Vec<FolderReq>, Vec<FolderReq>) = std::mem::take(&mut self.folders)
+                .into_iter()
+                .partition(|f| {
+                    f.stage == FolderStage::Contents
+                        && f.username == u
+                        && same_folder(&f.folder, &folder)
+                });
+            self.folders = rest;
+            if !mine.is_empty() {
+                self.emit(CoreEvent::FolderContents {
+                    username: u.clone(),
+                    folder: folder.clone(),
+                    dirs: dirs.clone(),
+                });
+            }
+            for f in mine {
+                self.expand_folder(&u, &f.folder, &dirs, false, &f.root);
+            }
+            // After the downloads started, so a cover image among them is not fetched twice.
+            let fetches = &self.fetches;
+            let busy = |u: &str, p: &str| fetches.contains_key(&(u.to_string(), p.to_string()));
+            self.covers.offer_folder(&*s, &u, &folder, &dirs, &busy);
+        }
         let mut i = 0;
         while i < self.folders.len() {
             let (u, folder, stage, deadline) = {
@@ -1303,17 +1348,6 @@ impl Worker {
                 (f.username.clone(), f.folder.clone(), f.stage, f.deadline)
             };
             if stage == FolderStage::Contents {
-                if let Some(listing) = s.take_folder(&u, &folder) {
-                    let root = self.folders.remove(i).root;
-                    let dirs = to_browse_dirs(&u, listing);
-                    self.emit(CoreEvent::FolderContents {
-                        username: u.clone(),
-                        folder: folder.clone(),
-                        dirs: dirs.clone(),
-                    });
-                    self.expand_folder(&u, &folder, &dirs, false, &root);
-                    continue;
-                }
                 if Instant::now() >= deadline {
                     // G14: no (matching) answer — fall back to the full listing.
                     self.folders[i].stage = FolderStage::Browse;

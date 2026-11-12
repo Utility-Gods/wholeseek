@@ -9,12 +9,13 @@ use std::rc::Rc;
 use wholeseek_core::RemoteFile;
 
 use super::files::{RowCtx, action, columns, file_row, more_key};
-use super::{META, amber, field_box, green, hairline, icons, input, tnum, vline};
+use super::{META, accent, amber, field_box, green, hairline, icons, input, tnum, vline};
 use crate::app::{App, MAX_ROWS};
 use crate::fmt;
-use crate::tabs::{Filters, SearchTab, Tab};
+use crate::tabs::{Filters, ResultsLayout, SearchTab, Tab};
 
 const FOLDER_INDENT: f32 = 14.0;
+const RECENT_W: f32 = 400.0;
 const FILE_INDENT: f32 = 26.0;
 
 pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
@@ -23,7 +24,17 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
         input(&st.edit, "Search music…", t)
             .key("query")
             .on_edit(|s: &mut App| &mut s.tab_mut().search_mut().expect("search tab is shown").edit)
-            .on_submit(|s: &mut App, _| s.submit_search()),
+            .on_submit(|s: &mut App, _| s.submit_search())
+            .on_input_key(recent_key)
+            .on_input_change(|s: &mut App, _| {
+                // Typing narrows the open list and drops its highlight.
+                let n = s.recent_matches().len();
+                if let Some(st) = s.tab_mut().search_mut()
+                    && st.recent.is_some()
+                {
+                    st.recent = (n > 0).then_some(None);
+                }
+            }),
         t,
     )
     .grow(1.0)
@@ -36,8 +47,11 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
         .px(12.0)
         .gap(12.0)
         .center_y()
-        .child(query)
-        .child(el().grow(1.0));
+        .child(query);
+    if let Some(v) = &st.search {
+        bar = bar.child(wish_button(s, &v.query, t).ml(-6.0));
+    }
+    bar = bar.child(el().grow(1.0));
     let Some(search) = &st.search else {
         return col()
             .w_full()
@@ -200,14 +214,25 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
         .key("tools")
         .h(36.0)
         .w_full()
-        .max_w(super::details::TABLE_MAX_W)
+        .max_w(super::details::RESULTS_MAX_W)
         .px(12.0)
         .gap(12.0)
         .center_y()
         .dir(rune::Direction::Rtl)
-        .child(find_box(st, shown, total, first_row, t))
+        .child(find_box(st, shown, total, first_row, t));
+    let tools = if super::SEARCH_BATCH {
+        tools.child(sort_button(st, t))
+    } else {
+        tools
+    };
+    let tools = tools
         .child(el().grow(1.0))
         .child(chips.dir(rune::Direction::Ltr));
+    let tools = if super::SEARCH_BATCH {
+        tools.child(layout_switch(st, t))
+    } else {
+        tools
+    };
     let find = Some(std::rc::Rc::new(f.text.clone())).filter(|q| !q.is_empty());
 
     let mut list = col().w_full().pb(8.0);
@@ -295,12 +320,16 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
     if shown == 0 {
         list = list.child(nothing_matches(st, t));
     }
+    let albums = super::SEARCH_BATCH && f.layout == ResultsLayout::Albums && shown > 0;
+    if albums && let Some(g) = st.grouped(f) {
+        list = super::albums::list(s, tab, &g, find.as_deref(), t);
+    }
     let saved = tab.scroll.clone();
-    // The results take what the inspector leaves; their rows cap at TABLE_MAX_W, left-aligned
+    // The results take what the inspector leaves; their rows cap at RESULTS_MAX_W, left-aligned
     // so nothing moves when the inspector opens. Never wider than the window: no fixed
     // widths from the measured window here (a stale width pushed the page off-screen).
     let results = col().key("results").h_full().grow(1.0).shrink().min_h(0.0);
-    let results = if shown > 0 {
+    let results = if shown > 0 && !albums {
         results.child(columns(s, FILE_INDENT, t)).child(hairline(t))
     } else {
         results
@@ -315,17 +344,26 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
             .min_h(0.0),
     );
     let inspector = super::details::inspector(s, tab, st, t);
+    // An open drawer lies over the right of the page: the results and the inspector fit in
+    // what it leaves rather than running under it (an overlaid inspector is pinned left of
+    // it too: pins ignore padding).
+    let drawer = if matches!(s.panel, crate::app::Panel::None) {
+        0.0
+    } else {
+        super::DRAWER_W + 1.0
+    };
     let mut body = row()
         .key("results-split")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
+        .pr(drawer)
         .child(results);
     if let Some(pane) = inspector {
         let pane = row().h_full().child(vline(t)).child(pane);
         body = if super::details::overlays(s) {
             // Narrow window: over the results from the right, which keep their layout.
-            body.child(pane.pin(None, Some(0.0), Some(0.0), Some(0.0)).shadow(
+            body.child(pane.pin(None, Some(0.0), Some(drawer), Some(0.0)).shadow(
                 0.0,
                 16.0,
                 rune::Color::BLACK.alpha(0.35),
@@ -342,6 +380,137 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
         .child(tools)
         .child(hairline(t))
         .child(body)
+}
+
+/// "↕ Relevance": the sort menu (the current order checked).
+fn sort_button(st: &SearchTab, t: &Theme) -> El {
+    let by = st.filters.sort;
+    row()
+        .key("sort")
+        .h(26.0)
+        .px(8.0)
+        .gap(5.0)
+        .center_y()
+        .radius(4.0)
+        .cursor(Cursor::Pointer)
+        .role("button")
+        .label(format!("Sort: {}", by.label()))
+        .help("Sort results")
+        .focusable(true)
+        .hover(t.hover)
+        .dir(rune::Direction::Ltr)
+        .child(icons::draw(
+            &icons::ARROW_UP_DOWN,
+            icons::SM,
+            t.text_secondary,
+        ))
+        .child(text(by.label()).font(META).color(t.text_secondary))
+        .on_press(move |s: &mut App| {
+            let items = sort_items(by);
+            s.open_menu(crate::menu::MenuAnchor::Key("sort".into()), items);
+        })
+}
+
+/// The sort menu's items: every order, the current one checked.
+pub fn sort_items(current: crate::tabs::SortBy) -> Vec<crate::menu::MenuItem> {
+    use crate::tabs::SortBy;
+    SortBy::ALL
+        .into_iter()
+        .map(|by| crate::menu::MenuItem {
+            id: match by {
+                SortBy::Relevance => "sort-relevance",
+                SortBy::Availability => "sort-availability",
+                SortBy::Size => "sort-size",
+                SortBy::Length => "sort-length",
+                SortBy::Name => "sort-name",
+            },
+            label: by.label().to_string(),
+            action: crate::menu::MenuAction::SetSort(by),
+            icon: (by == current).then_some(&icons::CHECK),
+            sep: false,
+            help: None,
+        })
+        .collect()
+}
+
+/// Albums | Folders: how the results are listed.
+fn layout_switch(st: &SearchTab, t: &Theme) -> El {
+    let seg = |key: &str, label: &str, icon: &'static rune::Icon, l: ResultsLayout| {
+        let on = st.filters.layout == l;
+        let fg = if on { t.text } else { t.text_secondary };
+        let mut b = row()
+            .key(key.to_string())
+            .h(22.0)
+            .px(8.0)
+            .gap(5.0)
+            .center_y()
+            .radius(3.0)
+            .cursor(Cursor::Pointer)
+            .role("button")
+            .label(label.to_string())
+            .focusable(true)
+            .hover(t.hover)
+            .child(icons::draw(icon, icons::SM, fg))
+            .child(text(label.to_string()).font(META).color(fg))
+            .on_press(move |s: &mut App| {
+                if let Some(st) = s.tab_mut().search_mut() {
+                    st.filters.layout = l;
+                    s.last_filters.layout = l;
+                }
+            });
+        if on {
+            b = b.fill(t.control_track);
+        }
+        b
+    };
+    row()
+        .key("layout")
+        .h(26.0)
+        .px(2.0)
+        .gap(2.0)
+        .center_y()
+        .radius(4.0)
+        .border(1.0, t.card_border)
+        .dir(rune::Direction::Ltr)
+        .child(seg(
+            "layout-albums",
+            "Albums",
+            &icons::DISC_3,
+            ResultsLayout::Albums,
+        ))
+        .child(seg(
+            "layout-folders",
+            "Folders",
+            &icons::FOLDER,
+            ResultsLayout::Folders,
+        ))
+}
+
+/// ☆: the search's query on the wishlist or off it.
+fn wish_button(s: &App, query: &str, t: &Theme) -> El {
+    let on = s.wished(query);
+    let q = query.to_string();
+    super::icon_button(
+        "wish",
+        if on {
+            icons::draw(&icons::STAR_SOLID, icons::LG, accent())
+        } else {
+            icons::draw(&icons::STAR, icons::LG, t.text_secondary)
+        },
+        t,
+    )
+    .size(28.0, 28.0)
+    .label(if on {
+        "Remove from wishlist"
+    } else {
+        "Add to wishlist"
+    })
+    .help(if on {
+        "On your wishlist: searched again every so often. Click to remove"
+    } else {
+        "Add to wishlist: search for this again every so often"
+    })
+    .on_press(move |s: &mut App| s.toggle_wish(&q))
 }
 
 /// "Showing results for …": the typed words found nothing, so the core searched once more
@@ -608,7 +777,7 @@ fn folder_line(
     find: Option<&crate::tabs::TextQuery>,
     t: &Theme,
 ) -> El {
-    let (tab, max_w) = (s.tab().id, super::details::TABLE_MAX_W);
+    let (tab, max_w) = (s.tab().id, super::details::RESULTS_MAX_W);
     let parts: Vec<&str> = folder.split('\\').collect();
     let shown: Vec<Option<usize>> = if parts.len() > MAX_SEGMENTS {
         let n = parts.len();
@@ -680,5 +849,102 @@ fn folder_line(
                 let items = s.folder_menu(&u2, &d2);
                 s.open_menu(crate::menu::MenuAnchor::Key(more2.clone()), items);
             }),
+    )
+}
+
+/// ↓/↑ open and walk the recent searches under the query box, Enter searches the highlighted
+/// one, Shift+Delete forgets it, Esc closes the list.
+fn recent_key(s: &mut App, e: &rune::KeyEvent, _tx: &mut rune::Tx) -> bool {
+    use rune::Key;
+    let open = s.tab().search().and_then(|st| st.recent);
+    match (&e.key, open) {
+        (Key::Down, _) => s.recent_step(true),
+        (Key::Up, Some(_)) => s.recent_step(false),
+        (Key::Escape, Some(_)) => {
+            s.close_recent();
+            true
+        }
+        (Key::Enter, Some(Some(i))) => match s.recent_matches().get(i).cloned() {
+            Some(q) => {
+                s.pick_recent(&q);
+                true
+            }
+            None => false,
+        },
+        (Key::Delete, Some(Some(i))) if e.mods.shift => {
+            if let Some(q) = s.recent_matches().get(i).cloned() {
+                s.forget_recent(&q);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The recent searches under the query box, when open: a layer at the root (a click
+/// outside closes it), anchored to the query box.
+pub fn recent_layer(s: &App, t: &Theme) -> Option<El> {
+    let sel = s.tab().search()?.recent?;
+    let items = s.recent_matches();
+    if items.is_empty() {
+        return None;
+    }
+    let mut list = col()
+        .key("recent")
+        .w(RECENT_W)
+        .py(4.0)
+        .radius(6.0)
+        .fill(super::pal::raised())
+        .border(1.0, super::pal::line_strong())
+        .role("listbox")
+        .anchored("search", rune::Side::Bottom, rune::Align::Start, 2.0);
+    for (i, q) in items.into_iter().enumerate() {
+        let (pick, forget) = (q.clone(), q.clone());
+        let mut entry = row()
+            .key(format!("recent-{i}"))
+            .h(28.0)
+            .w_full()
+            .pl(10.0)
+            .pr(4.0)
+            .gap(10.0)
+            .center_y()
+            .hover(t.hover)
+            .press(t.press)
+            .cursor(Cursor::Pointer)
+            .role("option")
+            .label(q.clone())
+            .on_press(move |s: &mut App| s.pick_recent(&pick))
+            .child(icons::draw(&icons::HISTORY, icons::MD, t.text_secondary))
+            .child(
+                text(q)
+                    .font(type_::BODY)
+                    .color(t.text)
+                    .truncate()
+                    .grow(1.0)
+                    .shrink()
+                    .min_w(0.0),
+            )
+            .child(
+                super::icon_button(
+                    &format!("recent-forget-{i}"),
+                    icons::close(icons::SM, t.text_secondary),
+                    t,
+                )
+                .help("Remove from recent searches")
+                .on_press_tx(move |s: &mut App, tx| {
+                    s.forget_recent(&forget);
+                    tx.focus("query", true); // ↑/↓ keep working
+                }),
+            );
+        if sel == Some(i) {
+            entry = entry.fill(t.hover);
+        }
+        list = list.child(entry);
+    }
+    Some(
+        el().key("recent-layer")
+            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .on_press(|s: &mut App| s.close_recent())
+            .child(list),
     )
 }

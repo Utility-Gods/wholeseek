@@ -21,13 +21,13 @@ const QUALITY_W: f32 = 92.0;
 const DL_W: f32 = 56.0;
 
 /// Column titles over a file list. `indent` lines them up with indented rows.
-pub fn columns(_s: &App, indent: f32, t: &Theme) -> El {
+pub fn columns(s: &App, indent: f32, t: &Theme) -> El {
     let h = |s: &str| text(s.to_string()).font(META).color(t.text_secondary);
     row()
         .key("columns")
         .h(24.0)
         .w_full()
-        .max_w(super::details::TABLE_MAX_W)
+        .max_w(table_max_w(s.tab().search().is_some()))
         .pl(12.0 + indent)
         .pr(6.0)
         .gap(10.0)
@@ -56,6 +56,16 @@ pub fn now_playing(s: &App, f: &RemoteFile) -> (bool, bool) {
         None => p.failed.is_none(),
     };
     (true, running)
+}
+
+/// How wide a file table gets: search results reach further (see
+/// [`super::details::RESULTS_MAX_W`]); a user tab keeps the narrower table.
+fn table_max_w(search: bool) -> f32 {
+    if search {
+        super::details::RESULTS_MAX_W
+    } else {
+        super::details::TABLE_MAX_W
+    }
 }
 
 /// The one live indicator: three bars moving with the clock while a track runs, at rest
@@ -149,7 +159,7 @@ pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t
         .key(key.to_string())
         .h(ROW_H)
         .w_full()
-        .max_w(super::details::TABLE_MAX_W)
+        .max_w(table_max_w(!ctx.in_user_tab))
         .pl(12.0 + indent)
         .pr(6.0)
         .gap(10.0)

@@ -26,6 +26,8 @@ use crate::tabs::{BrowseView, SearchTab, SearchView, Tab, TabId, TabKind, UserTa
 
 mod restore;
 
+/// At most this many recent searches listed under the query box.
+pub const RECENT_SHOWN: usize = 8;
 /// Results drawn at most; the rest are counted ("showing 300 of 4 120").
 pub const MAX_ROWS: usize = 300;
 
@@ -175,6 +177,8 @@ pub struct App {
     pub desktop_log: Rc<RefCell<Vec<DesktopCall>>>,
     pub menu: Option<Menu>,
     pub drawer: DrawerUi,
+    /// The drawer's History view.
+    pub hist: crate::history::HistoryUi,
     /// The search filters last chosen; a new search tab starts with them.
     pub last_filters: crate::tabs::Filters,
     /// Counts queues started; see [`crate::queue::PlayQueue::generation`].
@@ -187,6 +191,8 @@ pub struct App {
     /// Files downloaded before, by (user, remote path): the rows' "Downloaded" mark.
     /// Fetched from the backend once per tick.
     pub downloaded: wholeseek_core::DownloadedKeys,
+    /// What was searched before, for ↓ in the query box.
+    pub recent: crate::recent::Recent,
     pub strip_right_w: f32,
     /// What plays in order; the player strip shows its current item.
     pub queue: Option<PlayQueue>,
@@ -289,11 +295,13 @@ impl App {
             menu: None,
             folder_dests: Vec::new(),
             drawer: DrawerUi::default(),
+            hist: crate::history::HistoryUi::default(),
             last_filters: crate::tabs::Filters::default(),
             queue_generation: 0,
             strip_w: f32::INFINITY,
             window_w: 0.0,
             downloaded: Default::default(),
+            recent: Default::default(),
             strip_right_w: 0.0,
             queue: None,
             reveal: false,
@@ -447,8 +455,10 @@ impl App {
         changed |= self.profiles.settle();
         changed |= self.sync_covers();
         for e in events {
+            self.history_event(&e);
             self.apply(e);
         }
+        changed |= self.refresh_history();
         for n in notes {
             match n {
                 StoreNote::KeyringUnavailable(_) => self.keyring_available = false,
@@ -684,6 +694,8 @@ impl App {
             }
             // Settings shows the port in effect; no banner for a busy port.
             CoreEvent::Error { context, .. } if context == "listen_port" => {}
+            // Shown in the drawer's History view (`history_event`), not the banner.
+            CoreEvent::Error { context, .. } if context == "history" => {}
             CoreEvent::Error { context, message } => {
                 let text = format!("{context}: {message}");
                 if self.onboarding.connecting && context == "login" {
@@ -810,6 +822,7 @@ impl App {
         if query.is_empty() {
             return;
         }
+        tab.recent = None;
         let old = tab.search.take();
         if let Some(old) = old
             && !old.finished
@@ -831,6 +844,74 @@ impl App {
             t.scroll.set(0.0);
         }
         self.error = None;
+        if let Some(v) = self.tab().search().and_then(|st| st.search.as_ref()) {
+            let q = v.query.clone();
+            self.recent.add(&q);
+        }
+    }
+
+    /// The recent searches matching what the active search tab's query box holds (all of
+    /// them while it still holds the shown search).
+    pub fn recent_matches(&self) -> Vec<String> {
+        let st = self.tab().search();
+        let typed = st.map(|st| st.edit.text.trim()).unwrap_or("");
+        let shown = st
+            .and_then(|st| st.search.as_ref())
+            .map(|v| v.query.as_str());
+        let typed = if shown == Some(typed) { "" } else { typed };
+        self.recent
+            .matching(typed)
+            .into_iter()
+            .take(RECENT_SHOWN)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// ↓ / ↑ in the query box: opens the recent searches, then moves the highlight
+    /// (`None` is the query box itself). Returns false when there's nothing to show.
+    pub fn recent_step(&mut self, down: bool) -> bool {
+        let n = self.recent_matches().len();
+        let Some(st) = self.tab_mut().search_mut() else {
+            return false;
+        };
+        st.recent = match (st.recent, down) {
+            _ if n == 0 => None,
+            (None, true) => Some(None),
+            (None, false) => return false,
+            (Some(None), true) => Some(Some(0)),
+            (Some(Some(i)), true) => Some(Some((i + 1).min(n - 1))),
+            (Some(Some(0)), false) | (Some(None), false) => Some(None),
+            (Some(Some(i)), false) => Some(Some(i - 1)),
+        };
+        st.recent.is_some()
+    }
+
+    pub fn close_recent(&mut self) {
+        if let Some(st) = self.tab_mut().search_mut() {
+            st.recent = None;
+        }
+    }
+
+    /// Search `query` again from the recent list.
+    pub fn pick_recent(&mut self, query: &str) {
+        if let Some(st) = self.tab_mut().search_mut() {
+            st.edit.replace_text(query);
+            st.edit.set_caret(query.len());
+        }
+        self.submit_search();
+    }
+
+    /// Drop `query` from the recent searches, keeping the list open (closed when empty).
+    pub fn forget_recent(&mut self, query: &str) {
+        self.recent.remove(query);
+        let n = self.recent_matches().len();
+        if let Some(st) = self.tab_mut().search_mut() {
+            st.recent = match st.recent {
+                _ if n == 0 => None,
+                Some(Some(i)) => Some(Some(i.min(n - 1))),
+                r => r,
+            };
+        }
     }
 
     // ---- tabs ----------------------------------------------------------------------------
@@ -1133,14 +1214,38 @@ impl App {
         self.store.save_settings(&settings);
     }
 
-    /// ↓ `file` into `root` (`None`: the downloads folder). `album`: always in its album
-    /// folder (`Core::download_album_file`); else flat or not per the setting.
     /// ↓ on one track of an album (the search inspector's track list): always into its album
     /// folder, like Keep while an album plays.
     pub fn download_album_track(&mut self, file: &RemoteFile) {
         self.start_download(file, None, true);
     }
 
+    /// Whether `query` is on the wishlist (case-insensitive, spaces collapsed).
+    pub fn wished(&self, query: &str) -> bool {
+        let q = query.split_whitespace().collect::<Vec<_>>().join(" ");
+        self.backend
+            .settings()
+            .wishlist
+            .iter()
+            .any(|w| w.eq_ignore_ascii_case(&q))
+    }
+
+    /// ☆ on a search: put its query on the wishlist (searched again now and then) or take it
+    /// off, and save the settings.
+    pub fn toggle_wish(&mut self, query: &str) {
+        let changed = if self.wished(query) {
+            self.backend.wishlist_remove(query)
+        } else {
+            self.backend.wishlist_add(query)
+        };
+        if changed {
+            let settings = self.backend.settings().clone();
+            self.store.save_settings(&settings);
+        }
+    }
+
+    /// ↓ `file` into `root` (`None`: the downloads folder). `album`: always in its album
+    /// folder (`Core::download_album_file`); else flat or not per the setting.
     fn start_download(&mut self, file: &RemoteFile, root: Option<&Path>, album: bool) {
         if self
             .download_of(file)
