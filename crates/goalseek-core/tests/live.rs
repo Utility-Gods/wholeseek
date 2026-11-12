@@ -246,3 +246,204 @@ fn live_core_end_to_end() {
     core.logout();
     assert!(started, "no candidate started sending within the timeout");
 }
+
+fn env2(user: &str, pass: &str) -> Credentials {
+    Credentials {
+        username: std::env::var(user).unwrap_or_else(|_| panic!("{user} not set")),
+        password: std::env::var(pass).unwrap_or_else(|_| panic!("{pass} not set")),
+    }
+}
+
+fn port(var: &str, default: u16) -> u16 {
+    std::env::var(var)
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Network citizenship: account A shares a real FLAC, account B browses A,
+/// downloads it, and the bytes must match; A must report the upload.
+///
+/// Needs GOALSEEK_USER/GOALSEEK_PASS (A) and GOALSEEK_USER2/GOALSEEK_PASS2
+/// (B); ports GOALSEEK_PORT_A (2241) / GOALSEEK_PORT_B (2242); ffmpeg on PATH.
+#[test]
+#[ignore = "live Soulseek network; needs two accounts and permission"]
+fn live_share_upload_between_two_accounts() {
+    let a_creds = env2("GOALSEEK_USER", "GOALSEEK_PASS");
+    let b_creds = env2("GOALSEEK_USER2", "GOALSEEK_PASS2");
+    assert_ne!(a_creds.username, b_creds.username);
+    let a_user = a_creds.username.clone();
+    let b_user = b_creds.username.clone();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // A small real FLAC (3 s, 440 Hz) in a shared folder.
+    let share = tmp.path().join("share");
+    let album = share.join("goalseek share test");
+    std::fs::create_dir_all(&album).unwrap();
+    let flac = album.join("01 Tone.flac");
+    let ok = std::process::Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=3",
+            "-c:a",
+            "flac",
+        ])
+        .arg(&flac)
+        .status()
+        .expect("ffmpeg");
+    assert!(ok.success());
+    let original = std::fs::read(&flac).unwrap();
+    println!(
+        "0. generated {} ({} B)",
+        flac.file_name().unwrap().to_string_lossy(),
+        original.len()
+    );
+
+    let mk = |name: &str, port: u16, shares: Vec<std::path::PathBuf>| Settings {
+        download_dir: tmp.path().join(name).join("downloads"),
+        cache_dir: tmp.path().join(name).join("cache"),
+        share_dirs: shares,
+        listen_port: port,
+        ..Settings::default()
+    };
+    let (a, a_ev) =
+        Core::start(mk("a", port("GOALSEEK_PORT_A", 2241), vec![share.clone()])).unwrap();
+    let (b, b_ev) = Core::start(mk("b", port("GOALSEEK_PORT_B", 2242), Vec::new())).unwrap();
+
+    // 1. Both log in. (Throwaway usernames may appear in failure messages.)
+    for (label, core, ev, creds) in [("A", &a, &a_ev, a_creds), ("B", &b, &b_ev, b_creds)] {
+        let t = Instant::now();
+        core.login(creds);
+        let e = want(ev, Duration::from_secs(60), "login", |e| {
+            matches!(
+                e,
+                CoreEvent::Connected { .. } | CoreEvent::Disconnected { .. }
+            )
+        })
+        .expect("login answer");
+        let CoreEvent::Connected { listen_port, .. } = e else {
+            panic!("{label} login failed: {e:?}")
+        };
+        println!(
+            "1. {label} logged in in {:.1}s, listen port {listen_port:?}",
+            t.elapsed().as_secs_f32()
+        );
+    }
+    let mut a_seen: Vec<CoreEvent> = Vec::new();
+    if let Some(CoreEvent::ShareCounts { folders, files }) = want(
+        &a_ev,
+        Duration::from_secs(10),
+        "A share counts",
+        |e| matches!(e, CoreEvent::ShareCounts { files, .. } if *files > 0),
+    ) {
+        println!("1. A shares {folders} folder(s), {files} file(s)");
+    }
+    // Port mapping outcomes tell whether peers can reach A/B at all.
+    for (label, ev) in [("A", &a_ev), ("B", &b_ev)] {
+        if let Some(CoreEvent::PortMapping { port, outcome }) =
+            want(ev, Duration::from_secs(8), "port mapping", |e| {
+                matches!(e, CoreEvent::PortMapping { .. })
+            })
+        {
+            println!("1. {label} port mapping for {port}: {outcome:?}");
+        }
+    }
+
+    // 2. B browses A and finds the file.
+    let t = Instant::now();
+    b.browse(&a_user);
+    let e = want(&b_ev, Duration::from_secs(70), "browse", |e| {
+        matches!(
+            e,
+            CoreEvent::BrowseResult { .. } | CoreEvent::BrowseFailed { .. }
+        )
+    })
+    .expect("browse answer");
+    let CoreEvent::BrowseResult { dirs, .. } = e else {
+        panic!(
+            "browse failed: {e:?}\n   A and B run behind the same NAT: B can only reach A if A's \
+             listen port is reachable at A's public address (router port mapping or a manual \
+             forward, plus NAT hairpinning). See the port mapping lines above."
+        )
+    };
+    let file = dirs
+        .iter()
+        .flat_map(|d| d.files.iter())
+        .find(|f| f.path.ends_with("01 Tone.flac"))
+        .cloned()
+        .expect("shared FLAC not in A's listing");
+    println!(
+        "2. B browsed A in {:.1}s: {} dirs; found {} ({} B, duration {:?}s)",
+        t.elapsed().as_secs_f32(),
+        dirs.len(),
+        file.path,
+        file.size,
+        file.attrs.duration_secs
+    );
+    assert_eq!(file.size, original.len() as u64);
+
+    // 3. B downloads it.
+    let t = Instant::now();
+    let id = b.download(&file);
+    let e = want(
+        &b_ev,
+        Duration::from_secs(90),
+        "download end",
+        |e| match e {
+            CoreEvent::TransferDone { id: i, .. } | CoreEvent::TransferFailed { id: i, .. } => {
+                *i == id
+            }
+            _ => false,
+        },
+    )
+    .expect("download answer");
+    let CoreEvent::TransferDone { path, .. } = e else {
+        panic!("download failed: {e:?}")
+    };
+    let got = std::fs::read(&path).unwrap();
+    println!(
+        "3. B downloaded to {} in {:.1}s; {} B; identical={}",
+        path.strip_prefix(tmp.path()).unwrap_or(&path).display(),
+        t.elapsed().as_secs_f32(),
+        got.len(),
+        got == original
+    );
+    assert_eq!(got, original, "downloaded bytes differ");
+
+    // 4. A reported the upload to B.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut upload = None;
+    while upload.is_none() && Instant::now() < deadline {
+        if let Ok(e) = a_ev.recv_timeout(Duration::from_millis(200)) {
+            if let CoreEvent::Uploads(rows) = &e {
+                upload = rows
+                    .iter()
+                    .find(|r| r.username == b_user && r.path.ends_with("01 Tone.flac"))
+                    .cloned();
+            }
+            a_seen.push(e);
+        }
+    }
+    let uploads_events = a_seen
+        .iter()
+        .filter(|e| matches!(e, CoreEvent::Uploads(_)))
+        .count();
+    let counts = a_seen.iter().find_map(|e| match e {
+        CoreEvent::ShareCounts { folders, files } => Some((*folders, *files)),
+        _ => None,
+    });
+    println!("4. A: share counts {counts:?}, {uploads_events} Uploads snapshot(s)");
+    let row = upload.expect("A emitted no Uploads row for B's download");
+    println!(
+        "   A upload row: to=B path={} size={} sent={} state={:?}",
+        row.path, row.size, row.bytes_sent, row.state
+    );
+    assert_eq!(row.size, original.len() as u64);
+
+    a.logout();
+    b.logout();
+}

@@ -196,25 +196,31 @@ pub struct Settings {
     /// Map `listen_port` on the router via UPnP-IGD, falling back to NAT-PMP.
     /// Implemented by goalseek-core itself in CP1 (docs/core-api.md, G2).
     pub port_mapping: bool,
+    /// A ▶ that has received no data after this many seconds fails
+    /// (`TransferFailed`, reason starts with [`crate::PLAY_STALLED`]) and is
+    /// cancelled, so the app can try `rank::alternates`. ↓ is unaffected.
+    pub play_start_timeout_secs: u64,
 }
 
 impl Default for Settings {
-    /// XDG locations: `$XDG_DOWNLOAD_DIR/goalseek` (else `~/Downloads/goalseek`)
-    /// and `$XDG_CACHE_HOME/goalseek` (else `~/.cache/goalseek`).
+    /// XDG locations: `$XDG_DOWNLOAD_DIR/<APP_NAME>` (else `~/Downloads/<APP_NAME>`)
+    /// and `$XDG_CACHE_HOME/<APP_NAME>` (else `~/.cache/<APP_NAME>`), with
+    /// [`crate::config::APP_NAME`].
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         Self {
             download_dir: dirs::download_dir()
                 .unwrap_or_else(|| home.join("Downloads"))
-                .join("goalseek"),
+                .join(crate::config::APP_NAME),
             cache_dir: dirs::cache_dir()
                 .unwrap_or_else(|| home.join(".cache"))
-                .join("goalseek"),
+                .join(crate::config::APP_NAME),
             cache_cap_bytes: 1024 * 1024 * 1024,
             share_dirs: Vec::new(),
             listen_port: 2234,
             upload_slots: 10,
             port_mapping: true,
+            play_start_timeout_secs: 8,
         }
     }
 }

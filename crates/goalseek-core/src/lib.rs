@@ -16,6 +16,7 @@ pub mod rank;
 mod worker;
 
 pub use crate::core::{Command, Core, NOT_IMPLEMENTED, POLL_TICK};
+pub use crate::worker::PLAY_STALLED;
 pub use event::{CoreEvent, DisconnectReason, PortMapOutcome};
 pub use model::{
     AudioAttrs, BrowseDir, Credentials, PlayTicket, RemoteFile, SearchHit, SearchId, Settings,

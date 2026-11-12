@@ -12,8 +12,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// The app's name in every on-disk/keyring location: config dir, default
+/// download/cache dirs, log path, keyring service. The rename to Holeseek
+/// flips this (and [`LEGACY_APP_NAME`]) and nothing else.
+pub const APP_NAME: &str = "goalseek";
+/// Name of the previous release whose config/keyring [`migrate_legacy`]
+/// carries over. Equal to [`APP_NAME`] means "nothing to migrate".
+pub const LEGACY_APP_NAME: &str = "goalseek";
 /// Keyring service name; the account is the Soulseek username.
-pub const KEYRING_SERVICE: &str = "goalseek";
+pub const KEYRING_SERVICE: &str = APP_NAME;
 /// File name inside the config directory.
 pub const CONFIG_FILE: &str = "config.toml";
 /// How long to wait for the keyring before calling it unavailable (a Secret
@@ -54,23 +61,40 @@ pub struct ConfigFile {
     pub settings: Settings,
 }
 
-/// `$XDG_CONFIG_HOME/goalseek` (else `~/.config/goalseek`).
-#[must_use]
-pub fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("goalseek")
+/// The per-user base directories app dirs live under (`<base>/<APP_NAME>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseDirs {
+    /// `$XDG_CONFIG_HOME` (else `~/.config`).
+    pub config: PathBuf,
+    /// `$XDG_DOWNLOAD_DIR` (else `~/Downloads`).
+    pub downloads: PathBuf,
+    /// `$XDG_CACHE_HOME` (else `~/.cache`).
+    pub cache: PathBuf,
 }
 
-/// `$XDG_CACHE_HOME/goalseek/slsk.log` — where the protocol library logs (G13).
+impl BaseDirs {
+    /// The real per-user locations.
+    #[must_use]
+    pub fn system() -> Self {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        Self {
+            config: dirs::config_dir().unwrap_or_else(|| home.join(".config")),
+            downloads: dirs::download_dir().unwrap_or_else(|| home.join("Downloads")),
+            cache: dirs::cache_dir().unwrap_or_else(|| home.join(".cache")),
+        }
+    }
+}
+
+/// `$XDG_CONFIG_HOME/<APP_NAME>` (else `~/.config/<APP_NAME>`).
+#[must_use]
+pub fn config_dir() -> PathBuf {
+    BaseDirs::system().config.join(APP_NAME)
+}
+
+/// `$XDG_CACHE_HOME/<APP_NAME>/slsk.log` — where the protocol library logs (G13).
 #[must_use]
 pub fn default_log_path() -> PathBuf {
-    dirs::cache_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("goalseek")
-        .join("slsk.log")
+    BaseDirs::system().cache.join(APP_NAME).join("slsk.log")
 }
 
 // ---------------------------------------------------------------- public API
@@ -233,7 +257,34 @@ pub struct KeyringStore;
 
 impl SecretStore for KeyringStore {
     fn get(&self, username: &str) -> Result<Option<String>, String> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, username).map_err(|e| e.to_string())?;
+        NamedKeyringStore::new(KEYRING_SERVICE).get(username)
+    }
+    fn set(&self, username: &str, password: &str) -> Result<(), String> {
+        NamedKeyringStore::new(KEYRING_SERVICE).set(username, password)
+    }
+    fn delete(&self, username: &str) -> Result<(), String> {
+        NamedKeyringStore::new(KEYRING_SERVICE).delete(username)
+    }
+}
+
+/// OS keyring under an explicit service name (used for migration).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedKeyringStore {
+    pub service: String,
+}
+
+impl NamedKeyringStore {
+    #[must_use]
+    pub fn new(service: &str) -> Self {
+        Self {
+            service: service.to_string(),
+        }
+    }
+}
+
+impl SecretStore for NamedKeyringStore {
+    fn get(&self, username: &str) -> Result<Option<String>, String> {
+        let entry = keyring::Entry::new(&self.service, username).map_err(|e| e.to_string())?;
         match entry.get_password() {
             Ok(p) => Ok(Some(p)),
             Err(keyring::Error::NoEntry) => Ok(None),
@@ -242,17 +293,110 @@ impl SecretStore for KeyringStore {
     }
 
     fn set(&self, username: &str, password: &str) -> Result<(), String> {
-        keyring::Entry::new(KEYRING_SERVICE, username)
+        keyring::Entry::new(&self.service, username)
             .and_then(|e| e.set_password(password))
             .map_err(|e| e.to_string())
     }
 
     fn delete(&self, username: &str) -> Result<(), String> {
-        match keyring::Entry::new(KEYRING_SERVICE, username).and_then(|e| e.delete_credential()) {
+        match keyring::Entry::new(&self.service, username).and_then(|e| e.delete_credential()) {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(e.to_string()),
         }
     }
+}
+
+// ---------------------------------------------------------------- migration
+
+/// What [`migrate_legacy`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Migration {
+    /// Same name, no legacy config, or the new config dir already exists.
+    NotNeeded,
+    /// `config.toml` was copied (default dirs renamed).
+    Migrated { password: PasswordMigration },
+}
+
+/// The keyring half of a migration. Never fatal: on failure the user signs
+/// in again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasswordMigration {
+    Copied,
+    /// No saved username, or no password under the old service.
+    NothingSaved,
+    /// Keyring unavailable or refused (message is safe to show/log).
+    Failed(String),
+}
+
+/// Carry the previous release's config and saved password over to
+/// [`APP_NAME`]. Call once at startup, before [`load`]. Idempotent: does
+/// nothing once the new config dir exists (and nothing at all while
+/// [`LEGACY_APP_NAME`] equals [`APP_NAME`]).
+///
+/// # Errors
+/// I/O errors reading the old or writing the new config file.
+pub fn migrate_legacy() -> io::Result<Migration> {
+    migrate_legacy_in(
+        &BaseDirs::system(),
+        LEGACY_APP_NAME,
+        APP_NAME,
+        &(Arc::new(NamedKeyringStore::new(LEGACY_APP_NAME)) as Arc<dyn SecretStore>),
+        &(Arc::new(NamedKeyringStore::new(APP_NAME)) as Arc<dyn SecretStore>),
+    )
+}
+
+/// [`migrate_legacy`] with explicit base dirs, names and secret stores.
+///
+/// - Copies `<config>/<old>/config.toml` to `<config>/<new>/config.toml`; a
+///   `download_dir`/`cache_dir` equal to the old default
+///   (`<downloads>/<old>`, `<cache>/<old>`) becomes the new default; any
+///   other value is kept. The old files are left in place.
+/// - Copies the saved username's password from `old_secrets` to
+///   `new_secrets` (each call bounded by [`KEYRING_TIMEOUT`]); failure is
+///   reported in the result, never an error.
+///
+/// # Errors
+/// As [`migrate_legacy`].
+pub fn migrate_legacy_in(
+    base: &BaseDirs,
+    old: &str,
+    new: &str,
+    old_secrets: &Arc<dyn SecretStore>,
+    new_secrets: &Arc<dyn SecretStore>,
+) -> io::Result<Migration> {
+    let (old_dir, new_dir) = (base.config.join(old), base.config.join(new));
+    let old_file = old_dir.join(CONFIG_FILE);
+    if old == new || new_dir.exists() || !old_file.is_file() {
+        return Ok(Migration::NotNeeded);
+    }
+    let mut cfg = read_file(&old_file)?;
+    let s = &mut cfg.settings;
+    if s.download_dir == base.downloads.join(old) {
+        s.download_dir = base.downloads.join(new);
+    }
+    if s.cache_dir == base.cache.join(old) {
+        s.cache_dir = base.cache.join(new);
+    }
+    write_file(&new_dir.join(CONFIG_FILE), &cfg)?;
+
+    let password = match cfg.username {
+        None => PasswordMigration::NothingSaved,
+        Some(user) => {
+            let u = user.clone();
+            match with_timeout(old_secrets, move |s| s.get(&u)) {
+                Ok(None) => PasswordMigration::NothingSaved,
+                Err(e) => PasswordMigration::Failed(e),
+                Ok(Some(pw)) => match with_timeout(new_secrets, move |s| s.set(&user, &pw)) {
+                    Ok(()) => PasswordMigration::Copied,
+                    Err(e) => PasswordMigration::Failed(e),
+                },
+            }
+        }
+    };
+    if let PasswordMigration::Failed(e) = &password {
+        soulseek_rs::warn!("[config] saved password not migrated from {old} to {new}: {e}");
+    }
+    Ok(Migration::Migrated { password })
 }
 
 /// Run a keyring call on a detached helper thread, giving up after
@@ -351,6 +495,7 @@ pub(crate) mod tests {
             listen_port: 50_000,
             upload_slots: 3,
             port_mapping: false,
+            play_start_timeout_secs: 5,
         }
     }
 
@@ -427,7 +572,151 @@ pub(crate) mod tests {
         let l = load_in(tmp.path(), &mem()).unwrap();
         assert_eq!(l.settings.listen_port, 4000);
         assert_eq!(l.settings.upload_slots, Settings::default().upload_slots);
+        assert_eq!(
+            l.settings.play_start_timeout_secs, 8,
+            "pre-CP1 configs get the default"
+        );
         std::fs::write(&path, "not = [toml").unwrap();
         assert!(load_in(tmp.path(), &mem()).is_err());
+    }
+
+    fn bases(root: &Path) -> BaseDirs {
+        BaseDirs {
+            config: root.join("config"),
+            downloads: root.join("Downloads"),
+            cache: root.join("cache"),
+        }
+    }
+
+    fn legacy(base: &BaseDirs, username: Option<&str>, settings: Settings) {
+        let cfg = ConfigFile {
+            username: username.map(Into::into),
+            settings,
+        };
+        write_file(&base.config.join("goalseek").join(CONFIG_FILE), &cfg).unwrap();
+    }
+
+    fn stores(pw: Option<&str>) -> (Arc<MemoryStore>, Arc<MemoryStore>) {
+        let old = Arc::new(MemoryStore::default());
+        if let Some(pw) = pw {
+            old.map.lock().unwrap().insert("alice".into(), pw.into());
+        }
+        (old, Arc::new(MemoryStore::default()))
+    }
+
+    fn migrate(base: &BaseDirs, old: &Arc<MemoryStore>, new: &Arc<MemoryStore>) -> Migration {
+        let o: Arc<dyn SecretStore> = old.clone();
+        let n: Arc<dyn SecretStore> = new.clone();
+        migrate_legacy_in(base, "goalseek", "holeseek", &o, &n).unwrap()
+    }
+
+    #[test]
+    fn migration_renames_default_dirs_and_copies_password_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = bases(tmp.path());
+        let mut old_settings = sample();
+        old_settings.download_dir = base.downloads.join("goalseek");
+        old_settings.cache_dir = base.cache.join("goalseek");
+        legacy(&base, Some("alice"), old_settings.clone());
+        let (old, new) = stores(Some("pw1"));
+
+        let m = migrate(&base, &old, &new);
+        assert_eq!(
+            m,
+            Migration::Migrated {
+                password: PasswordMigration::Copied
+            }
+        );
+        let n = read_file(&base.config.join("holeseek").join(CONFIG_FILE)).unwrap();
+        assert_eq!(n.username.as_deref(), Some("alice"));
+        assert_eq!(n.settings.download_dir, base.downloads.join("holeseek"));
+        assert_eq!(n.settings.cache_dir, base.cache.join("holeseek"));
+        assert_eq!(
+            n.settings.share_dirs, old_settings.share_dirs,
+            "other settings kept"
+        );
+        assert_eq!(n.settings.listen_port, old_settings.listen_port);
+        assert_eq!(
+            new.map.lock().unwrap().get("alice").map(String::as_str),
+            Some("pw1")
+        );
+        assert!(
+            old.map.lock().unwrap().contains_key("alice"),
+            "old entry left in place"
+        );
+        assert!(
+            base.config.join("goalseek").join(CONFIG_FILE).is_file(),
+            "old config left"
+        );
+
+        // Idempotent: a second run (even with a changed old password) does nothing.
+        old.map.lock().unwrap().insert("alice".into(), "pw2".into());
+        assert_eq!(migrate(&base, &old, &new), Migration::NotNeeded);
+        assert_eq!(
+            new.map.lock().unwrap().get("alice").map(String::as_str),
+            Some("pw1")
+        );
+    }
+
+    #[test]
+    fn migration_keeps_custom_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = bases(tmp.path());
+        legacy(&base, None, sample()); // "/dl", "/cache"
+        let (old, new) = stores(None);
+        assert_eq!(
+            migrate(&base, &old, &new),
+            Migration::Migrated {
+                password: PasswordMigration::NothingSaved
+            }
+        );
+        let n = read_file(&base.config.join("holeseek").join(CONFIG_FILE)).unwrap();
+        assert_eq!(n.settings, sample());
+    }
+
+    #[test]
+    fn migration_survives_unavailable_keyring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = bases(tmp.path());
+        legacy(&base, Some("alice"), sample());
+        let old = Arc::new(MemoryStore {
+            fail: true,
+            ..Default::default()
+        });
+        let new = Arc::new(MemoryStore::default());
+        let m = migrate(&base, &old, &new);
+        assert!(
+            matches!(
+                m,
+                Migration::Migrated {
+                    password: PasswordMigration::Failed(_)
+                }
+            ),
+            "{m:?}"
+        );
+        assert!(base.config.join("holeseek").join(CONFIG_FILE).is_file());
+    }
+
+    #[test]
+    fn migration_not_needed_cases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = bases(tmp.path());
+        let (old, new) = stores(Some("pw"));
+        // No legacy config.
+        assert_eq!(migrate(&base, &old, &new), Migration::NotNeeded);
+        assert!(!base.config.join("holeseek").exists());
+        // New dir already exists (user already ran the new app).
+        legacy(&base, Some("alice"), sample());
+        std::fs::create_dir_all(base.config.join("holeseek")).unwrap();
+        assert_eq!(migrate(&base, &old, &new), Migration::NotNeeded);
+        assert!(new.map.lock().unwrap().is_empty());
+        // Same name: no-op (today's build, APP_NAME == LEGACY_APP_NAME).
+        let o: Arc<dyn SecretStore> = old.clone();
+        let n: Arc<dyn SecretStore> = new.clone();
+        assert_eq!(
+            migrate_legacy_in(&base, "goalseek", "goalseek", &o, &n).unwrap(),
+            Migration::NotNeeded
+        );
+        assert_eq!(APP_NAME, LEGACY_APP_NAME, "rename not flipped yet");
     }
 }

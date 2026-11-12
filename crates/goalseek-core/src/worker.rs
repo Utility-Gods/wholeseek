@@ -33,7 +33,8 @@ pub(crate) struct Tunables {
     pub search_window: Duration,
     pub browse_timeout: Duration,
     pub folder_timeout: Duration,
-    pub play_start_timeout: Duration,
+    /// `None`: `Settings::play_start_timeout_secs` (tests override it).
+    pub play_start_timeout: Option<Duration>,
     pub queue_place_after: Duration,
     pub uploads_every: Duration,
     pub profile_timeout: Duration,
@@ -47,7 +48,7 @@ impl Default for Tunables {
             search_window: Duration::from_secs(15),
             browse_timeout: Duration::from_secs(60),
             folder_timeout: Duration::from_secs(30),
-            play_start_timeout: Duration::from_secs(30),
+            play_start_timeout: None,
             queue_place_after: Duration::from_secs(5),
             uploads_every: Duration::from_secs(1),
             profile_timeout: Duration::from_secs(10),
@@ -55,6 +56,10 @@ impl Default for Tunables {
         }
     }
 }
+
+/// Start of the `TransferFailed` reason for a ▶ that received no data
+/// before `Settings::play_start_timeout_secs`.
+pub const PLAY_STALLED: &str = "no data from";
 
 pub(crate) enum Msg {
     Cmd(Command),
@@ -139,6 +144,8 @@ struct Transfer {
     state: TState,
     /// A play mirroring someone else's fetch has hard-linked the growing file.
     linked: bool,
+    /// When this transfer was (re)started; a ▶'s start deadline counts from here.
+    started: Instant,
 }
 
 /// One library download. Several transfers can subscribe to it (▶ and ↓ of
@@ -1023,6 +1030,7 @@ impl Worker {
                         final_path,
                         state: TState::Failed,
                         linked: false,
+                        started: Instant::now(),
                     },
                 );
                 self.emit(CoreEvent::TransferQueued {
@@ -1048,6 +1056,7 @@ impl Worker {
                 final_path,
                 state: TState::Active,
                 linked: false,
+                started: Instant::now(),
             },
         );
         self.begin(id);
@@ -1089,6 +1098,9 @@ impl Worker {
         };
         let (kind, file, dest_dir) = (t.kind, t.file.clone(), t.dest_dir.clone());
         let key: Key = (file.username.clone(), file.path.clone());
+        if let Some(t) = self.transfers.get_mut(&id) {
+            t.started = Instant::now();
+        }
 
         // 1. Same file already in flight: subscribe (play→keep promotion, G11).
         if let Some(f) = self.fetches.get_mut(&key) {
@@ -1225,7 +1237,8 @@ impl Worker {
                         speed_bytes_per_sec,
                     }) => {
                         if let Some(f) = self.fetches.get_mut(&key) {
-                            f.got_bytes = true;
+                            // The first report after opening the .part can carry 0 bytes.
+                            f.got_bytes |= bytes_downloaded > 0;
                             f.bytes = bytes_downloaded;
                             f.total = total_bytes;
                             f.speed = speed_bytes_per_sec;
@@ -1325,9 +1338,13 @@ impl Worker {
             self.emit(CoreEvent::TransferRemoteQueued { id, place });
         }
 
-        // G8: a ▶ that has not started within the timeout fails, so the UI can
-        // try another source. A ↓ on the same fetch keeps waiting in the queue.
-        if elapsed < t.play_start_timeout {
+        // G8: a ▶ that has received no data within the play-start timeout
+        // fails, so the UI can try another source (`rank::alternates`). A ↓
+        // on the same fetch keeps waiting in the queue.
+        let timeout = t
+            .play_start_timeout
+            .unwrap_or_else(|| Duration::from_secs(self.settings.play_start_timeout_secs));
+        if elapsed < timeout {
             return;
         }
         let Some(f) = self.fetches.get_mut(key) else {
@@ -1340,7 +1357,7 @@ impl Worker {
             .filter(|id| {
                 self.transfers
                     .get(id)
-                    .is_some_and(|t| t.kind == TransferKind::Play)
+                    .is_some_and(|t| t.kind == TransferKind::Play && t.started.elapsed() >= timeout)
             })
             .collect();
         if plays.is_empty() {
@@ -1358,9 +1375,9 @@ impl Worker {
             self.fail(
                 id,
                 format!(
-                    "{} did not start sending within {}s (queued or unreachable); try another source",
+                    "{PLAY_STALLED} {} within {}s (queued or unreachable); try another source",
                     key.0,
-                    t.play_start_timeout.as_secs()
+                    timeout.as_secs()
                 ),
             );
         }

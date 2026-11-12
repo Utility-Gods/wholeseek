@@ -219,7 +219,7 @@ fn tunables() -> Tunables {
         search_window: Duration::from_millis(300),
         browse_timeout: Duration::from_millis(200),
         folder_timeout: Duration::from_millis(100),
-        play_start_timeout: Duration::from_millis(400),
+        play_start_timeout: Some(Duration::from_millis(400)),
         queue_place_after: Duration::from_millis(50),
         uploads_every: Duration::from_millis(20),
         profile_timeout: Duration::from_millis(300),
@@ -228,6 +228,10 @@ fn tunables() -> Tunables {
 }
 
 fn harness_with(f: impl FnOnce(&mut Settings, &Path)) -> H {
+    harness_tuned(tunables(), f)
+}
+
+fn harness_tuned(t: Tunables, f: impl FnOnce(&mut Settings, &Path)) -> H {
     let tmp = tempfile::tempdir().unwrap();
     let mut settings = Settings {
         download_dir: tmp.path().join("downloads"),
@@ -237,7 +241,7 @@ fn harness_with(f: impl FnOnce(&mut Settings, &Path)) -> H {
     };
     f(&mut settings, tmp.path());
     let conn = Arc::new(FakeConnector::default());
-    let (core, ev) = Core::start_with(settings, conn.clone(), tunables()).unwrap();
+    let (core, ev) = Core::start_with(settings, conn.clone(), t).unwrap();
     H {
         core,
         ev,
@@ -1240,4 +1244,79 @@ fn profile_pending_at_session_loss_fails() {
     s.st().loss = Some(SessionLoss::Displaced);
     let e = h.want("failed", is_profile);
     assert!(matches!(e, CoreEvent::UserProfileFailed { .. }), "{e:?}");
+}
+
+// ------------------------------------------------------- ▶ start deadline
+
+fn is_failed(id: TransferId) -> impl Fn(&CoreEvent) -> bool {
+    move |e| matches!(e, CoreEvent::TransferFailed { id: i, .. } if *i == id)
+}
+
+#[test]
+fn play_start_deadline_comes_from_settings_and_ignores_zero_byte_progress() {
+    let t = Tunables {
+        play_start_timeout: None,
+        ..tunables()
+    };
+    let h = harness_tuned(t, |s, _| s.play_start_timeout_secs = 1);
+    let s = h.online();
+    let started = Instant::now();
+    let p = h.core.play_fetch(&rfile(r"a\1.flac", 4));
+    let d = h.core.download(&rfile(r"a\2.flac", 4));
+    wait_until("lib downloads", || s.st().downloads.len() == 2);
+    // The library's report right after opening the .part carries 0 bytes: not data.
+    s.progress(0, b"", 4);
+    let e = h.want("stall", is_failed(p.id));
+    let waited = started.elapsed();
+    let CoreEvent::TransferFailed { reason, .. } = e else {
+        unreachable!()
+    };
+    assert!(reason.starts_with(crate::PLAY_STALLED), "{reason}");
+    assert!(
+        waited >= Duration::from_millis(950),
+        "fired after {waited:?}"
+    );
+    assert!(waited < Duration::from_secs(3), "fired after {waited:?}");
+    wait_until("lib cancel", || {
+        s.st().cancels == vec![("alice".into(), r"a\1.flac".into())]
+    });
+    // The ↓ that is just as silent is not failed by the ▶ deadline.
+    h.none_within(Duration::from_millis(300), is_failed(d));
+}
+
+#[test]
+fn play_with_data_before_the_deadline_is_not_failed() {
+    let h = harness();
+    let s = h.online();
+    let p = h.core.play_fetch(&rfile(r"a\1.flac", 4));
+    wait_until("lib download", || s.st().downloads.len() == 1);
+    s.progress(0, b"ab", 4);
+    h.none_within(Duration::from_millis(700), is_failed(p.id));
+    assert!(s.st().cancels.is_empty());
+}
+
+#[test]
+fn play_joining_a_long_queued_download_gets_its_own_deadline() {
+    let h = harness();
+    let s = h.online();
+    let f = rfile(r"a\1.flac", 4);
+    let d = h.core.download(&f);
+    wait_until("lib download", || s.st().downloads.len() == 1);
+    std::thread::sleep(Duration::from_millis(500)); // longer than the 400 ms ▶ deadline
+    let joined = Instant::now();
+    let p = h.core.play_fetch(&f);
+    h.want("stall", is_failed(p.id));
+    assert!(
+        joined.elapsed() >= Duration::from_millis(380),
+        "{:?}",
+        joined.elapsed()
+    );
+    assert!(
+        s.st().cancels.is_empty(),
+        "the ↓ keeps the library transfer"
+    );
+    // The ↓ still completes.
+    s.progress(0, b"abcd", 4);
+    s.complete(0);
+    h.want("dl done", is_done(d));
 }

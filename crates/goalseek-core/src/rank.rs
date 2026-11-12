@@ -71,6 +71,87 @@ pub fn rank(hits: &mut Vec<SearchHit>, audio_only: bool) {
     });
 }
 
+/// Track title of a remote path for matching copies across users: the
+/// basename without extension, lower-cased, leading track/disc numbers
+/// (`01 - `, `1-02.`, `03_`) removed, then only letters and digits kept.
+/// A name that is nothing but a number keeps it (`1999.flac` → `1999`).
+#[must_use]
+pub fn normalized_title(path: &str) -> String {
+    let base = crate::paths::remote_basename(path);
+    let stem = base
+        .rfind('.')
+        .filter(|&i| i > 0)
+        .map_or(base, |i| &base[..i]);
+    let lower = stem.to_lowercase();
+    let stripped = lower.trim_start_matches(|c: char| {
+        c.is_ascii_digit()
+            || c.is_whitespace()
+            || matches!(c, '-' | '.' | '_' | '(' | ')' | '[' | ']')
+    });
+    let keep = if stripped.chars().any(char::is_alphanumeric) {
+        stripped
+    } else {
+        lower.as_str()
+    };
+    keep.chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+fn same_title(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    // "Artist - Title" vs "Title": the longer name ends with the shorter one,
+    // which must be long enough not to match everything ("intro").
+    let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
+    short.chars().count() >= 6 && long.ends_with(short)
+}
+
+fn size_within_1pct(a: u64, b: u64) -> bool {
+    a.abs_diff(b).saturating_mul(100) <= a.max(b)
+}
+
+/// Other users' copies of `file` among `hits`, best first, for ▶ fallback.
+///
+/// A hit matches when its [`normalized_title`] equals `file`'s (or one ends
+/// with the other, at least 6 characters) **and** either the size is within
+/// 1 % or both durations are known and equal (a different encoding of the
+/// same track). `file.username` is excluded; one entry per user (its best).
+/// Order: free slot first, then same format as `file`, then faster peer.
+#[must_use]
+pub fn alternates(file: &RemoteFile, hits: &[SearchHit]) -> Vec<RemoteFile> {
+    let title = normalized_title(&file.path);
+    let ext = extension(&file.path);
+    let mut found: Vec<&SearchHit> = hits
+        .iter()
+        .filter(|h| h.file.username != file.username)
+        .filter(|h| {
+            let same_duration = matches!(
+                (file.attrs.duration_secs, h.file.attrs.duration_secs),
+                (Some(a), Some(b)) if a == b
+            );
+            (size_within_1pct(file.size, h.file.size) || same_duration)
+                && same_title(&title, &normalized_title(&h.file.path))
+        })
+        .collect();
+    found.sort_by(|a, b| {
+        b.free_slot
+            .cmp(&a.free_slot)
+            .then_with(|| (extension(&b.file.path) == ext).cmp(&(extension(&a.file.path) == ext)))
+            .then(b.speed.cmp(&a.speed))
+            .then_with(|| a.file.username.cmp(&b.file.username))
+            .then_with(|| a.file.path.cmp(&b.file.path))
+    });
+    let mut seen = std::collections::HashSet::new();
+    found
+        .into_iter()
+        .filter(|h| seen.insert(h.file.username.clone()))
+        .map(|h| h.file.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +225,95 @@ mod tests {
         assert_eq!(h.file.attrs.bit_depth, Some(16));
         assert_eq!(h.file.basename(), "01.flac");
         assert_eq!(h.file.folder(), r"Music\Album");
+    }
+
+    fn alt(
+        user: &str,
+        path: &str,
+        size: u64,
+        dur: Option<u32>,
+        free: bool,
+        speed: u32,
+    ) -> SearchHit {
+        SearchHit {
+            file: RemoteFile {
+                username: user.into(),
+                path: path.into(),
+                size,
+                attrs: AudioAttrs {
+                    duration_secs: dur,
+                    ..AudioAttrs::default()
+                },
+            },
+            free_slot: free,
+            speed,
+        }
+    }
+
+    #[test]
+    fn normalized_title_strips_numbers_case_and_punctuation() {
+        assert_eq!(normalized_title(r"a\01 - Xtal.flac"), "xtal");
+        assert_eq!(normalized_title(r"a\1-01. Xtal.FLAC"), "xtal");
+        assert_eq!(normalized_title("b/03_Xtal!.mp3"), "xtal");
+        assert_eq!(
+            normalized_title(r"a\(07) We Are the Music Makers.flac"),
+            "wearethemusicmakers"
+        );
+        assert_eq!(normalized_title(r"a\1999.flac"), "1999");
+        assert_eq!(normalized_title(r"a\Ágeispolis.flac"), "ágeispolis");
+    }
+
+    #[test]
+    fn alternates_match_same_track_from_other_users_ranked() {
+        let file = alt(
+            "orig",
+            r"Music\SAW\01 Xtal.flac",
+            1_000_000,
+            Some(294),
+            true,
+            9,
+        )
+        .file;
+        let hits = vec![
+            alt("orig", r"other\01 Xtal.flac", 1_000_000, None, true, 99), // same user
+            alt("slow", r"x\01 - xtal.flac", 1_004_000, None, true, 10),   // size within 1%
+            alt("fast", r"y\Xtal.flac", 1_000_000, None, true, 500),
+            alt("busy", r"z\1-01 Xtal.flac", 1_000_000, None, false, 9_999), // no free slot
+            alt("mp3", r"m\01 Xtal.mp3", 300_000, Some(294), true, 800),     // same duration
+            alt("fast", r"y2\Xtal (copy).flac", 1_000_000, None, true, 900), // other title
+            alt("fast", r"y3\01 Xtal.flac", 999_000, None, true, 400),       // 2nd copy, same user
+        ];
+        let users: Vec<_> = alternates(&file, &hits)
+            .into_iter()
+            .map(|f| f.username)
+            .collect();
+        assert_eq!(users, ["fast", "slow", "mp3", "busy"]);
+    }
+
+    #[test]
+    fn alternates_reject_different_tracks() {
+        let file = alt("orig", r"a\01 Intro.flac", 1_000_000, Some(60), true, 1).file;
+        let hits = vec![
+            alt("a", r"x\01 Intro.flac", 1_020_000, None, true, 1), // 2% off, no duration
+            alt("b", r"x\01 Intro.flac", 1_020_000, Some(61), true, 1), // duration differs
+            alt("c", r"x\02 Outro.flac", 1_000_000, Some(60), true, 1), // other title
+            alt("d", r"x\Album Intro.flac", 1_000_000, Some(60), true, 1), // "intro" too short to suffix-match
+            alt("e", r"x\cover.jpg", 1_000_000, None, true, 1),
+        ];
+        assert!(alternates(&file, &hits).is_empty());
+    }
+
+    #[test]
+    fn alternates_accept_artist_prefixed_names_for_long_titles() {
+        let file = alt("orig", r"a\04 Ageispolis.flac", 34_909_356, None, true, 1).file;
+        let hits = vec![alt(
+            "p",
+            r"x\Aphex Twin - Ageispolis.flac",
+            34_909_356,
+            None,
+            true,
+            1,
+        )];
+        assert_eq!(alternates(&file, &hits).len(), 1);
     }
 }

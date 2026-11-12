@@ -179,7 +179,7 @@ No separate rescan call: rescan = `set_shared_directories(same dirs)`.
 | G5 | **Done** | ▶ into `cache/t<id>/`. ↓ streams into `downloads/.goalseek-partial/t<id>/` and is moved to `downloads/<folder>/` on completion; existing names get ` (1)`, ` (2)` … — never overwritten. `TransferQueued/Progress.part_path` is the real growing file. |
 | G6 | **Done** | `Disconnected{Network, will_retry:true}` → reconnect after 2 s, doubling, max 60 s (reset on success). `LoginRejected` / `Displaced` / `User` → no retry. Login while connected restarts the session. |
 | G7 | Accepted | `DisconnectReason::LoginRejected`. |
-| G8 | **Done** | ▶ that sends no bytes within 30 s → `TransferFailed` ("…try another source"), library transfer cancelled unless a ↓ shares it. Browse fails after 60 s, folder contents falls back after 30 s. After 5 s without bytes: `TransferRemoteQueued { place: None }`, then the polled place when known. |
+| G8 | **Done** | ▶ that has received no data within `Settings::play_start_timeout_secs` (default 8 s, counted from that ▶'s own start) → `TransferFailed`, reason starts with `PLAY_STALLED` ("no data from <user> within …"); library transfer cancelled unless a ↓ shares it (§3.5). Browse fails after 60 s, folder contents falls back after 30 s. After 5 s without bytes: `TransferRemoteQueued { place: None }`, then the polled place when known. |
 | G9 | Open | Upstream request before release. |
 | G10 | **Done** | `connect` (share scan) on a connect helper thread; `set_shares`/`rescan_shares` on a shares helper thread; offline, `ShareCounts` comes from a local scan. |
 | G11 | **Done** | One library transfer per (user, path); further ▶/↓ subscribe to it. ↓ during ▶ = promotion (cache copy kept, ↓ gets a hard link/copy). ▶ during ↓ gets a hard link to the growing `.part` at its ticket path. Second ↓ of the same file → `TransferFailed("already being downloaded …")`. `cancel` only cancels the library transfer when the last subscriber leaves. |
@@ -347,17 +347,60 @@ pub struct UserProfile {
   → `build_user_info(upload_slots, upload queue length, has free slot)`, empty description, no
   picture). Nothing to do in goalseek-core.
 
-### 3.3 Tests
+### 3.5 ▶ source fallback (additive)
 
-Offline: `cargo test -p goalseek-core` — paths, ranking, cache scan/eviction plan, config round
-trip with a temp dir and in-memory keyring, backoff, and the worker against a fake
-session/connector (login/reject/backoff/displaced, search deltas, browse timeout, folder fallback,
-cache-only play, promotion, cache reuse across restart, timeouts + retry, eviction, shares, uploads).
+Live data: many peers that advertise a free slot never send (3 of 4 in one run).
 
-Live (`#[ignore]`, needs `GOALSEEK_USER`/`GOALSEEK_PASS`):
-`cargo test -p goalseek-core --test live -- --ignored --nocapture` — login, search
-(`GOALSEEK_QUERY`, default "aphex twin"), top FLAC hits, browse the top user, `play_fetch` with time to
-first `TransferProgress`, cancel, assert the downloads dir is empty. **Not run yet.**
+- `Settings::play_start_timeout_secs: u64` (default 8; `#[serde(default)]`, so older config files
+  load). A ▶ that has received **no data** (a progress report with 0 bytes, as the library sends on
+  opening the `.part`, does not count) that long after its own start is cancelled and reported as
+  **`CoreEvent::TransferFailed { id, reason }`**, with `reason` starting with
+  `goalseek_core::PLAY_STALLED` (`"no data from"`). No new variant: the app matches `CoreEvent`
+  exhaustively and is mid-restructure, and every ▶ failure before playback should trigger the same
+  fallback anyway. `retry(id)` still works. ↓ is unaffected (keeps waiting in the remote queue); a
+  ▶ attached to a ↓ fails on its own deadline but leaves the ↓'s library transfer running.
+- `rank::alternates(file: &RemoteFile, hits: &[SearchHit]) -> Vec<RemoteFile>`: other users' copies
+  of the same track, best first. Match = `rank::normalized_title` equal (basename without
+  extension, lower-case, leading track/disc numbers and punctuation removed, letters+digits only;
+  or one title ends with the other when the shorter is ≥ 6 chars, for "Artist - Title") **and**
+  (size within 1 % **or** both durations known and equal). Excludes `file.username`; one entry per
+  user. Order: free slot, then same extension as `file`, then speed.
+- App wiring: on a ▶ `TransferFailed` before playback starts, `play_fetch` the next of
+  `alternates(&file, &hits_of_that_search)`.
+
+### 3.6 Rename prep — `config::migrate_legacy` (additive)
+
+- `config::APP_NAME` (`"goalseek"`) names the config dir, default download/cache dirs, log path and
+  keyring service (`KEYRING_SERVICE = APP_NAME`); `config::LEGACY_APP_NAME` (`"goalseek"`) is the
+  previous name. The Holeseek rename flips `APP_NAME = "holeseek"`, `LEGACY_APP_NAME = "goalseek"`.
+- `config::migrate_legacy() -> io::Result<Migration>`: call once at startup, before `load()`.
+  Idempotent — does nothing if the names are equal (today), the new config dir exists, or there is
+  no old `config.toml`. Otherwise copies `config.toml` to the new dir, replacing `download_dir` /
+  `cache_dir` only when they equal the old defaults (`<XDG downloads>/<old>`, `<XDG cache>/<old>`),
+  and copies the saved username's password from keyring service `<old>` to `<new>` (each call bounded
+  by `KEYRING_TIMEOUT`). Old files/entries are left in place. Result:
+  `Migration::{NotNeeded, Migrated { password: PasswordMigration::{Copied, NothingSaved, Failed(msg)} }}`;
+  a keyring failure is logged and returned, never an error (the user signs in again).
+- Testable form: `migrate_legacy_in(&BaseDirs { config, downloads, cache }, old, new, &old_store, &new_store)`.
+  Also new: `config::BaseDirs::system()`, `config::NamedKeyringStore { service }`.
+
+### 3.7 Tests
+
+Offline: `cargo test -p goalseek-core` — paths, ranking + `alternates` matching, cache
+scan/eviction plan, config round trip + legacy migration with a temp dir and in-memory keyring,
+backoff, and the worker against a fake session/connector (login/reject/backoff/displaced, search
+deltas, browse timeout, folder fallback, cache-only play, promotion, cache reuse across restart,
+▶ start deadline + retry, eviction, shares, uploads, user profile).
+
+Live (`#[ignore]`, throwaway accounts only, never the user's own; `--nocapture`):
+- `live_core_end_to_end` (`GOALSEEK_USER`/`GOALSEEK_PASS`, `GOALSEEK_LISTEN_PORT`): login, search
+  (`GOALSEEK_QUERY`, default "aphex twin"), top FLAC hits, browse + profile of the top user,
+  `play_fetch` with time to first `TransferProgress`, cancel, downloads dir stays empty.
+  Proof: `proof/cp1/live/profile-live.log`.
+- `live_share_upload_between_two_accounts` (+ `GOALSEEK_USER2`/`GOALSEEK_PASS2`,
+  `GOALSEEK_PORT_A`=2241, `GOALSEEK_PORT_B`=2242, ffmpeg): A shares a generated FLAC, B browses A
+  and downloads it, bytes must match, A must emit an `Uploads` row for B. Proof:
+  `proof/cp1/live/shares-live.log`.
 
 ## 4. Smoke example
 
