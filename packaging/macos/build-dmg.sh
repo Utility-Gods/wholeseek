@@ -1,25 +1,19 @@
 #!/usr/bin/env bash
-# Build an unsigned (ad-hoc signed) Wholeseek.app and DMG on your Mac.
+# Build an unsigned (ad-hoc signed) Wholeseek.app and DMG for Apple Silicon Macs.
 # Writes to target/macos-dist/ (gitignored). Needs Xcode command line tools + rustup.
-#   packaging/macos/build-dmg.sh               # this Mac's chip only (fast)
-#   UNIVERSAL=1 packaging/macos/build-dmg.sh   # Apple Silicon + Intel in one app
-#   SKIP_BUILD=1 packaging/macos/build-dmg.sh  # reuse target/<triple>/release
+#   packaging/macos/build-dmg.sh               # build, bundle, DMG
+#   SKIP_BUILD=1 packaging/macos/build-dmg.sh  # reuse target/aarch64-apple-darwin/release
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 cd "$root"
 
-if [ -n "${UNIVERSAL:-}" ]; then
-  targets=(aarch64-apple-darwin x86_64-apple-darwin)
-  flavour=universal
-else
-  case $(uname -m) in
-    arm64) targets=(aarch64-apple-darwin); flavour=arm64 ;;
-    *) targets=(x86_64-apple-darwin); flavour=x86_64 ;;
-  esac
-fi
+# Apple Silicon only.
+targets=(aarch64-apple-darwin)
+flavour=apple-silicon
 rustup target add "${targets[@]}" >/dev/null
 export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-12.0}
+[ "$(uname -m)" = arm64 ] || echo "note: building an Apple Silicon app on an Intel Mac (it will not run here)" >&2
 
 version=$(cargo metadata --format-version 1 --no-deps \
   | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="wholeseek"))')
