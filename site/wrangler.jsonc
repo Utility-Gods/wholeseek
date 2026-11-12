@@ -1,5 +1,6 @@
 // wholeseek.utilitygods.com: static page served by Cloudflare Workers (no server code).
-// Deployed by .github/workflows/site.yml on pushes to main that touch site/.
+// Deployed by Cloudflare Workers Builds (Git integration): root "site",
+// deploy command "npx wrangler deploy", watch path "site/*".
 {
   "name": "wholeseek-site",
   "compatibility_date": "2026-11-01",
