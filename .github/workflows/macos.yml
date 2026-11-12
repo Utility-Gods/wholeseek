@@ -48,5 +48,9 @@ jobs:
           DMG: ${{ steps.dmg.outputs.dmg }}
         run: |
           gh release view "$TAG" >/dev/null 2>&1 \
-            || gh release create "$TAG" --title "$TAG" --generate-notes
-          gh release upload "$TAG" "$DMG" --clobber
+            || gh release create "$TAG" --title "wholeseek $TAG" --generate-notes
+          # Stable name so websites can link to
+          # https://github.com/Utility-Gods/wholeseek/releases/latest/download/wholeseek-macos-apple-silicon.dmg
+          stable="$(dirname "$DMG")/wholeseek-macos-apple-silicon.dmg"
+          cp "$DMG" "$stable"
+          gh release upload "$TAG" "$DMG" "$stable" --clobber
