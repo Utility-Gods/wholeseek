@@ -2,7 +2,7 @@
 # Build wholeseek.icns from assets/wholeseek.svg (macOS only: needs iconutil).
 # Usage: make-icns.sh <svg> <out.icns> [fallback.png]
 # Renders with rsvg-convert when available (brew install librsvg); otherwise
-# scales the fallback PNG with sips (sizes above its own are upscaled).
+# scales the 1024 px fallback PNG down with sips (built into macOS).
 set -euo pipefail
 svg=$1 out=$2 png=${3:-}
 work=$(mktemp -d)

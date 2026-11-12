@@ -28,6 +28,18 @@ cargo test --workspace
 
 Your password is kept in the system keyring; settings live in `~/.config/wholeseek/`.
 
+### macOS (experimental)
+
+Build a DMG on your Mac (needs `xcode-select --install` and [rustup](https://rustup.rs)):
+
+```sh
+packaging/macos/build-dmg.sh               # this Mac's chip
+UNIVERSAL=1 packaging/macos/build-dmg.sh   # Apple Silicon + Intel
+```
+
+The DMG lands in `target/macos-dist/`. It is unsigned, so open it the first time with
+right-click → Open.
+
 ## Layout
 
 | Path | What |
