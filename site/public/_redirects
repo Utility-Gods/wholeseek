@@ -1,0 +1,5 @@
+# Latest release assets from GitHub Releases (302, so a new release needs no site change).
+/download        https://github.com/Utility-Gods/wholeseek/releases/latest/download/wholeseek-macos-apple-silicon.dmg 302
+/download/mac    https://github.com/Utility-Gods/wholeseek/releases/latest/download/wholeseek-macos-apple-silicon.dmg 302
+/download/linux  https://github.com/Utility-Gods/wholeseek/releases/latest/download/wholeseek-linux-x86_64.tar.gz 302
+/github          https://github.com/Utility-Gods/wholeseek 302

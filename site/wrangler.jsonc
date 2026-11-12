@@ -1,0 +1,11 @@
+// wholeseek.utilitygods.com: static page served by Cloudflare Workers (no server code).
+// Cloudflare Workers Builds deploys this from the repo: root directory "site",
+// deploy command "npx wrangler deploy", build watch path "site/*".
+{
+  "name": "wholeseek-site",
+  "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "404-page"
+  }
+}
