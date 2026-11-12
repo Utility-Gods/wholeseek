@@ -948,9 +948,11 @@ fn live_release_check() {
         });
         step(
             "download_folder ×2 fan-out",
-            contents <= 1 && queued.len() >= 2 && foldered && failed == 0,
+            // Peers refusing uploads (`failed`) are their business, not the fan-out's: one
+            // reply, both waiters expanded (each file queued twice, second copy refused).
+            contents == 1 && queued.len() == 2 * refused && foldered,
             format!(
-                "FolderContents×{contents}; queued {}; done in a {in_a}, in b {in_b}; refused dup {refused}; all in <root>/<album>/: {foldered}",
+                "FolderContents×{contents}; queued {}; done in a {in_a}, in b {in_b}; refused dup {refused}; peer-failed {failed}; all in <root>/<album>/: {foldered}",
                 queued.len()
             ),
         );
