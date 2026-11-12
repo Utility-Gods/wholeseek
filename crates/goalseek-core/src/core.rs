@@ -15,12 +15,13 @@
 use crate::event::CoreEvent;
 use crate::model::{Credentials, PlayTicket, RemoteFile, SearchId, Settings, TransferId};
 use crate::net::{Connector, RealConnector};
+use crate::status::CoreStatus;
 use crate::worker::{Msg, Tunables, Worker};
 use crate::{cache, paths};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -69,6 +70,8 @@ pub enum Command {
     },
     /// Additive: fetch a user's profile (server stats + peer UserInfo).
     UserProfile(String),
+    /// Additive: delete cached plays except those in use.
+    ClearCache,
     Shutdown,
 }
 
@@ -78,6 +81,7 @@ pub struct Core {
     tx: Sender<Msg>,
     next_id: Arc<AtomicU64>,
     settings: Settings,
+    status: Arc<Mutex<CoreStatus>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -104,6 +108,7 @@ impl Core {
         let staging = settings.download_dir.join(paths::STAGING_DIR_NAME);
         let first = cache::max_transfer_id(&[&settings.cache_dir, &staging]) + 1;
         let ids = Arc::new(AtomicU64::new(first));
+        let status = Arc::new(Mutex::new(CoreStatus::default()));
         let worker = Worker::new(
             ev_tx,
             tx.clone(),
@@ -111,6 +116,7 @@ impl Core {
             tunables,
             settings.clone(),
             ids.clone(),
+            status.clone(),
         );
         let handle = std::thread::Builder::new()
             .name("goalseek-core".into())
@@ -120,6 +126,7 @@ impl Core {
                 tx,
                 next_id: ids,
                 settings,
+                status,
                 worker: Some(handle),
             },
             ev_rx,
@@ -255,6 +262,20 @@ impl Core {
     /// within 10 s.
     pub fn user_profile(&self, username: &str) {
         self.send(Command::UserProfile(username.to_string()));
+    }
+
+    /// Additive: the current [`CoreStatus`] snapshot (reconnect countdown,
+    /// listen port really bound and why, running searches' progress, cache
+    /// usage). Cheap; meant to be read every frame.
+    #[must_use]
+    pub fn status(&self) -> CoreStatus {
+        self.status.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// Additive: delete cached plays (`cache/t*`), keeping the current play
+    /// and plays still being fetched. `status().cache` shows the result.
+    pub fn clear_cache(&self) {
+        self.send(Command::ClearCache);
     }
 
     /// Apply new settings. A changed listen port reconnects the session.

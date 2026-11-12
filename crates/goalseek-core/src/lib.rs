@@ -13,6 +13,7 @@ mod net;
 pub mod paths;
 mod port_mapping;
 pub mod rank;
+pub mod status;
 mod worker;
 
 pub use crate::core::{Command, Core, NOT_IMPLEMENTED, POLL_TICK};
@@ -22,6 +23,7 @@ pub use model::{
     AudioAttrs, BrowseDir, Credentials, PlayTicket, RemoteFile, SearchHit, SearchId, Settings,
     TransferId, TransferKind, UploadRow, UploadState, UserProfile,
 };
+pub use status::{CacheUsage, CoreStatus, ListenStatus, ReconnectStatus, SearchProgress};
 
 /// Client version goalseek reports on login. Major 176 is reserved for
 /// soulseek-rs-based clients; minor 1 is "unidentified" until we reserve our

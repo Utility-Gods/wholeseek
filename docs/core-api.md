@@ -177,13 +177,13 @@ No separate rescan call: rescan = `set_shared_directories(same dirs)`.
 | G3 | **Done** | Worker tick `POLL_TICK` (150 ms) polls session loss, search counts, browse/folder answers, download status channels, uploads (1 s). |
 | G4 | **Done** | Search window 15 s on a helper thread (`search_with_cancel`); deltas `results[seen..]` ranked per batch; a repeat of a live query ends the old `SearchId` first; `forget_search` on finish/cancel (deferred until the helper returns). Offline/empty query → `Error` + `SearchFinished { total_files: 0 }`. |
 | G5 | **Done** | ▶ into `cache/t<id>/`. ↓ streams into `downloads/.goalseek-partial/t<id>/` and is moved to `downloads/<folder>/` on completion; existing names get ` (1)`, ` (2)` … — never overwritten. `TransferQueued/Progress.part_path` is the real growing file. |
-| G6 | **Done** | `Disconnected{Network, will_retry:true}` → reconnect after 2 s, doubling, max 60 s (reset on success). `LoginRejected` / `Displaced` / `User` → no retry. Login while connected restarts the session. |
+| G6 | **Done** | `Disconnected{Network("… — reconnecting in N s (attempt k)"), will_retry:true}` → reconnect after 2, 5, 15, 30, then 60 s (reset on success); countdown in `status().reconnect` (§3.8). The new session re-announces shares and the bound port at login. `LoginRejected` / `Displaced` / `User` → no retry. Login while connected restarts the session. |
 | G7 | Accepted | `DisconnectReason::LoginRejected`. |
 | G8 | **Done** | ▶ that has received no data within `Settings::play_start_timeout_secs` (default 8 s, counted from that ▶'s own start) → `TransferFailed`, reason starts with `PLAY_STALLED` ("no data from <user> within …"); library transfer cancelled unless a ↓ shares it (§3.5). Browse fails after 60 s, folder contents falls back after 30 s. After 5 s without bytes: `TransferRemoteQueued { place: None }`, then the polled place when known. |
 | G9 | Open | Upstream request before release. |
 | G10 | **Done** | `connect` (share scan) on a connect helper thread; `set_shares`/`rescan_shares` on a shares helper thread; offline, `ShareCounts` comes from a local scan. |
 | G11 | **Done** | One library transfer per (user, path); further ▶/↓ subscribe to it. ↓ during ▶ = promotion (cache copy kept, ↓ gets a hard link/copy). ▶ during ↓ gets a hard link to the growing `.part` at its ticket path. Second ↓ of the same file → `TransferFailed("already being downloaded …")`. `cancel` only cancels the library transfer when the last subscriber leaves. |
-| G12 | **Done** | `Connected { listen_port }` = bound port; port mapping uses it. |
+| G12 | **Done** | `Connected { listen_port }` = bound port; port mapping uses it. If it differs from `Settings::listen_port`, an `Error { context: "listen_port" }` explains why and `status().listen` keeps `{requested, bound, note}` (§3.8). Reconnects wait (≤ 5 s) for the old session to release the port, so our own previous session no longer causes the fallback. |
 | G13 | **Done** | `goalseek_core::config::init_logging(&default_log_path())` (unsafe: call first in `main`) → `~/.cache/goalseek/slsk.log`, Info level. |
 | G14 | **Done** | Folder contents: exact (case/slash-insensitive) match, else the whole reply; no reply within 30 s → full browse of the user, then the folder is picked from it. |
 | G15 | Open (upstream) | See §3.4; everything else in the profile is served. |
@@ -217,6 +217,8 @@ impl Core {
     pub fn set_audio_only(&self, on: bool);      // search batch filter, default on
     pub fn cancel_upload(&self, username: &str, path: &str);  // then an Uploads snapshot
     pub fn user_profile(&self, username: &str);  // → UserProfile* events (§3.4)
+    pub fn status(&self) -> CoreStatus;          // polled snapshot (§3.8)
+    pub fn clear_cache(&self);                   // keeps plays in use (§3.8)
 }
 
 // src/event.rs
@@ -244,7 +246,7 @@ pub enum CoreEvent {
 }
 ```
 
-`Command` gained `SetAudioOnly(bool)`, `CancelUpload { username, path }` and `UserProfile(String)` (additive).
+`Command` gained `SetAudioOnly(bool)`, `CancelUpload { username, path }` `UserProfile(String)` and `ClearCache` (additive).
 
 Data (`src/model.rs`): `RemoteFile { username, path, size, attrs: AudioAttrs }`,
 `SearchHit { file, free_slot, speed }`, `BrowseDir { path, files }`, `UploadRow`, `Settings`
@@ -384,13 +386,62 @@ Live data: many peers that advertise a free slot never send (3 of 4 in one run).
 - Testable form: `migrate_legacy_in(&BaseDirs { config, downloads, cache }, old, new, &old_store, &new_store)`.
   Also new: `config::BaseDirs::system()`, `config::NamedKeyringStore { service }`.
 
+### 3.8 Status snapshot — `Core::status()` (additive)
+
+The app matches `CoreEvent` and `DisconnectReason` exhaustively, so nothing below adds a variant.
+Instead `Core::status() -> CoreStatus` returns a snapshot refreshed every tick (150 ms) and after
+every command/internal message, i.e. current by the time the UI handles the matching event.
+
+```rust
+pub struct CoreStatus {
+    pub reconnect: Option<ReconnectStatus>, // { attempt: u32 (1-based), delay, at: Instant }; .in_secs()
+    pub listen: ListenStatus,               // { requested: u16, bound: Option<u16>, note: Option<String> }
+    pub searches: Vec<SearchProgress>,      // open windows: { id, query, files, users, ends_at }; .remaining()
+    pub cache: CacheUsage,                  // { used_bytes, cap_bytes, in_use_bytes }
+}
+pub fn clear_cache(&self);                  // Command::ClearCache
+```
+
+**(a) Session loss.** "Another login took this username" is `DisconnectReason::Displaced`
+(`will_retry: false`, credentials dropped, never retried) — already distinct, so no
+`KickedByOtherLogin` variant. A network drop or failed login attempt (not a rejection) sends
+`Disconnected { Network("the connection to the server dropped — reconnecting in 5 s (attempt 2)"),
+will_retry: true }` and sets `status().reconnect` until the attempt starts; delays 2, 5, 15, 30,
+60 s (cap), reset after a successful login. That message + snapshot replace the requested
+`Reconnecting { attempt, in_secs }` event. Each new session is built with the current
+`share_dirs` and the library sends SharedFoldersFiles + the bound port right after login, then
+`ShareCounts` is emitted again.
+
+**(b) Search progress.** Results stream as `SearchResults` deltas for the whole window (15 s), not
+only the first batch; `status().searches` has the running file and distinct-user counts and
+`ends_at` for "128 results from 34 users… still searching (9 s left)". The definite end is
+`SearchFinished { total_files }`, sent when the window closes (or on cancel / a repeat of the same
+query / session loss); the search then leaves `status().searches`.
+
+**(c) Listen port.** soulseek-rs binds `Settings::listen_port` and, **only if it is in use**
+(`AddrInUse`), silently falls back to an OS-chosen port and advertises that one. Core reports the
+real port in `Connected { listen_port }` and `status().listen.bound`; when they differ,
+`status().listen.note` and an `Error { context: "listen_port", message }` say "port 2234 is in use
+(another Soulseek client or another copy of the app is listening on it), so the system picked port
+45543; …". A likely cause of the user's "2234 vs 45543" is fixed: a reconnect could start while
+the previous session was still held by a search helper thread (still bound to 2234); reconnects
+now wait up to 5 s for it to be dropped. Another running instance (or any program on 2234) still
+causes the fallback, and is now explained.
+
+**Cache.** `status().cache.used_bytes` is the size of `cache/t*` (rescanned every 2 s and after
+completions/eviction/clear); `in_use_bytes` is the part eviction and `clear_cache()` keep — the
+current play and plays still being fetched. `clear_cache()` deletes the rest and forgets them, so a
+later ▶ of a cleared file fetches it again.
+
 ### 3.7 Tests
 
 Offline: `cargo test -p goalseek-core` — paths, ranking + `alternates` matching, cache
 scan/eviction plan, config round trip + legacy migration with a temp dir and in-memory keyring,
 backoff, and the worker against a fake session/connector (login/reject/backoff/displaced, search
 deltas, browse timeout, folder fallback, cache-only play, promotion, cache reuse across restart,
-▶ start deadline + retry, eviction, shares, uploads, user profile).
+▶ start deadline + retry, eviction, shares, uploads, user profile, displaced vs. network-drop
+reconnect with backoff status and share re-announce, port release before reconnect, bound-port note,
+search progress over several batches, cache usage + `clear_cache`).
 
 Live (`#[ignore]`, throwaway accounts only, never the user's own; `--nocapture`):
 - `live_core_end_to_end` (`GOALSEEK_USER`/`GOALSEEK_PASS`, `GOALSEEK_LISTEN_PORT`): login, search

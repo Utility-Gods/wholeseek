@@ -204,10 +204,16 @@ pub(crate) fn scan_counts(dirs: &[std::path::PathBuf]) -> (u32, u32) {
     (s.folder_count(), s.file_count())
 }
 
-/// Reconnect delay after `attempt` consecutive failures: 2 s doubling to 60 s.
+/// Reconnect delays: 2, 5, 15, 30 s, then 60 s for every later attempt.
+pub(crate) const BACKOFF_SECS: [u64; 5] = [2, 5, 15, 30, 60];
+
+/// Reconnect delay after `attempt` consecutive failures (0-based).
 #[must_use]
 pub(crate) fn backoff(attempt: u32) -> Duration {
-    Duration::from_secs((2u64 << attempt.min(5)).min(60))
+    let i = usize::try_from(attempt)
+        .unwrap_or(usize::MAX)
+        .min(BACKOFF_SECS.len() - 1);
+    Duration::from_secs(BACKOFF_SECS[i])
 }
 
 #[cfg(test)]
@@ -215,8 +221,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backoff_doubles_and_caps() {
+    fn backoff_steps_and_caps_at_60s() {
         let secs: Vec<u64> = (0..8).map(|a| backoff(a).as_secs()).collect();
-        assert_eq!(secs, [2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(secs, [2, 5, 15, 30, 60, 60, 60, 60]);
     }
 }

@@ -14,6 +14,7 @@ use crate::model::{
 };
 use crate::net::{self, ConnectParams, Connector, LoginError, Session};
 use crate::port_mapping::{self, PortMapper};
+use crate::status::{CacheUsage, CoreStatus, ListenStatus, ReconnectStatus, SearchProgress};
 use crate::{paths, rank};
 use soulseek_rs::message::peer::PeerInfo;
 use soulseek_rs::{
@@ -21,9 +22,9 @@ use soulseek_rs::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// Timing knobs; tests shrink them.
@@ -38,6 +39,10 @@ pub(crate) struct Tunables {
     pub queue_place_after: Duration,
     pub uploads_every: Duration,
     pub profile_timeout: Duration,
+    /// How long a reconnect waits for the previous session to release its
+    /// listen port before connecting anyway.
+    pub release_wait: Duration,
+    pub cache_rescan: Duration,
     pub backoff: fn(u32) -> Duration,
 }
 
@@ -52,6 +57,8 @@ impl Default for Tunables {
             queue_place_after: Duration::from_secs(5),
             uploads_every: Duration::from_secs(1),
             profile_timeout: Duration::from_secs(10),
+            release_wait: Duration::from_secs(5),
+            cache_rescan: Duration::from_secs(2),
             backoff: net::backoff,
         }
     }
@@ -97,6 +104,8 @@ struct LiveSearch {
     query: String,
     seen: usize,
     delivered: usize,
+    users: HashSet<String>,
+    ends_at: Instant,
     cancel: Arc<AtomicBool>,
     session: Arc<dyn Session>,
 }
@@ -197,6 +206,14 @@ pub(crate) struct Worker {
     shares_dirty: bool,
     last_uploads: Option<Vec<UploadRow>>,
     last_uploads_poll: Instant,
+    status: Arc<Mutex<CoreStatus>>,
+    /// Sessions ended but possibly still referenced by helper threads.
+    retired: Vec<Weak<dyn Session>>,
+    reconnect: Option<ReconnectStatus>,
+    listen: ListenStatus,
+    cache_used: u64,
+    cache_in_use: u64,
+    last_cache_scan: Instant,
 }
 
 const BROWSE_CACHE_USERS: usize = 16;
@@ -209,6 +226,7 @@ impl Worker {
         t: Tunables,
         settings: Settings,
         ids: Arc<AtomicU64>,
+        status: Arc<Mutex<CoreStatus>>,
     ) -> Self {
         Self {
             events,
@@ -237,6 +255,13 @@ impl Worker {
             shares_dirty: false,
             last_uploads: None,
             last_uploads_poll: Instant::now(),
+            status,
+            retired: Vec::new(),
+            reconnect: None,
+            listen: ListenStatus::default(),
+            cache_used: 0,
+            cache_in_use: 0,
+            last_cache_scan: Instant::now(),
         }
     }
 
@@ -248,8 +273,14 @@ impl Worker {
             let wait = self.t.tick.saturating_sub(last_poll.elapsed());
             match rx.recv_timeout(wait) {
                 Ok(Msg::Cmd(Command::Shutdown)) | Err(RecvTimeoutError::Disconnected) => break,
-                Ok(Msg::Cmd(c)) => self.command(c),
-                Ok(Msg::Internal(i)) => self.internal(i),
+                Ok(Msg::Cmd(c)) => {
+                    self.command(c);
+                    self.publish();
+                }
+                Ok(Msg::Internal(i)) => {
+                    self.internal(i);
+                    self.publish();
+                }
                 Err(RecvTimeoutError::Timeout) => {}
             }
             if last_poll.elapsed() >= self.t.tick {
@@ -319,6 +350,7 @@ impl Worker {
                 self.last_uploads_poll = Instant::now() - self.t.uploads_every;
                 self.poll_uploads();
             }
+            Command::ClearCache => self.clear_cache(),
             Command::Shutdown => {}
         }
     }
@@ -366,6 +398,9 @@ impl Worker {
     }
 
     fn poll(&mut self) {
+        if self.last_cache_scan.elapsed() >= self.t.cache_rescan {
+            self.rescan_cache();
+        }
         self.poll_session();
         let searches: Vec<SearchId> = self.searches.iter().map(|s| s.id).collect();
         for id in searches {
@@ -376,6 +411,34 @@ impl Worker {
         self.poll_folders();
         self.poll_transfers();
         self.poll_uploads();
+        self.publish();
+    }
+
+    /// Refresh the [`CoreStatus`] snapshot read by `Core::status`.
+    fn publish(&self) {
+        let status = CoreStatus {
+            reconnect: self.reconnect,
+            listen: self.listen.clone(),
+            searches: self
+                .searches
+                .iter()
+                .map(|s| SearchProgress {
+                    id: s.id,
+                    query: s.query.clone(),
+                    files: s.delivered,
+                    users: s.users.len(),
+                    ends_at: s.ends_at,
+                })
+                .collect(),
+            cache: CacheUsage {
+                used_bytes: self.cache_used,
+                cap_bytes: self.settings.cache_cap_bytes,
+                in_use_bytes: self.cache_in_use,
+            },
+        };
+        if let Ok(mut s) = self.status.lock() {
+            *s = status;
+        }
     }
 
     // ---------------------------------------------------------------- session
@@ -397,7 +460,15 @@ impl Worker {
         self.generation += 1;
         let generation = self.generation;
         self.conn = Conn::Connecting;
+        self.reconnect = None;
+        self.listen.requested = self.settings.listen_port;
         self.shares_dirty = false;
+        // The previous session releases its listen port when its last
+        // reference (search/shares helper threads) drops. Connecting before
+        // that makes the library fall back to an OS-chosen port.
+        self.retired.retain(|w| w.strong_count() > 0);
+        let retired = std::mem::take(&mut self.retired);
+        let release_wait = self.t.release_wait;
         let params = ConnectParams {
             username: c.username,
             password: c.password,
@@ -409,6 +480,11 @@ impl Worker {
         let _ = std::thread::Builder::new()
             .name("goalseek-connect".into())
             .spawn(move || {
+                let deadline = Instant::now() + release_wait;
+                while retired.iter().any(|w| w.strong_count() > 0) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                drop(retired);
                 let result = connector.connect(&params);
                 let _ = me.send(Msg::Internal(Internal::LoginDone { generation, result }));
             });
@@ -432,6 +508,7 @@ impl Worker {
                     username,
                     listen_port: port,
                 });
+                self.note_listen_port(port);
                 let (folders, files) = s.shared_counts();
                 self.emit(CoreEvent::ShareCounts { folders, files });
                 if self.shares_dirty {
@@ -451,14 +528,46 @@ impl Worker {
         }
     }
 
+    /// Record the bound port and explain a fallback (G12). The library binds
+    /// an OS-chosen port only when the requested one is in use.
+    fn note_listen_port(&mut self, bound: Option<u16>) {
+        let requested = self.listen.requested;
+        self.listen.bound = bound;
+        self.listen.note = match bound {
+            Some(b) if b != requested => Some(format!(
+                "port {requested} is in use (another Soulseek client or another copy of the \
+                 app is listening on it), so the system picked port {b}; peers are told {b}, \
+                 but a router forward for {requested} will not reach it"
+            )),
+            None => Some(format!(
+                "not listening for peers (could not bind port {requested})"
+            )),
+            Some(_) => None,
+        };
+        if let Some(note) = self.listen.note.clone() {
+            self.error("listen_port", note);
+        }
+    }
+
     fn schedule_retry(&mut self, reason: String) {
         let delay = (self.t.backoff)(self.attempt);
         self.attempt = self.attempt.saturating_add(1);
-        self.conn = Conn::Waiting(Instant::now() + delay);
+        let at = Instant::now() + delay;
+        self.conn = Conn::Waiting(at);
+        self.reconnect = Some(ReconnectStatus {
+            attempt: self.attempt,
+            delay,
+            at,
+        });
+        let secs = delay.as_secs_f64().ceil();
         self.emit(CoreEvent::Disconnected {
-            reason: DisconnectReason::Network(reason),
+            reason: DisconnectReason::Network(format!(
+                "{reason} — reconnecting in {secs} s (attempt {})",
+                self.attempt
+            )),
             will_retry: true,
         });
+        self.publish();
     }
 
     fn logout(&mut self) {
@@ -476,6 +585,13 @@ impl Worker {
     /// Tear down everything bound to the current session. The caller sets `conn`.
     fn end_session(&mut self, why: &str) {
         self.mapper = None;
+        self.reconnect = None;
+        if let Conn::Online(s) = &self.conn {
+            self.retired.push(Arc::downgrade(s));
+        }
+        // Their helper threads hold the session until they return; the dead
+        // session has nothing to forget.
+        self.orphan_searches.clear();
         for s in std::mem::take(&mut self.searches) {
             s.cancel.store(true, Ordering::Relaxed);
             self.emit(CoreEvent::SearchFinished {
@@ -688,9 +804,12 @@ impl Worker {
             query,
             seen: 0,
             delivered: 0,
+            users: HashSet::new(),
+            ends_at: Instant::now() + self.t.search_window,
             cancel,
             session,
         });
+        self.publish();
     }
 
     fn poll_search(&mut self, id: SearchId) {
@@ -712,6 +831,7 @@ impl Worker {
         rank::rank(&mut hits, audio_only);
         if !hits.is_empty() {
             s.delivered += hits.len();
+            s.users.extend(hits.iter().map(|h| h.file.username.clone()));
             let ev = CoreEvent::SearchResults { search: id, hits };
             self.emit(ev);
         }
@@ -1506,9 +1626,8 @@ impl Worker {
         self.begin(id);
     }
 
-    /// Keep the cache under its cap: delete the oldest `t<id>` dirs that are
-    /// not playing and not being written.
-    fn evict(&mut self) {
+    /// Cache dirs that eviction and `clear_cache` must keep.
+    fn protected_cache_ids(&self) -> HashSet<u64> {
         let mut protected: HashSet<u64> = HashSet::new();
         protected.extend(self.current_play.map(|p| p.0));
         protected.extend(
@@ -1523,12 +1642,52 @@ impl Worker {
                 .filter(|f| f.owner_kind == TransferKind::Play)
                 .map(|f| f.owner.0),
         );
+        protected
+    }
+
+    fn rescan_cache(&mut self) {
+        self.last_cache_scan = Instant::now();
+        let protected = self.protected_cache_ids();
+        let entries = cache::scan(&self.settings.cache_dir);
+        self.cache_used = entries.iter().map(|e| e.bytes).sum();
+        self.cache_in_use = entries
+            .iter()
+            .filter(|e| protected.contains(&e.id))
+            .map(|e| e.bytes)
+            .sum();
+    }
+
+    /// Delete every cache dir except the current play and plays still being
+    /// fetched.
+    fn clear_cache(&mut self) {
+        let protected = self.protected_cache_ids();
+        for e in cache::scan(&self.settings.cache_dir) {
+            if protected.contains(&e.id) {
+                continue;
+            }
+            if let Err(err) = std::fs::remove_dir_all(&e.path) {
+                self.error(
+                    "cache",
+                    format!("could not delete {}: {err}", e.path.display()),
+                );
+            }
+            self.cache_index.retain(|_, p| !p.starts_with(&e.path));
+        }
+        self.rescan_cache();
+        self.publish();
+    }
+
+    /// Keep the cache under its cap: delete the oldest `t<id>` dirs that are
+    /// not playing and not being written.
+    fn evict(&mut self) {
+        let protected = self.protected_cache_ids();
         let entries = cache::scan(&self.settings.cache_dir);
         for id in cache::plan_eviction(&entries, self.settings.cache_cap_bytes, &protected) {
             let dir = paths::cache_transfer_dir(&self.settings.cache_dir, TransferId(id));
             let _ = std::fs::remove_dir_all(&dir);
             self.cache_index.retain(|_, p| !p.starts_with(&dir));
         }
+        self.rescan_cache();
     }
 }
 

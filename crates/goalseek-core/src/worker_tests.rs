@@ -44,6 +44,9 @@ struct FakeState {
     uploads: Vec<UploadInfo>,
     upload_cancels: Vec<(String, String)>,
     share_sets: Vec<Vec<String>>,
+    /// `listen_port()` answer; `None` = the requested 2234.
+    bound: Option<Option<u16>>,
+    search_linger: Duration,
     user_infos: HashMap<String, UserInfo>,
     peer_infos: HashMap<String, PeerInfo>,
     profile_requests: Vec<String>,
@@ -88,7 +91,7 @@ impl FakeSession {
 
 impl Session for FakeSession {
     fn listen_port(&self) -> Option<u16> {
-        Some(2234)
+        self.st().bound.unwrap_or(Some(2234))
     }
     fn session_loss(&self) -> Option<SessionLoss> {
         self.st().loss
@@ -99,6 +102,9 @@ impl Session for FakeSession {
         while start.elapsed() < window && !cancel.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(5));
         }
+        // Like the real helper, it may hold the session a while after cancel.
+        let linger = self.st().search_linger;
+        std::thread::sleep(linger);
     }
     fn search_count(&self, q: &str) -> usize {
         self.st().searches.get(q).map_or(0, Vec::len)
@@ -190,14 +196,30 @@ impl Session for FakeSession {
 struct FakeConnector {
     replies: Mutex<VecDeque<Result<Arc<FakeSession>, LoginError>>>,
     params: Mutex<Vec<ConnectParams>>,
+    /// Sessions handed out, to check none is still alive at the next connect.
+    handed_out: Mutex<Vec<std::sync::Weak<FakeSession>>>,
+    /// Per connect: was any earlier session still referenced?
+    prev_alive: Mutex<Vec<bool>>,
+    connected_at: Mutex<Vec<Instant>>,
 }
 
 impl Connector for FakeConnector {
     fn connect(&self, p: &ConnectParams) -> Result<Arc<dyn Session>, LoginError> {
         self.params.lock().unwrap().push(p.clone());
+        self.connected_at.lock().unwrap().push(Instant::now());
+        let alive = self
+            .handed_out
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|w| w.strong_count() > 0);
+        self.prev_alive.lock().unwrap().push(alive);
         let r = self.replies.lock().unwrap().pop_front();
         match r {
-            Some(Ok(s)) => Ok(s),
+            Some(Ok(s)) => {
+                self.handed_out.lock().unwrap().push(Arc::downgrade(&s));
+                Ok(s)
+            }
             Some(Err(e)) => Err(e),
             None => Err(LoginError::Other("no scripted reply".into())),
         }
@@ -223,6 +245,8 @@ fn tunables() -> Tunables {
         queue_place_after: Duration::from_millis(50),
         uploads_every: Duration::from_millis(20),
         profile_timeout: Duration::from_millis(300),
+        release_wait: Duration::from_secs(2),
+        cache_rescan: Duration::from_millis(50),
         backoff: |_| Duration::from_millis(30),
     }
 }
@@ -1319,4 +1343,262 @@ fn play_joining_a_long_queued_download_gets_its_own_deadline() {
     s.progress(0, b"abcd", 4);
     s.complete(0);
     h.want("dl done", is_done(d));
+}
+
+// ------------------------------------------- session loss, reconnect status
+
+#[test]
+fn displaced_is_distinct_and_never_reconnects() {
+    let h = harness();
+    let s = h.online();
+    h.script(Ok(Arc::new(FakeSession::default()))); // would succeed if tried
+    s.st().loss = Some(SessionLoss::Displaced);
+    let e = h.want("Disconnected", |e| {
+        matches!(e, CoreEvent::Disconnected { .. })
+    });
+    assert_eq!(
+        e,
+        CoreEvent::Disconnected {
+            reason: DisconnectReason::Displaced,
+            will_retry: false
+        }
+    );
+    h.none_within(Duration::from_millis(400), |e| {
+        matches!(e, CoreEvent::Connected { .. })
+    });
+    assert_eq!(
+        h.conn.params.lock().unwrap().len(),
+        1,
+        "no reconnect attempt"
+    );
+    assert_eq!(h.core.status().reconnect, None);
+}
+
+#[test]
+fn network_drop_reconnects_with_growing_backoff_status_and_reannounces_shares() {
+    let backoff: fn(u32) -> Duration = |a| Duration::from_millis(100 * (u64::from(a) + 1));
+    let t = Tunables {
+        backoff,
+        ..tunables()
+    };
+    let mut h = harness_tuned(t, |_, _| {});
+    let music = h.tmp.path().join("music");
+    std::fs::create_dir_all(&music).unwrap();
+    h.core.set_shares(vec![music.clone()]);
+    let s1 = h.online();
+    s1.st().loss = Some(SessionLoss::Disconnected);
+    h.script(Err(LoginError::Other("connection refused".into())));
+    let s2 = Arc::new(FakeSession::default());
+    h.script(Ok(s2.clone()));
+
+    // Drop → attempt 1 after 100 ms; it fails → attempt 2 after 200 ms.
+    for attempt in 1..=2u32 {
+        let e = h.want("Disconnected", |e| {
+            matches!(e, CoreEvent::Disconnected { .. })
+        });
+        let CoreEvent::Disconnected {
+            reason: DisconnectReason::Network(m),
+            will_retry: true,
+        } = e
+        else {
+            panic!("{e:?}")
+        };
+        assert!(m.contains(&format!("(attempt {attempt})")), "{m}");
+        assert!(m.contains("reconnecting in"), "{m}");
+        let r = h.core.status().reconnect.expect("reconnect status");
+        assert_eq!(r.attempt, attempt);
+        assert_eq!(r.delay, Duration::from_millis(100 * u64::from(attempt)));
+        assert!(r.in_secs() <= 1);
+    }
+    h.want("reconnected", |e| matches!(e, CoreEvent::Connected { .. }));
+    h.want("counts re-sent", |e| {
+        matches!(e, CoreEvent::ShareCounts { .. })
+    });
+    let params = h.conn.params.lock().unwrap().clone();
+    assert_eq!(params.len(), 3);
+    let shared = vec![music.to_string_lossy().into_owned()];
+    assert!(
+        params.iter().all(|p| p.share_dirs == shared),
+        "every session announces the shares"
+    );
+    wait_until("status cleared", || h.core.status().reconnect.is_none());
+}
+
+#[test]
+fn reconnect_waits_for_the_old_session_to_release_the_port() {
+    let h = harness();
+    let s1 = h.online();
+    s1.st().search_linger = Duration::from_millis(400);
+    let _ = h.core.search("q");
+    wait_until("search started", || s1.st().searches.contains_key("q"));
+    h.script(Ok(Arc::new(FakeSession::default())));
+    s1.st().loss = Some(SessionLoss::Disconnected);
+    drop(s1);
+    let dropped = Instant::now();
+    h.want("reconnected", |e| matches!(e, CoreEvent::Connected { .. }));
+    assert_eq!(*h.conn.prev_alive.lock().unwrap(), [false, false]);
+    let at = h.conn.connected_at.lock().unwrap()[1];
+    assert!(
+        at.duration_since(dropped) >= Duration::from_millis(300),
+        "waited for the helper"
+    );
+}
+
+// ------------------------------------------------------------ listen port
+
+#[test]
+fn bound_port_is_reported_with_the_reason_when_it_differs() {
+    let h = harness();
+    let s = Arc::new(FakeSession::default());
+    s.st().bound = Some(Some(45_543));
+    h.script(Ok(s));
+    h.core.login(creds());
+    let e = h.want("Connected", |e| matches!(e, CoreEvent::Connected { .. }));
+    assert!(
+        matches!(
+            e,
+            CoreEvent::Connected {
+                listen_port: Some(45_543),
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    let e = h.want(
+        "note",
+        |e| matches!(e, CoreEvent::Error { context, .. } if context == "listen_port"),
+    );
+    let CoreEvent::Error { message, .. } = e else {
+        unreachable!()
+    };
+    assert!(
+        message.contains("2234 is in use") && message.contains("45543"),
+        "{message}"
+    );
+    let l = h.core.status().listen;
+    assert_eq!((l.requested, l.bound), (2234, Some(45_543)));
+    assert_eq!(l.note.as_deref(), Some(message.as_str()));
+}
+
+#[test]
+fn matching_bound_port_has_no_note() {
+    let h = harness();
+    let _s = h.online();
+    h.none_within(Duration::from_millis(100), |e| {
+        matches!(e, CoreEvent::Error { .. })
+    });
+    let l = h.core.status().listen;
+    assert_eq!((l.requested, l.bound, l.note), (2234, Some(2234), None));
+}
+
+// ------------------------------------------------------------ search progress
+
+#[test]
+fn search_keeps_streaming_with_progress_until_the_window_closes() {
+    let t = Tunables {
+        search_window: Duration::from_millis(600),
+        ..tunables()
+    };
+    let h = harness_tuned(t, |_, _| {});
+    let s = h.online();
+    let started = Instant::now();
+    let id = h.core.search("q");
+    wait_until("registered", || s.st().searches.contains_key("q"));
+    let p = h.core.status().searches;
+    assert_eq!(p.len(), 1);
+    assert_eq!((p[0].id, p[0].files, p[0].users), (id, 0, 0));
+    assert!(p[0].remaining() > Duration::from_millis(300));
+
+    let batches = [
+        result("u1", &[r"a\1.flac", r"a\2.flac"]),
+        result("u2", &[r"b\1.mp3"]),
+        result("u1", &[r"c\3.flac"]),
+    ];
+    let mut files = 0;
+    for (i, r) in batches.into_iter().enumerate() {
+        let n = r.files.len();
+        s.st().searches.get_mut("q").unwrap().push(r);
+        let CoreEvent::SearchResults { hits, .. } =
+            h.want("batch", |e| matches!(e, CoreEvent::SearchResults { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(hits.len(), n, "batch {i} is only the new files");
+        files += n;
+        wait_until("progress", || {
+            h.core
+                .status()
+                .searches
+                .first()
+                .is_some_and(|p| p.files == files)
+        });
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    let p = &h.core.status().searches[0];
+    assert_eq!((p.files, p.users), (4, 2));
+    let e = h.want("finished", |e| {
+        matches!(e, CoreEvent::SearchFinished { .. })
+    });
+    assert_eq!(
+        e,
+        CoreEvent::SearchFinished {
+            search: id,
+            total_files: 4
+        }
+    );
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(550) && took < Duration::from_millis(1500),
+        "{took:?}"
+    );
+    wait_until("gone from status", || h.core.status().searches.is_empty());
+}
+
+// ------------------------------------------------------------------- cache
+
+#[test]
+fn cache_usage_and_clear_cache_keeps_plays_in_use() {
+    let h = harness();
+    let s = h.online();
+    let done_play = |name: &str, i: usize, data: &[u8]| {
+        let t = h
+            .core
+            .play_fetch(&rfile(&format!(r"a\{name}"), data.len() as u64));
+        wait_until("lib download", || s.st().downloads.len() == i + 1);
+        s.progress(i, data, data.len() as u64);
+        s.complete(i);
+        h.want("done", is_done(t.id));
+        t
+    };
+    let old = done_play("1.flac", 0, b"0123456789");
+    // In flight (being fetched), not the current play once the next starts.
+    let fetching = h.core.play_fetch(&rfile(r"a\2.flac", 8));
+    wait_until("lib download", || s.st().downloads.len() == 2);
+    s.progress(1, b"abc", 8);
+    let current = done_play("3.flac", 2, b"xyz12");
+    // The snapshot is rescanned every 50 ms here; wait for one taken after
+    // the last play finished.
+    wait_until("usage with one finished, unprotected play", || {
+        let c = h.core.status().cache;
+        c.in_use_bytes >= 3 + 5 && c.in_use_bytes < c.used_bytes
+    });
+    let c = h.core.status().cache;
+    assert_eq!(c.cap_bytes, Settings::default().cache_cap_bytes);
+    assert!(
+        c.in_use_bytes >= 3 + 5 && c.in_use_bytes < c.used_bytes,
+        "{c:?}"
+    );
+
+    h.core.clear_cache();
+    wait_until("cleared", || !old.final_path.exists());
+    assert!(fetching.part_path.exists(), "the fetching play is kept");
+    assert!(current.final_path.exists(), "the current play is kept");
+    wait_until("usage after clear", || {
+        let c = h.core.status().cache;
+        c.used_bytes == c.in_use_bytes && c.used_bytes > 0
+    });
+    // The cleared file is fetched again rather than served from a deleted path.
+    let again = h.core.play_fetch(&rfile(r"a\1.flac", 10));
+    wait_until("refetch", || s.st().downloads.len() == 4);
+    h.core.cancel(again.id);
 }
