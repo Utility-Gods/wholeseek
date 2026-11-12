@@ -1924,7 +1924,10 @@ impl Worker {
                 if let Some(t) = self.transfers.get_mut(&id) {
                     t.state = TState::Cancelled;
                 }
-                self.record_history(id, Outcome::Cancelled, None, None);
+                // Replaces its Failed row; a refused duplicate never had one.
+                if self.history.lock().is_ok_and(|h| h.has_transfer(id)) {
+                    self.record_history(id, Outcome::Cancelled, None, None);
+                }
                 self.emit(CoreEvent::TransferCancelled { id });
                 return;
             }

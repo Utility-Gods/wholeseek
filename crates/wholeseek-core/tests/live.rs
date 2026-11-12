@@ -934,6 +934,8 @@ fn live_release_check() {
         for (id, _) in &queued {
             core.cancel(*id);
         }
+        // Let the cancels land (they are recorded too) before counting rows.
+        while ev.recv_timeout(Duration::from_secs(3)).is_ok() {}
         if done.is_empty() {
             continue;
         }

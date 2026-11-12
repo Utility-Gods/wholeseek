@@ -332,6 +332,14 @@ impl History {
         self.compact()
     }
 
+    /// Whether this run recorded transfer `transfer` (and it was not removed).
+    #[must_use]
+    pub fn has_transfer(&self, transfer: TransferId) -> bool {
+        self.by_transfer
+            .get(&transfer)
+            .is_some_and(|id| self.entries.iter().any(|e| e.id == *id))
+    }
+
     #[must_use]
     pub fn was_downloaded(&self, username: &str, remote_path: &str) -> bool {
         self.keys

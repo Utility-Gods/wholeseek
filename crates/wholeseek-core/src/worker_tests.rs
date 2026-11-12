@@ -2326,6 +2326,12 @@ fn history_marks_failed_and_cancelled_downloads() {
         "cancelled",
         |e| matches!(e, CoreEvent::TransferCancelled { id } if *id == a),
     );
+    // Dismissing the refused duplicate (cancel on a failed transfer) adds no row either.
+    h.core.cancel(dup);
+    h.want(
+        "dup dismissed",
+        |e| matches!(e, CoreEvent::TransferCancelled { id } if *id == dup),
+    );
     let all = history(&h);
     assert_eq!(
         all.len(),
