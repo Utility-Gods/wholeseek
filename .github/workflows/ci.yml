@@ -35,7 +35,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libasound2-dev libdbus-1-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            ffmpeg # audio tests generate their fixtures with ffmpeg
 
       - name: fmt
         run: cargo fmt --all --check
