@@ -202,8 +202,12 @@ where
 impl AudioSink for CpalSink {
     fn start(&mut self, sample_rate: u32, channels: usize) -> Result<(), String> {
         // Not `cpal::default_host()`: it panics if the host cannot be initialised.
-        let host = cpal::host_from_id(cpal::HostId::Alsa)
-            .map_err(|e| format!("audio system unavailable: {e}"))?;
+        #[cfg(target_os = "macos")]
+        let host_id = cpal::HostId::CoreAudio;
+        #[cfg(not(target_os = "macos"))]
+        let host_id = cpal::HostId::Alsa;
+        let host =
+            cpal::host_from_id(host_id).map_err(|e| format!("audio system unavailable: {e}"))?;
         let device = host
             .default_output_device()
             .ok_or("no audio output device found")?;
