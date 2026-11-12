@@ -62,3 +62,6 @@ rm -rf "$stage"
 hdiutil verify "$dmg"
 
 echo "dmg: $dmg ($(wc -c <"$dmg" | tr -d ' ') bytes)"
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  { echo "dmg=$dmg"; echo "name=$(basename "$dmg")"; } >>"$GITHUB_OUTPUT"
+fi
