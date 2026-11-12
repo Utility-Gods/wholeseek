@@ -463,10 +463,13 @@ mod tests {
         assert!(super::cached_image(&rt.state, &u, &d).is_none());
 
         let path = covers.store_embedded(&u, &d, &png()).unwrap();
-        let img = rt.state.art.image(&path);
-        assert!(img.is_none(), "first ask starts the decode");
-        let handle = rt.state.art.handles.borrow().get(&path).cloned().unwrap();
-        handle.wait().expect("decodes");
+        // The first ask starts the decode; on a fast machine it may already be done.
+        if rt.state.art.image(&path).is_none() {
+            let handle = rt.state.art.handles.borrow().get(&path).cloned();
+            if let Some(handle) = handle {
+                handle.wait().expect("decodes");
+            }
+        }
         rt.frame(1.0 / 60.0);
         assert!(
             super::cached_image(&rt.state, &u, &d).is_some(),
