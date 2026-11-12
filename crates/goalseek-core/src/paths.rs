@@ -97,6 +97,27 @@ fn sanitize(name: &str) -> String {
     }
 }
 
+/// Files `Core::download_folder` leaves out: OS/file-manager junk, matched
+/// case-insensitively against the basename. `*x` = ends with `x`, `x*` =
+/// starts with `x`, otherwise the whole name. Cue sheets, rip logs, cover
+/// art and `.nfo` files are kept.
+pub const DOWNLOAD_SKIP: &[&str] = &["thumbs.db", "desktop.ini", ".ds_store", "*.url", "._*"];
+
+/// True when `remote_path`'s basename matches [`DOWNLOAD_SKIP`].
+#[must_use]
+pub fn is_download_junk(remote_path: &str) -> bool {
+    let name = remote_basename(remote_path).to_lowercase();
+    DOWNLOAD_SKIP.iter().any(|p| {
+        if let Some(suffix) = p.strip_prefix('*') {
+            name.ends_with(suffix)
+        } else if let Some(prefix) = p.strip_suffix('*') {
+            name.starts_with(prefix)
+        } else {
+            name == *p
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +183,35 @@ mod tests {
             download_dir_for(d, r"x\a/b\01.flac"),
             PathBuf::from("/dl/b")
         );
+    }
+
+    #[test]
+    fn download_junk_is_matched_case_insensitively_and_music_extras_kept() {
+        for junk in [
+            r"A\Thumbs.db",
+            r"A\THUMBS.DB",
+            r"A\desktop.ini",
+            r"A\Desktop.INI",
+            "A/.DS_Store",
+            r"A\Album on Discogs.url",
+            r"A\LINK.URL",
+            r"A\._01 Track.flac",
+        ] {
+            assert!(is_download_junk(junk), "{junk}");
+        }
+        for keep in [
+            r"A\01 Track.flac",
+            r"A\album.cue",
+            r"A\rip.log",
+            r"A\cover.jpg",
+            r"A\folder.png",
+            r"A\info.nfo",
+            r"A\thumbs.db.flac",
+            r"A\my.url.txt",
+            r"A\_01 underscore.flac",
+            r"._dir\01.flac",
+        ] {
+            assert!(!is_download_junk(keep), "{keep}");
+        }
     }
 }

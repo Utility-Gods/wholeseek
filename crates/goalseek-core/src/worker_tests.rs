@@ -47,6 +47,7 @@ struct FakeState {
     /// `listen_port()` answer; `None` = the requested 2234.
     bound: Option<Option<u16>>,
     search_linger: Duration,
+    share_delay: Duration,
     user_infos: HashMap<String, UserInfo>,
     peer_infos: HashMap<String, PeerInfo>,
     profile_requests: Vec<String>,
@@ -158,6 +159,8 @@ impl Session for FakeSession {
         Some(7)
     }
     fn set_shares(&self, dirs: Vec<String>) -> Result<(u32, u32), String> {
+        let delay = self.st().share_delay;
+        std::thread::sleep(delay);
         self.st().share_sets.push(dirs);
         Ok((1, 42))
     }
@@ -1601,4 +1604,153 @@ fn cache_usage_and_clear_cache_keeps_plays_in_use() {
     let again = h.core.play_fetch(&rfile(r"a\1.flac", 10));
     wait_until("refetch", || s.st().downloads.len() == 4);
     h.core.cancel(again.id);
+}
+
+// -------------------------------------------------- folder junk, share status
+
+#[test]
+fn download_folder_skips_os_junk_but_keeps_music_extras() {
+    let h = harness();
+    let s = h.online();
+    let listing = vec![dir(
+        r"Music\Album",
+        &[
+            "01 Track.flac",
+            "Thumbs.db",
+            "desktop.ini",
+            ".DS_Store",
+            "Discogs.URL",
+            "._01 Track.flac",
+            "album.cue",
+            "rip.log",
+            "cover.jpg",
+            "back.png",
+            "info.nfo",
+        ],
+    )];
+    s.st()
+        .folders
+        .insert(("alice".into(), r"Music\Album".into()), listing);
+    h.core.download_folder("alice", r"Music\Album");
+    wait_until("downloads queued", || s.st().downloads.len() >= 6);
+    std::thread::sleep(Duration::from_millis(100));
+    let mut names: Vec<String> = s
+        .st()
+        .downloads
+        .iter()
+        .map(|d| crate::paths::remote_basename(&d.path).to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "01 Track.flac",
+            "album.cue",
+            "back.png",
+            "cover.jpg",
+            "info.nfo",
+            "rip.log"
+        ]
+    );
+}
+
+#[test]
+fn folder_of_only_junk_reports_an_error() {
+    let h = harness();
+    let s = h.online();
+    s.st().folders.insert(
+        ("alice".into(), r"Pics".into()),
+        vec![dir("Pics", &["Thumbs.db", "desktop.ini"])],
+    );
+    h.core.download_folder("alice", "Pics");
+    let e = h.want(
+        "error",
+        |e| matches!(e, CoreEvent::Error { context, .. } if context == "download_folder"),
+    );
+    assert!(
+        matches!(e, CoreEvent::Error { ref message, .. } if message.contains("only system files")),
+        "{e:?}"
+    );
+    assert!(s.st().downloads.is_empty());
+}
+
+fn make_share(root: &Path, name: &str, albums: &[(&str, usize)]) -> PathBuf {
+    let d = root.join(name);
+    for (album, n) in albums {
+        std::fs::create_dir_all(d.join(album)).unwrap();
+        for i in 0..*n {
+            std::fs::write(d.join(album).join(format!("{i:02}.flac")), b"x").unwrap();
+        }
+    }
+    d
+}
+
+#[test]
+fn share_status_per_directory_offline_and_after_rescan() {
+    let mut h = harness();
+    let a = make_share(h.tmp.path(), "a", &[("x", 2), ("y", 1)]);
+    let b = make_share(h.tmp.path(), "b", &[("z", 4)]);
+    let missing = h.tmp.path().join("missing");
+    h.core
+        .set_shares(vec![a.clone(), b.clone(), missing.clone()]);
+    h.want("counts", |e| matches!(e, CoreEvent::ShareCounts { .. }));
+    let sh = h.core.status().shares;
+    let got: Vec<_> = sh
+        .iter()
+        .map(|s| (s.dir.clone(), s.files, s.scanning))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (a.clone(), 3, false),
+            (b.clone(), 4, false),
+            (missing.clone(), 0, false)
+        ]
+    );
+    assert!(sh[0].folders >= 2 && sh[1].folders >= 1, "{sh:?}");
+
+    // Online rescan: marked scanning while it runs, then updated per dir.
+    let s = h.online();
+    std::fs::write(b.join("z").join("new.flac"), b"x").unwrap();
+    s.st().share_delay = Duration::from_millis(300);
+    h.core.rescan_shares();
+    wait_until("marked scanning", || {
+        h.core.status().shares.iter().all(|s| s.scanning)
+    });
+    let mid = h.core.status().shares;
+    assert_eq!(mid[1].files, 4, "previous counts kept while scanning");
+    wait_until("rescanned", || {
+        let sh = h.core.status().shares;
+        sh[1].files == 5 && sh.iter().all(|s| !s.scanning)
+    });
+    assert_eq!(s.st().share_sets.len(), 1, "library rescan ran too");
+
+    // Removing a share drops its entry; order follows Settings::share_dirs.
+    h.core.set_shares(vec![b.clone()]);
+    wait_until("one share", || {
+        let sh = h.core.status().shares;
+        sh.len() == 1 && sh[0].dir == b && !sh[0].scanning
+    });
+}
+
+#[test]
+fn share_status_is_filled_at_startup_without_login() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = make_share(tmp.path(), "a", &[("x", 2)]);
+    let settings = Settings {
+        download_dir: tmp.path().join("downloads"),
+        cache_dir: tmp.path().join("cache"),
+        share_dirs: vec![a.clone()],
+        port_mapping: false,
+        ..Settings::default()
+    };
+    let conn = Arc::new(FakeConnector::default());
+    let (core, _ev) = Core::start_with(settings, conn.clone(), tunables()).unwrap();
+    wait_until("startup scan", || {
+        core.status()
+            .shares
+            .first()
+            .is_some_and(|s| s.files == 2 && !s.scanning)
+    });
+    assert!(conn.params.lock().unwrap().is_empty(), "no network");
 }

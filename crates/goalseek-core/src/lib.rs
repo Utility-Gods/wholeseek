@@ -23,7 +23,10 @@ pub use model::{
     AudioAttrs, BrowseDir, Credentials, PlayTicket, RemoteFile, SearchHit, SearchId, Settings,
     TransferId, TransferKind, UploadRow, UploadState, UserProfile,
 };
-pub use status::{CacheUsage, CoreStatus, ListenStatus, ReconnectStatus, SearchProgress};
+pub use paths::{DOWNLOAD_SKIP, is_download_junk};
+pub use status::{
+    CacheUsage, CoreStatus, ListenStatus, ReconnectStatus, SearchProgress, ShareStatus,
+};
 
 /// Client version goalseek reports on login. Major 176 is reserved for
 /// soulseek-rs-based clients; minor 1 is "unidentified" until we reserve our

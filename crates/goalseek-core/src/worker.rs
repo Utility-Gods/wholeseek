@@ -14,7 +14,9 @@ use crate::model::{
 };
 use crate::net::{self, ConnectParams, Connector, LoginError, Session};
 use crate::port_mapping::{self, PortMapper};
-use crate::status::{CacheUsage, CoreStatus, ListenStatus, ReconnectStatus, SearchProgress};
+use crate::status::{
+    CacheUsage, CoreStatus, ListenStatus, ReconnectStatus, SearchProgress, ShareStatus,
+};
 use crate::{paths, rank};
 use soulseek_rs::message::peer::PeerInfo;
 use soulseek_rs::{
@@ -82,6 +84,7 @@ pub(crate) enum Internal {
     SharesScanned {
         seq: u64,
         result: Result<(u32, u32), String>,
+        per_dir: Vec<(PathBuf, u32, u32)>,
     },
     PortMap {
         generation: u64,
@@ -214,6 +217,7 @@ pub(crate) struct Worker {
     cache_used: u64,
     cache_in_use: u64,
     last_cache_scan: Instant,
+    shares: Vec<ShareStatus>,
 }
 
 const BROWSE_CACHE_USERS: usize = 16;
@@ -262,12 +266,16 @@ impl Worker {
             cache_used: 0,
             cache_in_use: 0,
             last_cache_scan: Instant::now(),
+            shares: Vec::new(),
         }
     }
 
     pub(crate) fn run(mut self, rx: &Receiver<Msg>) {
         self.cache_index = cache::index(&self.settings.cache_dir);
         self.evict();
+        if !self.settings.share_dirs.is_empty() {
+            self.rescan(); // counts for status().shares before any login
+        }
         let mut last_poll = Instant::now();
         loop {
             let wait = self.t.tick.saturating_sub(last_poll.elapsed());
@@ -367,9 +375,18 @@ impl Worker {
                     session.forget_search(&query);
                 }
             }
-            Internal::SharesScanned { seq, result } => {
+            Internal::SharesScanned {
+                seq,
+                result,
+                per_dir,
+            } => {
                 if seq != self.share_seq {
                     return;
+                }
+                for (dir, folders, files) in per_dir {
+                    if let Some(s) = self.shares.iter_mut().find(|s| s.dir == dir) {
+                        (s.folders, s.files, s.scanning) = (folders, files, false);
+                    }
                 }
                 match result {
                     Ok((folders, files)) => self.emit(CoreEvent::ShareCounts { folders, files }),
@@ -435,6 +452,7 @@ impl Worker {
                 cap_bytes: self.settings.cache_cap_bytes,
                 in_use_bytes: self.cache_in_use,
             },
+            shares: self.shares.clone(),
         };
         if let Ok(mut s) = self.status.lock() {
             *s = status;
@@ -504,11 +522,17 @@ impl Worker {
                 s.set_upload_slots(self.settings.upload_slots);
                 let port = s.listen_port();
                 self.conn = Conn::Online(s.clone());
+                // Snapshot first, so status().listen is current when the UI
+                // handles Connected / the note.
+                self.note_listen_port(port);
+                self.publish();
                 self.emit(CoreEvent::Connected {
                     username,
                     listen_port: port,
                 });
-                self.note_listen_port(port);
+                if let Some(note) = self.listen.note.clone() {
+                    self.error("listen_port", note);
+                }
                 let (folders, files) = s.shared_counts();
                 self.emit(CoreEvent::ShareCounts { folders, files });
                 if self.shares_dirty {
@@ -528,7 +552,8 @@ impl Worker {
         }
     }
 
-    /// Record the bound port and explain a fallback (G12). The library binds
+    /// Record the bound port and why it differs (G12); the caller emits the
+    /// note after `Connected`. The library binds
     /// an OS-chosen port only when the requested one is in use.
     fn note_listen_port(&mut self, bound: Option<u16>) {
         let requested = self.listen.requested;
@@ -544,9 +569,6 @@ impl Worker {
             )),
             Some(_) => None,
         };
-        if let Some(note) = self.listen.note.clone() {
-            self.error("listen_port", note);
-        }
     }
 
     fn schedule_retry(&mut self, reason: String) {
@@ -704,15 +726,42 @@ impl Worker {
 
     // ----------------------------------------------------------------- shares
 
+    /// Make `self.shares` follow `settings.share_dirs` (keeping known counts).
+    fn sync_share_list(&mut self) {
+        let old = std::mem::take(&mut self.shares);
+        self.shares = self
+            .settings
+            .share_dirs
+            .iter()
+            .map(|d| {
+                old.iter()
+                    .find(|s| &s.dir == d)
+                    .cloned()
+                    .unwrap_or(ShareStatus {
+                        dir: d.clone(),
+                        folders: 0,
+                        files: 0,
+                        scanning: false,
+                    })
+            })
+            .collect();
+    }
+
     fn rescan(&mut self) {
+        self.sync_share_list();
+        for s in &mut self.shares {
+            s.scanning = true;
+        }
         self.share_seq += 1;
         let seq = self.share_seq;
         let dirs = self.settings.share_dirs.clone();
         let me = self.me.clone();
         let session = match &self.conn {
             Conn::Connecting => {
+                // The session being built may have scanned the old list; it
+                // rescans once online. Count locally meanwhile.
                 self.shares_dirty = true;
-                return;
+                None
             }
             Conn::Online(s) => Some(s.clone()),
             _ => None,
@@ -724,7 +773,21 @@ impl Worker {
                     Some(s) => s.set_shares(share_dir_strings(&dirs)),
                     None => Ok(net::scan_counts(&dirs)),
                 };
-                let _ = me.send(Msg::Internal(Internal::SharesScanned { seq, result }));
+                // Per-directory counts for status().shares. The library only
+                // reports totals, so each directory is counted on its own (an
+                // extra read-only walk on this helper thread).
+                let per_dir = dirs
+                    .iter()
+                    .map(|d| {
+                        let (folders, files) = net::scan_counts(std::slice::from_ref(d));
+                        (d.clone(), folders, files)
+                    })
+                    .collect();
+                let _ = me.send(Msg::Internal(Internal::SharesScanned {
+                    seq,
+                    result,
+                    per_dir,
+                }));
             });
     }
 
@@ -1117,11 +1180,21 @@ impl Worker {
         } else {
             dirs.iter().flat_map(|d| d.files.iter().cloned()).collect()
         };
+        // OS junk (Thumbs.db, ._*, …) is skipped silently: no event can carry
+        // the count without a new variant; `FolderContents`/`BrowseResult`
+        // list every file, so the UI can count with `paths::is_download_junk`.
+        let all = files.len();
+        let files: Vec<RemoteFile> = files
+            .into_iter()
+            .filter(|f| !paths::is_download_junk(&f.path))
+            .collect();
         if files.is_empty() {
-            self.error(
-                "download_folder",
-                format!("{folder} from {username} has no files"),
-            );
+            let why = if all == 0 {
+                "has no files"
+            } else {
+                "has only system files (Thumbs.db, …)"
+            };
+            self.error("download_folder", format!("{folder} from {username} {why}"));
             return true;
         }
         for file in files {

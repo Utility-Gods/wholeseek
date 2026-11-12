@@ -7,6 +7,7 @@
 //! matches in the app.
 
 use crate::model::SearchId;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Everything in the snapshot. Updated by the worker every poll tick
@@ -21,6 +22,22 @@ pub struct CoreStatus {
     /// this list when its `SearchFinished` event is sent.
     pub searches: Vec<SearchProgress>,
     pub cache: CacheUsage,
+    /// One entry per `Settings::share_dirs` entry, in that order.
+    pub shares: Vec<ShareStatus>,
+}
+
+/// Counts for one shared directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareStatus {
+    pub dir: PathBuf,
+    /// Folders (the directory itself and every subfolder holding files, as
+    /// the library counts them) and files found by the last scan; 0 until the
+    /// first scan finishes or when the directory is missing/unreadable.
+    pub folders: u32,
+    pub files: u32,
+    /// A scan or rescan including this directory is running; the counts are
+    /// from the previous scan until it ends.
+    pub scanning: bool,
 }
 
 /// The pending automatic reconnect.

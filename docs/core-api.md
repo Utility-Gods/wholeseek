@@ -398,6 +398,7 @@ pub struct CoreStatus {
     pub listen: ListenStatus,               // { requested: u16, bound: Option<u16>, note: Option<String> }
     pub searches: Vec<SearchProgress>,      // open windows: { id, query, files, users, ends_at }; .remaining()
     pub cache: CacheUsage,                  // { used_bytes, cap_bytes, in_use_bytes }
+    pub shares: Vec<ShareStatus>,           // per Settings::share_dirs entry: { dir, folders, files, scanning }
 }
 pub fn clear_cache(&self);                  // Command::ClearCache
 ```
@@ -433,6 +434,25 @@ completions/eviction/clear); `in_use_bytes` is the part eviction and `clear_cach
 current play and plays still being fetched. `clear_cache()` deletes the rest and forgets them, so a
 later ▶ of a cleared file fetches it again.
 
+**Per-share counts.** `status().shares` has one `ShareStatus { dir, folders, files, scanning }` per
+`Settings::share_dirs` entry, in that order. Filled at `Core::start` (local scan, no network) when
+shares are configured, and after every `set_shares` / `rescan_shares` / share change in
+`apply_settings`: entries are marked `scanning: true` (keeping the previous counts) as soon as the
+command is handled, and updated when the scan ends. The library reports only totals, so the share
+helper thread also counts each directory on its own (an extra read-only walk); a missing or
+unreadable directory reads 0/0. The `ShareCounts` event (totals) is unchanged.
+
+### 3.9 Folder download skips OS junk (additive)
+
+`goalseek_core::DOWNLOAD_SKIP = ["thumbs.db", "desktop.ini", ".ds_store", "*.url", "._*"]`, matched
+case-insensitively against the basename (`*x` = ends with, `x*` = starts with, else exact), and
+`goalseek_core::is_download_junk(remote_path)`. `Core::download_folder` leaves those files out;
+`.cue`, `.log`, `.jpg`, `.png`, `.nfo` and everything else are downloaded. The skip is **silent**:
+no existing event can carry a count without a new variant. `FolderContents` / `BrowseResult`
+still list every file, so the UI can show "N system files skipped" with `is_download_junk`. A
+folder that holds only junk gives `Error { context: "download_folder", "… has only system files
+(Thumbs.db, …)" }`. Single-file `Core::download` is not filtered.
+
 ### 3.7 Tests
 
 Offline: `cargo test -p goalseek-core` — paths, ranking + `alternates` matching, cache
@@ -441,7 +461,8 @@ backoff, and the worker against a fake session/connector (login/reject/backoff/d
 deltas, browse timeout, folder fallback, cache-only play, promotion, cache reuse across restart,
 ▶ start deadline + retry, eviction, shares, uploads, user profile, displaced vs. network-drop
 reconnect with backoff status and share re-announce, port release before reconnect, bound-port note,
-search progress over several batches, cache usage + `clear_cache`).
+search progress over several batches, cache usage + `clear_cache`, folder junk skip, per-share
+status at startup and across rescans).
 
 Live (`#[ignore]`, throwaway accounts only, never the user's own; `--nocapture`):
 - `live_core_end_to_end` (`GOALSEEK_USER`/`GOALSEEK_PASS`, `GOALSEEK_LISTEN_PORT`): login, search
