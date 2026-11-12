@@ -177,6 +177,8 @@ pub struct App {
     /// The top strip's laid-out width and its right cluster's (status, Transfers, ⚙), in
     /// points; how many tabs fit before the rest go under "»". Infinite until first laid out.
     pub strip_w: f32,
+    /// The window's width in points (the strip spans it); 0 until first laid out.
+    pub window_w: f32,
     pub strip_right_w: f32,
     /// What plays in order; the player strip shows its current item.
     pub queue: Option<PlayQueue>,
@@ -272,6 +274,7 @@ impl App {
             last_filters: crate::tabs::Filters::default(),
             queue_generation: 0,
             strip_w: f32::INFINITY,
+            window_w: 0.0,
             strip_right_w: 0.0,
             queue: None,
             reveal: false,

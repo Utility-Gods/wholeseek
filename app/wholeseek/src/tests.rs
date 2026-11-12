@@ -2559,3 +2559,200 @@ fn user_tabs_list_files_in_the_same_natural_order() {
         .collect();
     assert_eq!(q, names, "the queue uses the listing's order");
 }
+
+// ---- wide windows: a capped table and the details pane ------------------------------------------
+
+/// The "hollow lights" results in a `w`-point-wide window.
+fn searched_at(w: f32) -> Runtime<App> {
+    let mut rt = Runtime::new(
+        App::demo(),
+        view::view,
+        (w, 900.0),
+        Env {
+            system_dark: true,
+            scale: 1.0,
+        },
+    );
+    rt.poll = Some(poll);
+    rt.on_key = Some(crate::on_key);
+    rt.frame(0.0);
+    rt.state.demo_login();
+    run(&mut rt, 1.0);
+    rt.update(|s, _| s.search_for("hollow lights"));
+    run(&mut rt, 1.6);
+    rt
+}
+
+#[test]
+fn the_details_pane_appears_from_1500_points_and_the_table_is_capped() {
+    use crate::view::{PANE_MIN_WINDOW_W, TABLE_MAX_W};
+    let narrow = searched_at(PANE_MIN_WINDOW_W - 1.0);
+    assert!(
+        narrow.find("details").is_none(),
+        "no pane below the breakpoint"
+    );
+    let ([_, _, w, _], _) = narrow.presented("row-0").unwrap();
+    assert!(
+        w > TABLE_MAX_W + 300.0,
+        "below it rows still span the window ({w})"
+    );
+
+    for width in [PANE_MIN_WINDOW_W, 1920.0, 2560.0] {
+        let rt = searched_at(width);
+        assert!(rt.find("details").is_some(), "pane at {width}");
+        assert!(
+            rt.find("details-empty").is_some(),
+            "nothing selected yet: one muted line"
+        );
+        let ([x, _, w, _], _) = rt.presented("row-0").unwrap();
+        assert!(x + w <= TABLE_MAX_W + 0.5, "{width}: row ends at {}", x + w);
+        // Length sits right after the names, not at the far edge.
+        let len_x = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.path.ends_with("columns") || e.key.as_deref() == Some("columns"))
+            .map(|e| e.rect[0] + e.rect[2])
+            .unwrap();
+        assert!(len_x <= TABLE_MAX_W + 0.5);
+        let ([px, _, pw, _], _) = rt.presented("details").unwrap();
+        assert!(
+            px >= TABLE_MAX_W && px + pw <= width + 0.5,
+            "pane inside the window"
+        );
+    }
+}
+
+#[test]
+fn clicking_a_row_or_folder_selects_its_group_per_tab_without_playing() {
+    let mut rt = searched_at(1920.0);
+    let fetches = count_calls(&rt, |c| matches!(c, Call::PlayFetch(_)));
+    let (i, f) = row_of(&rt, "alice", "02 Salt Roads.flac");
+    click(&mut rt, &format!("row-{i}"));
+    assert_eq!(rt.state.tab().group, Some(("alice".into(), COAST.into())));
+    assert_eq!(
+        count_calls(&rt, |c| matches!(c, Call::PlayFetch(_))),
+        fetches,
+        "select, not play"
+    );
+    assert!(rt.state.playing.is_none());
+    assert_eq!(
+        text_of(&rt, "details-title").as_deref(),
+        Some("Coastline (2019)")
+    );
+    // The pane lists the folder (as the results know it) in track order, with totals.
+    let names: Vec<_> = (0..8)
+        .filter_map(|k| {
+            rt.elements()
+                .into_iter()
+                .find(|e| e.path.ends_with(&format!("track-{k}/name")))
+                .and_then(|e| e.text)
+        })
+        .collect();
+    assert_eq!(names[0], "01 Northern Glass.flac");
+    assert_eq!(names[5], "06 Coastline.flac");
+    assert_eq!(names.len(), 6);
+    assert_eq!(
+        text_of(&rt, "details-summary").as_deref(),
+        Some("6 files · 25:12 · 158.9 MB · FLAC")
+    );
+    // Enter on the selected row still plays.
+    rt.update(|_, tx| tx.focus(format!("row-{i}"), false));
+    press(
+        &mut rt,
+        KeyEvent {
+            key: Key::Enter,
+            mods: Mods::default(),
+        },
+    );
+    assert_eq!(rt.state.playing.as_ref().map(|p| p.file.clone()), Some(f));
+
+    // A folder line selects that folder; another tab keeps its own selection.
+    click(&mut rt, "folder-0-1");
+    assert_eq!(rt.state.tab().group, Some(("alice".into(), FERRY.into())));
+    click(&mut rt, "new-tab");
+    rt.update(|s, _| s.search_for("hollow lights"));
+    run(&mut rt, 1.6);
+    assert_eq!(rt.state.tab().group, None);
+    assert!(rt.find("details-empty").is_some());
+    let (j, _) = row_of(&rt, "dj_ivo", "Hollow Lights - Salt Roads.mp3");
+    click(&mut rt, &format!("row-{j}"));
+    assert_eq!(rt.state.tab().group.as_ref().unwrap().0, "dj_ivo");
+    click(&mut rt, "tab-0");
+    assert_eq!(rt.state.tab().group, Some(("alice".into(), FERRY.into())));
+    assert_eq!(
+        text_of(&rt, "details-title").as_deref(),
+        Some("Night Ferry EP (2021)")
+    );
+}
+
+#[test]
+fn pane_actions_do_what_the_folder_menu_does() {
+    // Each pane button against the same item picked from the folder's ⋯ menu.
+    for (button, item) in [
+        ("details-download", "menu-download-folder"),
+        ("details-play", "menu-play-folder"),
+        ("details-browse", "menu-open-folder"),
+    ] {
+        let outcome = |via_pane: bool| {
+            let mut rt = searched_at(1920.0);
+            click(&mut rt, "folder-0-0");
+            let before = calls(&rt).len();
+            if via_pane {
+                click(&mut rt, button);
+            } else {
+                let (x, y) = rt.find("folder-0-0").unwrap();
+                rt.update(|s, _| {
+                    let items = s.folder_menu("alice", COAST);
+                    s.open_menu(crate::menu::MenuAnchor::Point(x, y), items);
+                });
+                run(&mut rt, 0.05);
+                click(&mut rt, item);
+            }
+            run(&mut rt, 0.1);
+            let q: Vec<_> = rt
+                .state
+                .queue
+                .as_ref()
+                .map(|q| q.items.iter().map(|i| i.file.path.clone()).collect())
+                .unwrap_or_default();
+            let tab = rt
+                .state
+                .tab()
+                .browse()
+                .map(|b| (b.username.clone(), b.selected.clone()));
+            (calls(&rt)[before..].to_vec(), q, tab, rt.state.tabs.len())
+        };
+        assert_eq!(outcome(true), outcome(false), "{button} = {item}");
+    }
+}
+
+#[test]
+fn play_album_only_shows_for_a_folder_with_something_playable() {
+    let mut rt = searched_at(1920.0);
+    let opus = wholeseek_core::RemoteFile {
+        username: "zed".into(),
+        path: r"x\only.opus".into(),
+        size: 1,
+        attrs: Default::default(),
+    };
+    rt.update(|s, _| {
+        let tab = s.tab_mut();
+        tab.group = Some(("zed".into(), "x".into()));
+        tab.search_mut()
+            .unwrap()
+            .search
+            .as_mut()
+            .unwrap()
+            .hits
+            .push(wholeseek_core::SearchHit {
+                file: opus,
+                free_slot: true,
+                speed: 1,
+            });
+    });
+    run(&mut rt, 0.05);
+    assert!(rt.find("details-download").is_some() && rt.find("details-browse").is_some());
+    assert!(rt.find("details-play").is_none(), "nothing there decodes");
+    click(&mut rt, "folder-0-0");
+    assert!(rt.find("details-play").is_some());
+}

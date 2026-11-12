@@ -9,7 +9,7 @@ use std::rc::Rc;
 use wholeseek_core::RemoteFile;
 
 use super::files::{RowCtx, columns, file_row, more_key};
-use super::{META, amber, field_box, green, hairline, icons, input, tnum};
+use super::{META, amber, field_box, green, hairline, icons, input, tnum, vline};
 use crate::app::{App, MAX_ROWS};
 use crate::fmt;
 use crate::tabs::{Filters, SearchTab, Tab};
@@ -171,6 +171,12 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
                 &g.username,
                 folder,
                 s.tab().id,
+                super::details::wide(s)
+                    && tab
+                        .group
+                        .as_ref()
+                        .is_some_and(|(u, d)| u == &g.username && d == folder),
+                super::details::table_max_w(s),
                 t,
             ));
             let files: Rc<[RemoteFile]> = s.folder_files(&g.username, folder).into();
@@ -215,13 +221,15 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
         );
     }
     let saved = tab.scroll.clone();
-    col()
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .child(bar)
-        .child(hairline(t))
-        .child(columns(FILE_INDENT, t))
+    let wide = super::details::wide(s);
+    let mut results = col().key("results").min_h(0.0);
+    results = if wide {
+        results.w(super::details::TABLE_MAX_W).h_full()
+    } else {
+        results.w_full().grow(1.0)
+    };
+    let results = results
+        .child(columns(s, FILE_INDENT, t))
         .child(hairline(t))
         .child(
             list.key(tab.list_key())
@@ -231,7 +239,27 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
                 .on_scroll_offset(move |at: ScrollPos| saved.set(at.offset[1]))
                 .shrink()
                 .min_h(0.0),
-        )
+        );
+    let body = if wide {
+        // Wide window: the table at its natural width, the selected folder beside it.
+        row()
+            .key("results-split")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .child(results)
+            .child(vline(t))
+            .child(super::details::pane(s, tab, st, t))
+    } else {
+        results
+    };
+    col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(bar)
+        .child(hairline(t))
+        .child(body)
 }
 
 /// Format chips shown before the rest fold into "+N".
@@ -328,7 +356,15 @@ const MAX_SEGMENTS: usize = 4;
 
 /// A result folder: its path in segments, each opening the user's tab at that folder; ⋯ and
 /// right-click open its menu. Long paths elide in the middle; the full path is the tooltip.
-fn folder_line(key: &str, username: &str, folder: &str, tab: crate::tabs::TabId, t: &Theme) -> El {
+fn folder_line(
+    key: &str,
+    username: &str,
+    folder: &str,
+    tab: crate::tabs::TabId,
+    selected: bool,
+    max_w: f32,
+    t: &Theme,
+) -> El {
     let parts: Vec<&str> = folder.split('\\').collect();
     let shown: Vec<Option<usize>> = if parts.len() > MAX_SEGMENTS {
         let n = parts.len();
@@ -339,16 +375,21 @@ fn folder_line(key: &str, username: &str, folder: &str, tab: crate::tabs::TabId,
     let more = more_key(tab, folder);
     let (u, d) = (username.to_string(), folder.to_string());
     let (u2, d2, more2) = (u.clone(), d.clone(), more.clone());
+    let pick = (u.clone(), d.clone());
     let mut r = row()
         .key(key.to_string())
         .h(22.0)
         .w_full()
+        .max_w(max_w)
+        .cursor(Cursor::Pointer)
+        .on_press(move |s: &mut App| s.tab_mut().group = Some(pick.clone()))
         .pl(12.0 + FOLDER_INDENT)
         .pr(6.0)
         .gap(4.0)
         .center_y()
         .hover_group()
         .help(fmt::crumbs(folder))
+        .hover(t.hover)
         .on_secondary_press(move |s: &mut App, p, _| {
             let items = s.folder_menu(&u, &d);
             super::menu::at_point(s, p, items);
@@ -381,6 +422,9 @@ fn folder_line(key: &str, username: &str, folder: &str, tab: crate::tabs::TabId,
                     s.restore_scroll(tx);
                 }),
         );
+    }
+    if selected {
+        r = r.fill(t.hover);
     }
     r.child(el().grow(1.0)).child(
         super::icon_button(&more, icons::more(12.0, t.text_secondary), t)

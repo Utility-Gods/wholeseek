@@ -218,7 +218,7 @@ fn folder(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
         .min_h(0.0)
         .child(head)
         .child(hairline(t))
-        .child(columns(0.0, t))
+        .child(columns(s, 0.0, t))
         .child(hairline(t))
         .child(
             list.key(tab.list_key())

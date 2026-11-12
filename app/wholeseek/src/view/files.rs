@@ -21,12 +21,13 @@ const QUALITY_W: f32 = 92.0;
 const DL_W: f32 = 56.0;
 
 /// Column titles over a file list. `indent` lines them up with indented rows.
-pub fn columns(indent: f32, t: &Theme) -> El {
+pub fn columns(s: &App, indent: f32, t: &Theme) -> El {
     let h = |s: &str| text(s.to_string()).font(META).color(t.text_secondary);
     row()
         .key("columns")
         .h(24.0)
         .w_full()
+        .max_w(super::details::table_max_w(s))
         .pl(12.0 + indent)
         .pr(6.0)
         .gap(10.0)
@@ -133,10 +134,12 @@ pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t
         more = more.group_opacity(0.0, 1.0);
     }
     let path = f.path.clone();
+    let group = (!in_user).then(|| (f.username.clone(), f.folder().to_string()));
     let mut r = row()
         .key(key.to_string())
         .h(ROW_H)
         .w_full()
+        .max_w(super::details::table_max_w(s))
         .pl(12.0 + indent)
         .pr(6.0)
         .gap(10.0)
@@ -145,7 +148,14 @@ pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t
         .hover_group()
         .focusable(true)
         .focus_ring(1.0, -1.0, accent().alpha(0.6))
-        .on_press(move |s: &mut App| s.tab_mut().selected = Some(path.clone()))
+        .on_press(move |s: &mut App| {
+            // Selects (never plays); in a search tab its folder fills the details pane.
+            let tab = s.tab_mut();
+            tab.selected = Some(path.clone());
+            if group.is_some() {
+                tab.group = group.clone();
+            }
+        })
         .on_key(move |s: &mut App, e: &KeyEvent, _| {
             if e.key != Key::Enter {
                 return false;

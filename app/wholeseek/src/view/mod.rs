@@ -4,6 +4,7 @@
 //! track, primary buttons, focus). Motion: none on entry or exit — the whole window lands
 //! changes at once (`instant_changes`); only hover/press colours move, in 60 ms.
 
+mod details;
 mod files;
 mod icons;
 mod menu;
@@ -14,6 +15,8 @@ mod profile;
 mod search;
 mod strip;
 mod user;
+#[cfg(test)]
+pub use details::{PANE_MIN_WINDOW_W, TABLE_MAX_W};
 #[cfg(test)]
 pub use files::more_key as files_more_key;
 pub use search::MAX_FORMAT_CHIPS;

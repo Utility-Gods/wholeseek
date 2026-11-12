@@ -190,6 +190,15 @@ fn scene_results(s: &mut App) {
     s.download(&demo_file("vinyl_rips", "A1 Northern Glass.flac"));
 }
 
+/// The results with alice's Coastline selected: on a wide window the details pane shows it.
+fn scene_wide(s: &mut App) {
+    scene_results(s);
+    let f = demo_file("alice", "02 Salt Roads.flac");
+    let tab = s.tab_mut();
+    tab.selected = Some(f.path.clone());
+    tab.group = Some((f.username.clone(), f.folder().to_string()));
+}
+
 fn scene_browse(s: &mut App) {
     s.demo_search();
     s.play(&demo_file("alice", "02 Salt Roads.flac"));
@@ -303,6 +312,7 @@ fn main() {
     rune::run(AppSpec::<App> {
         scenes: &[
             ("search-tab", scene_results),
+            ("wide", scene_wide),
             ("user-tab", scene_browse),
             ("three-tabs", scene_three_tabs),
             ("transfers-drawer", scene_transfers),

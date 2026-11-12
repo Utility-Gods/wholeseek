@@ -141,7 +141,10 @@ pub fn view(s: &App, t: &Theme) -> El {
         .gap(4.0)
         .center_y()
         .fill(t.bg)
-        .on_layout(|s: &mut App, r: [f32; 4]| s.strip_w = r[2])
+        .on_layout(|s: &mut App, r: [f32; 4]| {
+            s.strip_w = r[2];
+            s.window_w = r[2];
+        })
         .child(tabs);
     if let Some(more) = more {
         strip = strip.child(more);

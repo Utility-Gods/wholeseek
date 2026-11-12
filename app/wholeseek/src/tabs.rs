@@ -20,6 +20,8 @@ pub struct Tab {
     pub tree_scroll: Rc<Cell<f32>>,
     /// The selected file row (remote path): Enter plays it, its ⋯ stays visible.
     pub selected: Option<String>,
+    /// A search tab's selected folder group (user, folder): what the details pane shows.
+    pub group: Option<(String, String)>,
 }
 
 pub enum TabKind {
@@ -354,6 +356,7 @@ impl Tab {
             scroll: Rc::default(),
             tree_scroll: Rc::default(),
             selected: None,
+            group: None,
         }
     }
 
