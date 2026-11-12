@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use rune::tok::Theme;
 use rune::{El, Image, ImageCache, SurfaceFit, Waker, el};
 use wholeseek_audio::{ArtLookup, embedded_art};
-use wholeseek_core::{Covers, RemoteFile, TransferId};
+use wholeseek_core::{CoverState, Covers, RemoteFile, TransferId};
 
 use super::icons;
 use crate::app::{App, TState};
@@ -304,19 +304,30 @@ impl App {
 pub const GAP: f32 = 14.0;
 
 /// The folder's cover above an album header (the narrow search inspector); `inset` lines the
-/// cover up with the header's text.
+/// cover up with the header's text. Only while a cover exists or is being fetched (a plain
+/// square then); no cover known → just the header, no space spent.
 pub fn above(s: &App, username: &str, folder: &str, inset: f32, header: El, t: &Theme) -> El {
+    let square = match s.backend.covers().map(|c| c.state(username, folder)) {
+        Some(CoverState::Ready(_)) => match cached_image(s, username, folder) {
+            Some(_) => cover(s, "header-cover", username, folder, HEADER, t),
+            // Decoding: a plain square for a moment.
+            None => loading(HEADER, t),
+        },
+        Some(CoverState::Pending) => loading(HEADER, t),
+        _ => return header,
+    };
     rune::col()
         .w_full()
-        .child(rune::row().pl(inset).pt(14.0).child(cover(
-            s,
-            "header-cover",
-            username,
-            folder,
-            HEADER,
-            t,
-        )))
+        .child(rune::row().pl(inset).pt(14.0).child(square))
         .child(header)
+}
+
+fn loading(size: f32, t: &Theme) -> El {
+    el().key("header-cover")
+        .size(size, size)
+        .radius(4.0)
+        .fill(t.hover)
+        .label("Album cover")
 }
 
 /// The folder's cover left of an album header (a user tab's folder view). Build the header

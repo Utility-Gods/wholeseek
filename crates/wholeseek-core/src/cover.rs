@@ -20,7 +20,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use soulseek_rs::{DownloadStatus, SharedDirectory};
+use soulseek_rs::DownloadStatus;
 
 use crate::paths;
 
@@ -478,7 +478,6 @@ impl Covers {
 /// The library calls a cover fetch needs; implemented by every [`crate::net::Session`].
 pub(crate) trait CoverNet {
     fn request_folder(&self, username: &str, folder: &str) -> Result<(), String>;
-    fn take_folder(&self, username: &str, folder: &str) -> Option<Vec<SharedDirectory>>;
     fn download(
         &self,
         username: &str,
@@ -493,9 +492,6 @@ pub(crate) trait CoverNet {
 impl<T: crate::net::Session + ?Sized> CoverNet for T {
     fn request_folder(&self, username: &str, folder: &str) -> Result<(), String> {
         crate::net::Session::request_folder(self, username, folder)
-    }
-    fn take_folder(&self, username: &str, folder: &str) -> Option<Vec<SharedDirectory>> {
-        crate::net::Session::take_folder(self, username, folder)
     }
     fn download(
         &self,
@@ -534,6 +530,10 @@ impl Default for CoverTimeouts {
         }
     }
 }
+
+/// Whether the worker is already transferring (user, remote path) — e.g. a folder download
+/// that includes the cover image. The library allows one transfer per (user, path).
+pub(crate) type Busy<'a> = &'a dyn Fn(&str, &str) -> bool;
 
 /// Queued requests kept per peer; older ones are dropped (the user moved on).
 const QUEUE_PER_PEER: usize = 4;
@@ -657,7 +657,7 @@ impl Fetcher {
         }
     }
 
-    pub(crate) fn poll<N: CoverNet + ?Sized>(&mut self, net: Option<&N>) {
+    pub(crate) fn poll<N: CoverNet + ?Sized>(&mut self, net: Option<&N>, busy: Busy) {
         let Some(net) = net else {
             if !self.queue.is_empty() || !self.active.is_empty() {
                 self.session_ended();
@@ -669,16 +669,16 @@ impl Fetcher {
             self.advance(net, &u);
         }
         // Start the oldest request of every idle peer.
-        let mut i = 0;
-        while i < self.queue.len() {
-            if self.active.contains_key(&self.queue[i].username) {
-                i += 1;
+        // One pass over a snapshot: a job deferred during it (its image is busy) is pushed back
+        // onto `self.queue` and waits for the next poll — never retried in this loop.
+        let mut started: HashSet<String> = HashSet::new();
+        for job in std::mem::take(&mut self.queue) {
+            if self.active.contains_key(&job.username) || started.contains(&job.username) {
+                self.queue.push_back(job);
                 continue;
             }
-            let Some(job) = self.queue.remove(i) else {
-                break;
-            };
-            self.start(net, job);
+            started.insert(job.username.clone());
+            self.start(net, job, busy);
         }
         if self
             .last_flush
@@ -691,9 +691,41 @@ impl Fetcher {
         }
     }
 
-    fn start<N: CoverNet + ?Sized>(&mut self, net: &N, job: Job) {
+    /// Folders whose contents a fetch is waiting for. The worker takes each reply once and
+    /// hands it to every waiter ([`Fetcher::offer_folder`] and folder downloads).
+    pub(crate) fn listing_waits(&self) -> Vec<(String, String)> {
+        self.active
+            .values()
+            .filter(|a| matches!(a.stage, Stage::Listing { .. }))
+            .map(|a| (a.job.username.clone(), a.job.folder.clone()))
+            .collect()
+    }
+
+    /// A folder-contents reply arrived: the fetch waiting for it picks its image.
+    pub(crate) fn offer_folder<N: CoverNet + ?Sized>(
+        &mut self,
+        net: &N,
+        username: &str,
+        folder: &str,
+        dirs: &[crate::model::BrowseDir],
+        busy: Busy,
+    ) {
+        let waiting = self.active.get(username).is_some_and(|a| {
+            matches!(a.stage, Stage::Listing { .. })
+                && cover_key(username, &a.job.folder) == cover_key(username, folder)
+        });
+        if !waiting {
+            return;
+        }
+        if let Some(mut a) = self.active.remove(username) {
+            a.job.listing = Some(files_of(username, &a.job.folder, dirs));
+            self.choose(net, a.job, busy);
+        }
+    }
+
+    fn start<N: CoverNet + ?Sized>(&mut self, net: &N, job: Job, busy: Busy) {
         if job.listing.is_some() {
-            self.choose(net, job);
+            self.choose(net, job, busy);
             return;
         }
         if let Err(e) = net.request_folder(&job.username, &job.folder) {
@@ -714,7 +746,7 @@ impl Fetcher {
     }
 
     /// Pick the image from the listing and start its download, or remember the miss.
-    fn choose<N: CoverNet + ?Sized>(&mut self, net: &N, job: Job) {
+    fn choose<N: CoverNet + ?Sized>(&mut self, net: &N, job: Job, busy: Busy) {
         let files = job.listing.clone().unwrap_or_default();
         let Some(i) = pick_cover(&files) else {
             job.store.miss(&job.key, MISS_TTL);
@@ -726,6 +758,11 @@ impl Fetcher {
         } else {
             format!("{}\\{name}", job.folder)
         };
+        if busy(&job.username, &remote) {
+            // Being downloaded with its folder: try again once that transfer is over.
+            self.queue.push_back(job);
+            return;
+        }
         let dir = job.store.tmp_dir(&job.key);
         let _ = std::fs::remove_dir_all(&dir);
         let file = paths::final_path(&dir, &remote);
@@ -759,11 +796,7 @@ impl Fetcher {
         };
         match &mut a.stage {
             Stage::Listing { deadline } => {
-                if let Some(dirs) = net.take_folder(&a.job.username, &a.job.folder) {
-                    let dirs = crate::worker::to_browse_dirs(&a.job.username, dirs);
-                    a.job.listing = Some(files_of(&a.job.username, &a.job.folder, &dirs));
-                    self.choose(net, a.job);
-                } else if Instant::now() >= *deadline {
+                if Instant::now() >= *deadline {
                     log::fail(&a.job, "no folder listing");
                     a.job.store.miss(&a.job.key, FAIL_TTL);
                 } else {
@@ -998,7 +1031,6 @@ mod tests {
     #[derive(Default)]
     struct FakeNet {
         folder_requests: Mutex<Vec<(String, String)>>,
-        folders: Mutex<HashMap<(String, String), Vec<SharedDirectory>>>,
         downloads: Mutex<Vec<Started>>,
         cancelled: Mutex<Vec<String>>,
         removed: Mutex<Vec<String>>,
@@ -1011,9 +1043,6 @@ mod tests {
                 .unwrap()
                 .push((u.into(), f.into()));
             Ok(())
-        }
-        fn take_folder(&self, u: &str, f: &str) -> Option<Vec<SharedDirectory>> {
-            self.folders.lock().unwrap().remove(&(u.into(), f.into()))
         }
         fn download(
             &self,
@@ -1036,6 +1065,34 @@ mod tests {
         fn remove_download(&self, _u: &str, p: &str) {
             self.removed.lock().unwrap().push(p.into());
         }
+    }
+
+    fn idle(_: &str, _: &str) -> bool {
+        false
+    }
+
+    #[test]
+    fn image_in_a_running_folder_download_waits_for_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Covers::open(tmp.path());
+        let net = FakeNet::default();
+        let mut fx = Fetcher::default();
+        fx.request(
+            store.clone(),
+            "a".into(),
+            "F".into(),
+            listing(&[("cover.jpg", 5)]),
+            None,
+        );
+        let downloading = std::cell::Cell::new(true);
+        let busy = |_: &str, p: &str| downloading.get() && p == r"F\cover.jpg";
+        fx.poll(Some(&net), &busy);
+        fx.poll(Some(&net), &busy);
+        assert!(net.downloads.lock().unwrap().is_empty());
+        assert_eq!(store.state("a", "F"), CoverState::Pending);
+        downloading.set(false);
+        fx.poll(Some(&net), &busy);
+        assert_eq!(net.downloads.lock().unwrap().len(), 1);
     }
 
     fn listing(names: &[(&str, u64)]) -> Option<Vec<(String, u64)>> {
@@ -1085,7 +1142,7 @@ mod tests {
             None,
         );
         assert_eq!(fx.len(), 4);
-        fx.poll(Some(&net));
+        fx.poll(Some(&net), &idle);
         {
             let d = net.downloads.lock().unwrap();
             assert_eq!(d.len(), 1, "one alice download at a time");
@@ -1099,7 +1156,7 @@ mod tests {
             *net.folder_requests.lock().unwrap(),
             vec![("bob".to_string(), r"Mp3\B".to_string())]
         );
-        fx.poll(Some(&net));
+        fx.poll(Some(&net), &idle);
         assert_eq!(net.downloads.lock().unwrap().len(), 1, "still one");
         // alice's first finishes: the library wrote the file into the temp dir.
         let (tx, dir) = {
@@ -1115,7 +1172,7 @@ mod tests {
         })
         .unwrap();
         tx.send(DownloadStatus::Completed).unwrap();
-        fx.poll(Some(&net));
+        fx.poll(Some(&net), &idle);
         assert!(matches!(
             wait_ready(&store, "alice", r"Music\A1", &changed),
             CoverState::Ready(_)
@@ -1134,15 +1191,13 @@ mod tests {
         let net = FakeNet::default();
         let mut fx = Fetcher::default();
         fx.request(store.clone(), "bob".into(), r"M\B".into(), None, None);
-        fx.poll(Some(&net));
-        net.folders.lock().unwrap().insert(
-            ("bob".into(), r"M\B".into()),
-            vec![SharedDirectory {
-                name: r"M\B".into(),
-                files: vec![],
-            }],
-        );
-        fx.poll(Some(&net));
+        fx.poll(Some(&net), &idle);
+        assert_eq!(fx.listing_waits(), vec![("bob".into(), r"M\B".into())]);
+        let empty = crate::model::BrowseDir {
+            path: r"M\B".into(),
+            files: vec![],
+        };
+        fx.offer_folder(&net, "bob", r"m\b\", &[empty], &idle);
         assert_eq!(store.state("bob", r"M\B"), CoverState::Missing);
         assert_eq!(fx.len(), 0);
         assert!(net.downloads.lock().unwrap().is_empty());
@@ -1169,9 +1224,9 @@ mod tests {
             None,
         );
         fx.request(store.clone(), "slow".into(), "G".into(), None, None);
-        fx.poll(Some(&net));
+        fx.poll(Some(&net), &idle);
         std::thread::sleep(Duration::from_millis(5));
-        fx.poll(Some(&net));
+        fx.poll(Some(&net), &idle);
         assert_eq!(*net.cancelled.lock().unwrap(), vec![r"F\folder.jpg"]);
         assert_eq!(store.state("q", "F"), CoverState::Missing);
         assert_eq!(
@@ -1190,8 +1245,8 @@ mod tests {
         let mut fx = Fetcher::default();
         fx.request(store.clone(), "a".into(), "F".into(), None, None);
         fx.request(store.clone(), "a".into(), "G".into(), None, None);
-        fx.poll(Some(&net));
-        fx.poll::<FakeNet>(None);
+        fx.poll(Some(&net), &idle);
+        fx.poll::<FakeNet>(None, &idle);
         assert_eq!(fx.len(), 0);
         assert_eq!(store.state("a", "F"), CoverState::Unknown);
         assert_eq!(store.state("a", "G"), CoverState::Unknown);
@@ -1220,7 +1275,7 @@ mod tests {
             },
         ];
         fx.request(store, "a".into(), r"M\Y".into(), None, Some(&browse));
-        fx.poll(Some(&net));
+        fx.poll(Some(&net), &idle);
         assert!(net.folder_requests.lock().unwrap().is_empty());
         assert_eq!(net.downloads.lock().unwrap()[0].1, r"M\Y\cover.jpg");
     }
