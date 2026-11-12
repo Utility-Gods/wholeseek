@@ -108,3 +108,26 @@ jobs:
           stable="$(dirname "$TARBALL")/wholeseek-linux-x86_64.tar.gz"
           cp "$TARBALL" "$stable"
           gh release upload "$TAG" "$TARBALL" "$stable" --clobber
+
+  verify-site-links:
+    # After both builds are attached, prove the website's download links serve this release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: wholeseek.utilitygods.com/download/* resolve to this tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          for kind in mac linux; do
+            ok=
+            for try in 1 2 3 4 5 6; do
+              hops=$(curl -sIL "https://wholeseek.utilitygods.com/download/$kind" | tr -d '\r' | grep -i '^location:' || true)
+              code=$(curl -sL -o /dev/null -r 0-0 -w '%{http_code}' "https://wholeseek.utilitygods.com/download/$kind")
+              echo "$kind try $try: $code"; echo "$hops" | sed -E 's/\?.*//'
+              if echo "$hops" | grep -q "/releases/download/$TAG/" && { [ "$code" = 206 ] || [ "$code" = 200 ]; }; then ok=1; break; fi
+              sleep 20
+            done
+            [ -n "$ok" ] || { echo "::error::/download/$kind does not serve $TAG"; exit 1; }
+          done
