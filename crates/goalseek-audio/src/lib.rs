@@ -2,7 +2,7 @@
 //!
 //! - [`GrowingFile`]: blocking `Read + Seek + MediaSource` over a growing `.part` file.
 //! - [`Player`]: symphonia decode thread → [`AudioSink`] (cpal device with feature `output`,
-//!   or a capture/null sink).
+//!   or a capture/null sink), with an optional play queue ([`QueueItem`]) for albums.
 
 pub mod growing;
 #[cfg(feature = "output")]
@@ -16,7 +16,7 @@ pub use growing::{
 #[cfg(feature = "output")]
 pub use output::CpalSink;
 pub use player::{
-    DEFAULT_STALL_THRESHOLD, Output, PlayState, Player, PlayerEvent, PlayerSnapshot, SeekError,
-    SinkFactory,
+    DEFAULT_STALL_THRESHOLD, Output, PREFETCH_REMAINING_SECS, PREVIOUS_RESTART_SECS, PlayState,
+    Player, PlayerEvent, PlayerSnapshot, QueueItem, SeekError, SinkFactory,
 };
 pub use sink::{AudioSink, CaptureData, CaptureSink, NullSink};

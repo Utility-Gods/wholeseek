@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
@@ -135,6 +135,26 @@ pub enum PlayerEvent {
     Error(String),
     /// The track was stopped or replaced by [`Player::stop`] / [`Player::play`].
     Stopped,
+    /// The queue moved to item `index` ([`Player::set_queue`], `next`, `previous` or
+    /// auto-advance). Sent first for the new track. If the item has no path yet, `Buffering`
+    /// follows and the player waits for [`Player::set_queue_path`].
+    TrackChanged {
+        index: usize,
+        id: String,
+    },
+    /// Start fetching queue item `index` now. Sent once per queue track, when about
+    /// [`PREFETCH_REMAINING_SECS`] remain or the current file is fully downloaded and more
+    /// than half played, whichever comes first.
+    PrefetchNext {
+        index: usize,
+        id: String,
+    },
+    /// Queue item `index` played to its end (follows `Ended`); the next item starts.
+    TrackEnded {
+        index: usize,
+    },
+    /// The last queue item ended (or `next` was called on it); the player stops.
+    QueueEnded,
 }
 
 /// Builds a sink on the decode thread (the sink itself need not be `Send`).
@@ -230,6 +250,8 @@ struct Ctl {
     /// Set when the decode thread has exited (and dropped its sink).
     finished: Arc<AtomicBool>,
     kick: (Mutex<bool>, Condvar),
+    /// For queue handling (prefetch hint, auto-advance) from the ticker.
+    player: Weak<Inner>,
 }
 
 impl Ctl {
@@ -300,8 +322,78 @@ impl Session {
     }
 }
 
-/// Plays one track at a time from a (possibly still downloading) file.
+/// Seconds before the end of a queue track at which [`PlayerEvent::PrefetchNext`] is sent.
+pub const PREFETCH_REMAINING_SECS: f64 = 20.0;
+
+/// [`Player::previous`] restarts the current track instead when it has played longer than this.
+pub const PREVIOUS_RESTART_SECS: f64 = 3.0;
+
+/// One entry of the play queue (see [`Player::set_queue`]). Fetching stays with the app: it
+/// starts the download (into the cache dir) and gives the player the path, either up front or
+/// later with [`Player::set_queue_path`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueItem {
+    /// Opaque to the player; handed back in queue events (e.g. a peer + remote path key).
+    pub id: String,
+    /// Where the file is (being) downloaded, final or `.part` name; `None` until fetched.
+    pub path: Option<PathBuf>,
+    /// Expected complete size in bytes, or [`UNKNOWN_SIZE`](crate::UNKNOWN_SIZE).
+    pub size: u64,
+}
+
+impl QueueItem {
+    /// An item that has not been fetched yet.
+    pub fn new(id: impl Into<String>, size: u64) -> Self {
+        Self {
+            id: id.into(),
+            path: None,
+            size,
+        }
+    }
+
+    /// An item whose download has started (or finished) at `path`.
+    pub fn with_path(id: impl Into<String>, path: impl Into<PathBuf>, size: u64) -> Self {
+        Self {
+            id: id.into(),
+            path: Some(path.into()),
+            size,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Queue {
+    items: Vec<QueueItem>,
+    index: Option<usize>,
+    /// Event generation of the track for `index` (playing, or waiting for its path).
+    generation: u64,
+    /// The current item has no path yet; the player reports `Buffering`.
+    waiting: bool,
+    /// `PrefetchNext` already sent for the current track.
+    prefetched: bool,
+}
+
+impl Queue {
+    fn clear(&mut self) {
+        *self = Queue::default();
+    }
+}
+
+fn source_for(path: &Path, size: u64) -> GrowingFile {
+    if size == crate::UNKNOWN_SIZE {
+        GrowingFile::new_unknown_size(path)
+    } else {
+        GrowingFile::new(path, size)
+    }
+}
+
+/// Plays one track at a time from a (possibly still downloading) file, optionally working
+/// through a queue of tracks (e.g. the rest of an album folder, see [`Player::set_queue`]).
 pub struct Player {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     sinks: SinkFactory,
     volume: Arc<AtomicU32>,
     stall_ms: Arc<AtomicU64>,
@@ -310,6 +402,8 @@ pub struct Player {
     /// Exit flag of the most recent decode thread; a new track waits (on its own thread) for
     /// the old one to release the output before opening it.
     last_finished: Mutex<Option<Arc<AtomicBool>>>,
+    /// Lock order: `queue` before `current`.
+    queue: Mutex<Queue>,
 }
 
 impl Player {
@@ -320,39 +414,40 @@ impl Player {
     /// Use a custom sink (built on the decode thread for every track).
     pub fn with_sink_factory(sinks: SinkFactory) -> Self {
         Self {
-            sinks,
-            volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
-            stall_ms: Arc::new(AtomicU64::new(DEFAULT_STALL_THRESHOLD.as_millis() as u64)),
-            hub: Arc::new(Hub::default()),
-            current: Mutex::new(None),
-            last_finished: Mutex::new(None),
+            inner: Arc::new(Inner {
+                sinks,
+                volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+                stall_ms: Arc::new(AtomicU64::new(DEFAULT_STALL_THRESHOLD.as_millis() as u64)),
+                hub: Arc::new(Hub::default()),
+                current: Mutex::new(None),
+                last_finished: Mutex::new(None),
+                queue: Mutex::new(Queue::default()),
+            }),
         }
-    }
-
-    fn session(&self) -> std::sync::MutexGuard<'_, Option<Session>> {
-        lock(&self.current)
     }
 
     /// Receive [`PlayerEvent`]s. Any number of subscribers; dropped receivers are pruned.
     pub fn subscribe(&self) -> Receiver<PlayerEvent> {
         let (tx, rx) = mpsc::channel();
-        lock(&self.hub.subs).push(tx);
+        lock(&self.inner.hub.subs).push(tx);
         rx
     }
 
     /// Called (from player threads) after events are sent, e.g. to wake the UI event loop.
     /// Must be cheap and must not call back into the `Player`.
     pub fn set_waker(&self, waker: impl Fn() + Send + Sync + 'static) {
-        *lock(&self.hub.waker) = Some(Arc::new(waker));
+        *lock(&self.inner.hub.waker) = Some(Arc::new(waker));
     }
 
     /// How long without new bytes, while waiting, before the stall notice (default 5 s).
     pub fn set_stall_threshold(&self, t: Duration) {
-        self.stall_ms.store(t.as_millis() as u64, Ordering::SeqCst);
+        self.inner
+            .stall_ms
+            .store(t.as_millis() as u64, Ordering::SeqCst);
     }
 
     /// Start playing `path` (the final name or the `.part` name) whose complete size is
-    /// `total_size`. Replaces any current track. Returns immediately.
+    /// `total_size`. Replaces any current track and clears the queue. Returns immediately.
     pub fn play(&self, path: impl AsRef<Path>, total_size: u64) {
         self.play_source(path.as_ref(), GrowingFile::new(path.as_ref(), total_size));
     }
@@ -365,8 +460,250 @@ impl Player {
 
     /// Like [`play`](Self::play) with a pre-configured source (poll interval, timeouts).
     pub fn play_source(&self, path: &Path, src: GrowingFile) {
+        let mut q = lock(&self.inner.queue);
+        q.clear();
+        self.inner.play_source(path, src, None);
+    }
+
+    pub fn pause(&self) {
+        self.inner.pause();
+    }
+
+    pub fn resume(&self) {
+        self.inner.resume();
+    }
+
+    /// Stop and unload; also clears the queue. The decode thread exits on its own (never
+    /// joined here).
+    pub fn stop(&self) {
+        let mut q = lock(&self.inner.queue);
+        q.clear();
+        self.inner.stop();
+    }
+
+    /// The current track's source handle (e.g. to forward download progress with
+    /// [`GrowingHandle::notify`] or [`GrowingHandle::set_total_size`]).
+    pub fn source_handle(&self) -> Option<GrowingHandle> {
+        self.inner.source_handle()
+    }
+
+    /// The download behind the current track failed or was cancelled: play what is already
+    /// downloaded, then stop with `PlayState::Error(reason)` instead of waiting forever.
+    pub fn fail_source(&self, reason: impl Into<String>) {
+        self.inner.fail_source(reason);
+    }
+
+    /// Seek within the downloaded range. Targets beyond it are rejected immediately with
+    /// [`SeekError::NotBuffered`] so the UI can show why. Seeking backwards is always allowed.
+    pub fn seek(&self, secs: f64) -> Result<(), SeekError> {
+        self.inner.seek(secs)
+    }
+
+    /// Volume 0.0..=1.0 (clamped), applied on the decode thread.
+    pub fn set_volume(&self, v: f32) {
+        self.inner.set_volume(v);
+    }
+
+    pub fn snapshot(&self) -> PlayerSnapshot {
+        let waiting = lock(&self.inner.queue).waiting;
+        let mut snap = self.inner.snapshot();
+        if waiting && snap.state == PlayState::Idle {
+            snap.state = PlayState::Buffering;
+        }
+        snap
+    }
+
+    /// Replace the queue with `items` and play `items[start]` (which replaces any current
+    /// track). When a queue track ends the next one starts automatically; see
+    /// [`PlayerEvent::PrefetchNext`] for when to fetch it. Does nothing but clear the queue
+    /// (and stop) if `start` is out of range.
+    ///
+    /// Sends [`PlayerEvent::TrackChanged`]; if the item has no path yet the player waits in
+    /// `Buffering` until [`set_queue_path`](Self::set_queue_path) is called for it.
+    pub fn set_queue(&self, items: Vec<QueueItem>, start: usize) {
+        let mut q = lock(&self.inner.queue);
+        q.clear();
+        if start >= items.len() {
+            self.inner.stop();
+            return;
+        }
+        q.items = items;
+        self.inner.goto(&mut q, start);
+    }
+
+    /// Tell the player where queue item `index` is being downloaded (after the app started
+    /// fetching it, e.g. on [`PlayerEvent::PrefetchNext`] or [`PlayerEvent::TrackChanged`]).
+    /// If the player was waiting for this item, it starts playing it. Returns `false` if
+    /// `index` is not in the queue.
+    pub fn set_queue_path(&self, index: usize, path: impl Into<PathBuf>, size: u64) -> bool {
+        let mut q = lock(&self.inner.queue);
+        let Some(item) = q.items.get_mut(index) else {
+            return false;
+        };
+        let path = path.into();
+        item.path = Some(path.clone());
+        item.size = size;
+        if q.waiting && q.index == Some(index) {
+            q.waiting = false;
+            q.generation = self.inner.play_source(&path, source_for(&path, size), None);
+        }
+        true
+    }
+
+    /// Skip to the next queue item; at the end of the queue, stop (with
+    /// [`PlayerEvent::QueueEnded`]). Does nothing without a queue.
+    pub fn next(&self) {
+        let mut q = lock(&self.inner.queue);
+        let Some(i) = q.index else {
+            return;
+        };
+        if i + 1 < q.items.len() {
+            self.inner.goto(&mut q, i + 1);
+        } else {
+            self.inner.end_queue(&mut q);
+        }
+    }
+
+    /// Restart the current track if it has played more than [`PREVIOUS_RESTART_SECS`],
+    /// otherwise go to the previous queue item (the first item restarts). Does nothing without
+    /// a queue.
+    pub fn previous(&self) {
+        let mut q = lock(&self.inner.queue);
+        let Some(i) = q.index else {
+            return;
+        };
+        let pos = self
+            .inner
+            .session()
+            .as_ref()
+            .map_or(0.0, |s| s.ctl.position());
+        if pos > PREVIOUS_RESTART_SECS && self.inner.seek(0.0).is_ok() {
+            return;
+        }
+        self.inner.goto(&mut q, i.saturating_sub(1));
+    }
+
+    /// Index of the current queue item, if a queue is active.
+    pub fn queue_index(&self) -> Option<usize> {
+        lock(&self.inner.queue).index
+    }
+
+    /// The queue (empty if none).
+    pub fn queue_items(&self) -> Vec<QueueItem> {
+        lock(&self.inner.queue).items.clone()
+    }
+
+    /// Forget the queue; the current track keeps playing and then just ends.
+    pub fn clear_queue(&self) {
+        let mut q = lock(&self.inner.queue);
+        if q.waiting {
+            // Nothing is playing; leave a clean Idle state.
+            self.inner.stop();
+        }
+        q.clear();
+    }
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl Inner {
+    /// Make queue item `i` current: play it if its path is known, else wait for it.
+    fn goto(self: &Arc<Self>, q: &mut Queue, i: usize) {
+        let item = q.items[i].clone();
+        q.index = Some(i);
+        q.prefetched = false;
+        let changed = PlayerEvent::TrackChanged {
+            index: i,
+            id: item.id.clone(),
+        };
+        match &item.path {
+            Some(path) => {
+                q.waiting = false;
+                q.generation = self.play_source(path, source_for(path, item.size), Some(changed));
+            }
+            None => {
+                let had = self.stop_session();
+                let generation = self.hub.bump(had);
+                q.waiting = true;
+                q.generation = generation;
+                self.hub.emit(generation, changed);
+                self.hub.emit(generation, PlayerEvent::Buffering);
+            }
+        }
+    }
+
+    fn end_queue(&self, q: &mut Queue) {
+        self.hub.emit(q.generation, PlayerEvent::QueueEnded);
+        q.clear();
+        self.stop();
+    }
+
+    /// Called by the ticker of track `ctl` on every pass (`ended`: it just reached its end).
+    fn queue_tick(self: &Arc<Self>, ctl: &Ctl, state: &PlayState, ended: bool) {
+        let mut q = lock(&self.queue);
+        let Some(i) = q.index else {
+            return;
+        };
+        if q.generation != ctl.generation || ctl.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        let has_next = i + 1 < q.items.len();
+        if ended {
+            ctl.emit(PlayerEvent::TrackEnded { index: i });
+            if has_next {
+                self.goto(&mut q, i + 1);
+            } else {
+                self.end_queue(&mut q);
+            }
+            return;
+        }
+        if q.prefetched
+            || !has_next
+            || !matches!(
+                state,
+                PlayState::Playing | PlayState::Paused | PlayState::Buffering
+            )
+        {
+            return;
+        }
+        let Some((dur, _)) = ctl.duration() else {
+            return;
+        };
+        let pos = ctl.position();
+        // "Fully downloaded": all announced bytes are on disk (the reader itself only notices
+        // completion when the decoder reaches the end).
+        let g = &ctl.growing;
+        let downloaded =
+            g.is_complete() || (g.known_total_size().is_some() && g.buffered_fraction() >= 1.0);
+        if dur - pos <= PREFETCH_REMAINING_SECS || (downloaded && pos > dur / 2.0) {
+            q.prefetched = true;
+            ctl.emit(PlayerEvent::PrefetchNext {
+                index: i + 1,
+                id: q.items[i + 1].id.clone(),
+            });
+        }
+    }
+
+    fn session(&self) -> std::sync::MutexGuard<'_, Option<Session>> {
+        lock(&self.current)
+    }
+
+    /// Start a new track (new event generation); `first` is sent before any of its events.
+    fn play_source(
+        self: &Arc<Self>,
+        path: &Path,
+        src: GrowingFile,
+        first: Option<PlayerEvent>,
+    ) -> u64 {
         let had = self.stop_session();
         let generation = self.hub.bump(had);
+        if let Some(ev) = first {
+            self.hub.emit(generation, ev);
+        }
         let (tx, rx) = mpsc::channel();
         let finished = Arc::new(AtomicBool::new(false));
         let ctl = Arc::new(Ctl {
@@ -385,6 +722,7 @@ impl Player {
             stopped: AtomicBool::new(false),
             finished: finished.clone(),
             kick: (Mutex::new(false), Condvar::new()),
+            player: Arc::downgrade(self),
         });
         let prev = lock(&self.last_finished).replace(finished);
         let sinks = self.sinks.clone();
@@ -410,15 +748,16 @@ impl Player {
             }
         }
         *self.session() = Some(Session { ctl, tx });
+        generation
     }
 
-    pub fn pause(&self) {
+    fn pause(&self) {
         if let Some(s) = &*self.session() {
             s.send(Cmd::Pause);
         }
     }
 
-    pub fn resume(&self) {
+    fn resume(&self) {
         if let Some(s) = &*self.session() {
             s.send(Cmd::Resume);
         }
@@ -437,7 +776,7 @@ impl Player {
     }
 
     /// Stop and unload. The decode thread exits on its own (never joined here).
-    pub fn stop(&self) {
+    fn stop(&self) {
         if self.stop_session() {
             self.hub.bump(true);
         }
@@ -445,13 +784,13 @@ impl Player {
 
     /// The current track's source handle (e.g. to forward download progress with
     /// [`GrowingHandle::notify`] or [`GrowingHandle::set_total_size`]).
-    pub fn source_handle(&self) -> Option<GrowingHandle> {
+    fn source_handle(&self) -> Option<GrowingHandle> {
         self.session().as_ref().map(|s| s.ctl.growing.clone())
     }
 
     /// The download behind the current track failed or was cancelled: play what is already
     /// downloaded, then stop with `PlayState::Error(reason)` instead of waiting forever.
-    pub fn fail_source(&self, reason: impl Into<String>) {
+    fn fail_source(&self, reason: impl Into<String>) {
         if let Some(s) = &*self.session() {
             s.ctl.growing.fail(reason);
         }
@@ -459,7 +798,7 @@ impl Player {
 
     /// Seek within the downloaded range. Targets beyond it are rejected immediately with
     /// [`SeekError::NotBuffered`] so the UI can show why. Seeking backwards is always allowed.
-    pub fn seek(&self, secs: f64) -> Result<(), SeekError> {
+    fn seek(&self, secs: f64) -> Result<(), SeekError> {
         let guard = self.session();
         let s = guard.as_ref().ok_or(SeekError::NothingPlaying)?;
         if matches!(s.ctl.status(), Status::Error(_)) {
@@ -489,7 +828,7 @@ impl Player {
     }
 
     /// Volume 0.0..=1.0 (clamped), applied on the decode thread.
-    pub fn set_volume(&self, v: f32) {
+    fn set_volume(&self, v: f32) {
         let v = if v.is_finite() {
             v.clamp(0.0, 1.0)
         } else {
@@ -498,7 +837,7 @@ impl Player {
         self.volume.store(v.to_bits(), Ordering::SeqCst);
     }
 
-    pub fn snapshot(&self) -> PlayerSnapshot {
+    fn snapshot(&self) -> PlayerSnapshot {
         let volume = f32::from_bits(self.volume.load(Ordering::SeqCst));
         let guard = self.session();
         let Some(s) = guard.as_ref() else {
@@ -534,12 +873,6 @@ impl Player {
             volume,
             notice: s.ctl.notice(),
         }
-    }
-}
-
-impl Drop for Player {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
 
@@ -644,7 +977,9 @@ fn ticker(ctl: &Ctl) {
             last_notice = notice;
         }
         let state = ctl.public_state();
+        let mut ended = false;
         if last_state.as_ref() != Some(&state) {
+            ended = state == PlayState::Ended;
             let ev = match &state {
                 PlayState::Idle => None,
                 PlayState::Buffering => Some(PlayerEvent::Buffering),
@@ -665,6 +1000,9 @@ fn ticker(ctl: &Ctl) {
                 buffered_fraction: g.buffered_fraction(),
             });
             last_tick = Instant::now();
+        }
+        if let Some(p) = ctl.player.upgrade() {
+            p.queue_tick(ctl, &state, ended);
         }
         if matches!(state, PlayState::Error(_)) && ctl.finished.load(Ordering::SeqCst) {
             return;
