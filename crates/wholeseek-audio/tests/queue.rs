@@ -515,7 +515,14 @@ fn manual_play_elsewhere_clears_queue() {
         brief(&ev),
         brief(&after)
     );
-    let all: Vec<_> = ev.iter().chain(after.iter()).collect();
+    // Events of the old queue track sent before the replacement (e.g. its PrefetchNext, which
+    // a short track sends right at start, possibly just before `play`) may still be in the
+    // channel; the replacement is marked by `Stopped` and nothing of the queue may follow it.
+    let cut = ev
+        .iter()
+        .position(|(_, e)| *e == PlayerEvent::Stopped)
+        .expect("Stopped marks the replacement");
+    let all: Vec<_> = ev[cut..].iter().chain(after.iter()).collect();
     assert!(all.iter().all(|(_, e)| changed(e).is_none()
         && track_ended(e).is_none()
         && prefetch(e).is_none()
