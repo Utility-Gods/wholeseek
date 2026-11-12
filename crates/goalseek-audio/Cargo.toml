@@ -1,0 +1,21 @@
+[package]
+name = "goalseek-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+symphonia = { version = "0.6.1", default-features = false, features = ["flac", "mp3", "ogg", "vorbis", "isomp4", "aac", "wav", "pcm"] }
+cpal = { version = "0.18.2", optional = true }
+
+[features]
+default = ["output"]
+output = ["dep:cpal"]
+
+[dev-dependencies]
+tempfile = "3"
+goalseek-core.workspace = true
+
+[[example]]
+name = "live_play"
+required-features = ["output"]

@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/goalseek-core", "crates/goalseek-audio", "app/goalseek"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.99"
+
+[workspace.dependencies]
+# Pinned revisions (see docs/MVP.md). Bump deliberately.
+soulseek-rs-lib = { git = "https://github.com/michel/soulseek-rs", rev = "434dcc0155ed87203cafcd1cf7b1a1073f88a63d" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "01349dbf2dd01a4e0e1cf3e5aa6e9dc0521291a1" }
+goalseek-core = { path = "crates/goalseek-core" }
+goalseek-audio = { path = "crates/goalseek-audio" }
+
+# Rune requires its consumers to patch these from its vendor/ dir (a dependency's [patch] does not
+# apply to the workspace that depends on it). Same pinned rev as the `rune` dependency above.
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "01349dbf2dd01a4e0e1cf3e5aa6e9dc0521291a1" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "01349dbf2dd01a4e0e1cf3e5aa6e9dc0521291a1" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "01349dbf2dd01a4e0e1cf3e5aa6e9dc0521291a1" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "01349dbf2dd01a4e0e1cf3e5aa6e9dc0521291a1" }

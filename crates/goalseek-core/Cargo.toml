@@ -1,0 +1,20 @@
+[package]
+name = "goalseek-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+soulseek-rs-lib.workspace = true
+# Port mapping (UPnP-IGD); NAT-PMP is hand-rolled std-only (src/port_mapping).
+igd-next = "0.17"
+# Config persistence (~/.config/goalseek/config.toml).
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+dirs = "6"
+# Password storage. Linux uses the pure-Rust zbus Secret Service backend so the
+# build does not need libdbus-1-dev (same feature set soulseek-rs ships).
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
+
+[dev-dependencies]
+tempfile = "3"

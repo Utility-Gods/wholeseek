@@ -1,0 +1,1056 @@
+//! Worker logic against a fake session: no network, temp dirs only.
+
+use crate::core::Core;
+use crate::event::{CoreEvent, DisconnectReason};
+use crate::model::{
+    AudioAttrs, Credentials, RemoteFile, Settings, TransferId, TransferKind, UploadState,
+};
+use crate::net::{ConnectParams, Connector, LoginError, Session};
+use crate::worker::Tunables;
+use soulseek_rs::{
+    DownloadStatus, File, SearchResult, SessionLoss, SharedDirectory, SharedFileEntry, UploadInfo,
+    UploadStatus,
+};
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+// ------------------------------------------------------------------- fakes
+
+struct FakeDl {
+    path: String,
+    dir: PathBuf,
+    tx: Sender<DownloadStatus>,
+}
+
+#[derive(Default)]
+struct FakeState {
+    loss: Option<SessionLoss>,
+    searches: HashMap<String, Vec<SearchResult>>,
+    forgotten: Vec<String>,
+    browses: HashMap<String, Vec<SharedDirectory>>,
+    browse_requests: Vec<String>,
+    folders: HashMap<(String, String), Vec<SharedDirectory>>,
+    folder_requests: Vec<(String, String)>,
+    downloads: Vec<FakeDl>,
+    cancels: Vec<(String, String)>,
+    place_requests: usize,
+    uploads: Vec<UploadInfo>,
+    upload_cancels: Vec<(String, String)>,
+    share_sets: Vec<Vec<String>>,
+    slots: usize,
+}
+
+#[derive(Default)]
+struct FakeSession {
+    s: Mutex<FakeState>,
+}
+
+impl FakeSession {
+    fn st(&self) -> std::sync::MutexGuard<'_, FakeState> {
+        self.s.lock().unwrap()
+    }
+    /// Simulate the library: write the `.part`, report progress.
+    fn progress(&self, i: usize, data: &[u8], total: u64) -> PathBuf {
+        let st = self.st();
+        let d = &st.downloads[i];
+        let part = crate::paths::part_path(&d.dir, &d.path);
+        std::fs::create_dir_all(&d.dir).unwrap();
+        std::fs::write(&part, data).unwrap();
+        d.tx.send(DownloadStatus::InProgress {
+            bytes_downloaded: data.len() as u64,
+            total_bytes: total,
+            speed_bytes_per_sec: 1000.0,
+        })
+        .unwrap();
+        part
+    }
+    /// Simulate the library finishing: rename `.part` → final, report Completed.
+    fn complete(&self, i: usize) -> PathBuf {
+        let st = self.st();
+        let d = &st.downloads[i];
+        let part = crate::paths::part_path(&d.dir, &d.path);
+        let fin = crate::paths::final_path(&d.dir, &d.path);
+        std::fs::rename(&part, &fin).unwrap();
+        d.tx.send(DownloadStatus::Completed).unwrap();
+        fin
+    }
+}
+
+impl Session for FakeSession {
+    fn listen_port(&self) -> Option<u16> {
+        Some(2234)
+    }
+    fn session_loss(&self) -> Option<SessionLoss> {
+        self.st().loss
+    }
+    fn search_blocking(&self, query: &str, window: Duration, cancel: Arc<AtomicBool>) {
+        self.st().searches.insert(query.to_string(), Vec::new());
+        let start = Instant::now();
+        while start.elapsed() < window && !cancel.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn search_count(&self, q: &str) -> usize {
+        self.st().searches.get(q).map_or(0, Vec::len)
+    }
+    fn search_results(&self, q: &str) -> Vec<SearchResult> {
+        self.st().searches.get(q).cloned().unwrap_or_default()
+    }
+    fn forget_search(&self, q: &str) {
+        let mut st = self.st();
+        st.searches.remove(q);
+        st.forgotten.push(q.to_string());
+    }
+    fn browse(&self, u: &str) -> Result<(), String> {
+        self.st().browse_requests.push(u.to_string());
+        Ok(())
+    }
+    fn take_browse(&self, u: &str) -> Option<Vec<SharedDirectory>> {
+        self.st().browses.remove(u)
+    }
+    fn request_folder(&self, u: &str, f: &str) -> Result<(), String> {
+        self.st().folder_requests.push((u.into(), f.into()));
+        Ok(())
+    }
+    fn take_folder(&self, u: &str, f: &str) -> Option<Vec<SharedDirectory>> {
+        self.st().folders.remove(&(u.to_string(), f.to_string()))
+    }
+    fn download(
+        &self,
+        _user: &str,
+        path: &str,
+        _size: u64,
+        dir: &str,
+    ) -> Result<Receiver<DownloadStatus>, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.st().downloads.push(FakeDl {
+            path: path.into(),
+            dir: dir.into(),
+            tx,
+        });
+        Ok(rx)
+    }
+    fn cancel_download(&self, u: &str, p: &str) -> bool {
+        self.st().cancels.push((u.into(), p.into()));
+        true
+    }
+    fn remove_download(&self, _u: &str, _p: &str) {}
+    fn request_place_in_queue(&self, _u: &str, _p: &str) {
+        self.st().place_requests += 1;
+    }
+    fn queue_place(&self, _u: &str, _p: &str) -> Option<u32> {
+        Some(7)
+    }
+    fn set_shares(&self, dirs: Vec<String>) -> Result<(u32, u32), String> {
+        self.st().share_sets.push(dirs);
+        Ok((1, 42))
+    }
+    fn shared_counts(&self) -> (u32, u32) {
+        (0, 0)
+    }
+    fn uploads(&self) -> Vec<UploadInfo> {
+        self.st().uploads.clone()
+    }
+    fn cancel_upload(&self, u: &str, p: &str) -> bool {
+        self.st().upload_cancels.push((u.into(), p.into()));
+        true
+    }
+    fn set_upload_slots(&self, n: usize) {
+        self.st().slots = n;
+    }
+}
+
+#[derive(Default)]
+struct FakeConnector {
+    replies: Mutex<VecDeque<Result<Arc<FakeSession>, LoginError>>>,
+    params: Mutex<Vec<ConnectParams>>,
+}
+
+impl Connector for FakeConnector {
+    fn connect(&self, p: &ConnectParams) -> Result<Arc<dyn Session>, LoginError> {
+        self.params.lock().unwrap().push(p.clone());
+        let r = self.replies.lock().unwrap().pop_front();
+        match r {
+            Some(Ok(s)) => Ok(s),
+            Some(Err(e)) => Err(e),
+            None => Err(LoginError::Other("no scripted reply".into())),
+        }
+    }
+}
+
+// ----------------------------------------------------------------- harness
+
+struct H {
+    core: Core,
+    ev: Receiver<CoreEvent>,
+    conn: Arc<FakeConnector>,
+    tmp: tempfile::TempDir,
+}
+
+fn tunables() -> Tunables {
+    Tunables {
+        tick: Duration::from_millis(10),
+        search_window: Duration::from_millis(300),
+        browse_timeout: Duration::from_millis(200),
+        folder_timeout: Duration::from_millis(100),
+        play_start_timeout: Duration::from_millis(400),
+        queue_place_after: Duration::from_millis(50),
+        uploads_every: Duration::from_millis(20),
+        backoff: |_| Duration::from_millis(30),
+    }
+}
+
+fn harness_with(f: impl FnOnce(&mut Settings, &Path)) -> H {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut settings = Settings {
+        download_dir: tmp.path().join("downloads"),
+        cache_dir: tmp.path().join("cache"),
+        port_mapping: false,
+        ..Settings::default()
+    };
+    f(&mut settings, tmp.path());
+    let conn = Arc::new(FakeConnector::default());
+    let (core, ev) = Core::start_with(settings, conn.clone(), tunables()).unwrap();
+    H {
+        core,
+        ev,
+        conn,
+        tmp,
+    }
+}
+
+fn harness() -> H {
+    harness_with(|_, _| {})
+}
+
+impl H {
+    fn script(&self, r: Result<Arc<FakeSession>, LoginError>) {
+        self.conn.replies.lock().unwrap().push_back(r);
+    }
+    /// Wait for the first event matching `pred`, discarding others.
+    fn want(&self, what: &str, pred: impl Fn(&CoreEvent) -> bool) -> CoreEvent {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            if let Ok(e) = self.ev.recv_timeout(Duration::from_millis(20)) {
+                if pred(&e) {
+                    return e;
+                }
+                seen.push(e);
+            }
+        }
+        panic!("timed out waiting for {what}; saw {seen:#?}");
+    }
+    /// Assert no matching event arrives within `d`.
+    fn none_within(&self, d: Duration, pred: impl Fn(&CoreEvent) -> bool) {
+        let deadline = Instant::now() + d;
+        while Instant::now() < deadline {
+            if let Ok(e) = self.ev.recv_timeout(Duration::from_millis(10)) {
+                assert!(!pred(&e), "unexpected {e:?}");
+            }
+        }
+    }
+    fn online(&self) -> Arc<FakeSession> {
+        let s = Arc::new(FakeSession::default());
+        self.script(Ok(s.clone()));
+        self.core.login(creds());
+        self.want("Connected", |e| matches!(e, CoreEvent::Connected { .. }));
+        s
+    }
+    fn downloads_dir(&self) -> PathBuf {
+        self.tmp.path().join("downloads")
+    }
+    fn cache_dir(&self) -> PathBuf {
+        self.tmp.path().join("cache")
+    }
+}
+
+fn wait_until(what: &str, f: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if f() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("timed out: {what}");
+}
+
+fn creds() -> Credentials {
+    Credentials {
+        username: "me".into(),
+        password: "pw".into(),
+    }
+}
+
+fn rfile(path: &str, size: u64) -> RemoteFile {
+    RemoteFile {
+        username: "alice".into(),
+        path: path.into(),
+        size,
+        attrs: AudioAttrs::default(),
+    }
+}
+
+fn result(user: &str, names: &[&str]) -> SearchResult {
+    SearchResult {
+        token: 1,
+        files: names
+            .iter()
+            .map(|n| File {
+                username: user.into(),
+                name: (*n).into(),
+                size: 10,
+                attribs: HashMap::new(),
+            })
+            .collect(),
+        slots: 1,
+        speed: 100,
+        username: user.into(),
+    }
+}
+
+fn dir(name: &str, files: &[&str]) -> SharedDirectory {
+    SharedDirectory {
+        name: name.into(),
+        files: files
+            .iter()
+            .map(|f| SharedFileEntry {
+                name: (*f).into(),
+                size: 4,
+                attributes: vec![(1, 200)],
+            })
+            .collect(),
+    }
+}
+
+/// Every regular file under `dir`, recursively.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(files_under(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+fn is_done(id: TransferId) -> impl Fn(&CoreEvent) -> bool {
+    move |e| matches!(e, CoreEvent::TransferDone { id: i, .. } if *i == id)
+}
+
+fn done_path(e: CoreEvent) -> PathBuf {
+    match e {
+        CoreEvent::TransferDone { path, .. } => path,
+        other => panic!("{other:?}"),
+    }
+}
+
+// ------------------------------------------------------------------- session
+
+#[test]
+fn login_connects_and_reports_bound_port_and_slots() {
+    let h = harness();
+    let s = Arc::new(FakeSession::default());
+    h.script(Ok(s.clone()));
+    h.core.login(creds());
+    match h.want("Connected", |e| matches!(e, CoreEvent::Connected { .. })) {
+        CoreEvent::Connected {
+            username,
+            listen_port,
+        } => {
+            assert_eq!(username, "me");
+            assert_eq!(listen_port, Some(2234));
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(s.st().slots, 10);
+    let p = h.conn.params.lock().unwrap()[0].clone();
+    assert_eq!(p.listen_port, 2234);
+}
+
+#[test]
+fn rejected_login_does_not_retry() {
+    let h = harness();
+    h.script(Err(LoginError::Rejected));
+    h.core.login(creds());
+    let e = h.want("Disconnected", |e| {
+        matches!(e, CoreEvent::Disconnected { .. })
+    });
+    assert_eq!(
+        e,
+        CoreEvent::Disconnected {
+            reason: DisconnectReason::LoginRejected,
+            will_retry: false
+        }
+    );
+    h.none_within(Duration::from_millis(150), |e| {
+        matches!(e, CoreEvent::Connected { .. })
+    });
+    assert_eq!(h.conn.params.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn network_failure_retries_with_backoff_then_connects() {
+    let h = harness();
+    h.script(Err(LoginError::Other("connection refused".into())));
+    h.script(Ok(Arc::new(FakeSession::default())));
+    h.core.login(creds());
+    let e = h.want("Disconnected", |e| {
+        matches!(e, CoreEvent::Disconnected { .. })
+    });
+    assert!(matches!(
+        e,
+        CoreEvent::Disconnected {
+            reason: DisconnectReason::Network(_),
+            will_retry: true
+        }
+    ));
+    h.want("Connected", |e| matches!(e, CoreEvent::Connected { .. }));
+    assert_eq!(h.conn.params.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn dropped_session_reconnects_but_displaced_does_not() {
+    let h = harness();
+    let s1 = h.online();
+    let s2 = Arc::new(FakeSession::default());
+    h.script(Ok(s2.clone()));
+    s1.st().loss = Some(SessionLoss::Disconnected);
+    let e = h.want("Disconnected", |e| {
+        matches!(e, CoreEvent::Disconnected { .. })
+    });
+    assert!(matches!(
+        e,
+        CoreEvent::Disconnected {
+            will_retry: true,
+            ..
+        }
+    ));
+    h.want("reconnected", |e| matches!(e, CoreEvent::Connected { .. }));
+
+    s2.st().loss = Some(SessionLoss::Displaced);
+    let e = h.want("Disconnected", |e| {
+        matches!(e, CoreEvent::Disconnected { .. })
+    });
+    assert_eq!(
+        e,
+        CoreEvent::Disconnected {
+            reason: DisconnectReason::Displaced,
+            will_retry: false
+        }
+    );
+    h.none_within(Duration::from_millis(150), |e| {
+        matches!(e, CoreEvent::Connected { .. })
+    });
+}
+
+#[test]
+fn logout_stops_and_listen_port_change_reconnects() {
+    let mut h = harness();
+    let _s = h.online();
+    h.script(Ok(Arc::new(FakeSession::default())));
+    let mut new = h.core.settings().clone();
+    new.listen_port = 40_000;
+    h.core.apply_settings(new);
+    h.want("reconnected", |e| matches!(e, CoreEvent::Connected { .. }));
+    assert_eq!(
+        h.conn.params.lock().unwrap().last().unwrap().listen_port,
+        40_000
+    );
+    h.core.logout();
+    let e = h.want("Disconnected", |e| {
+        matches!(
+            e,
+            CoreEvent::Disconnected {
+                reason: DisconnectReason::User,
+                ..
+            }
+        )
+    });
+    assert!(matches!(
+        e,
+        CoreEvent::Disconnected {
+            will_retry: false,
+            ..
+        }
+    ));
+}
+
+// -------------------------------------------------------------------- search
+
+#[test]
+fn search_streams_ranked_deltas_then_finishes_and_forgets() {
+    let h = harness();
+    let s = h.online();
+    let id = h.core.search("  daft punk ");
+    wait_until("search registered", || {
+        s.st().searches.contains_key("daft punk")
+    });
+    s.st()
+        .searches
+        .get_mut("daft punk")
+        .unwrap()
+        .push(result("a", &[r"x\1.mp3"]));
+    let e = h.want("batch 1", |e| matches!(e, CoreEvent::SearchResults { .. }));
+    let CoreEvent::SearchResults { search, hits } = e else {
+        unreachable!()
+    };
+    assert_eq!(search, id);
+    assert_eq!(hits.len(), 1);
+    s.st()
+        .searches
+        .get_mut("daft punk")
+        .unwrap()
+        .push(result("b", &[r"y\cover.jpg", r"y\2.ogg", r"y\1.flac"]));
+    let CoreEvent::SearchResults { hits, .. } =
+        h.want("batch 2", |e| matches!(e, CoreEvent::SearchResults { .. }))
+    else {
+        unreachable!()
+    };
+    let paths: Vec<_> = hits.iter().map(|h| h.file.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [r"y\1.flac", r"y\2.ogg"],
+        "only the delta, audio-only, FLAC first"
+    );
+    let e = h.want("finished", |e| {
+        matches!(e, CoreEvent::SearchFinished { .. })
+    });
+    assert_eq!(
+        e,
+        CoreEvent::SearchFinished {
+            search: id,
+            total_files: 3
+        }
+    );
+    assert!(s.st().forgotten.contains(&"daft punk".to_string()));
+}
+
+#[test]
+fn audio_only_can_be_turned_off() {
+    let h = harness();
+    let s = h.online();
+    h.core.set_audio_only(false);
+    let _ = h.core.search("q");
+    wait_until("registered", || s.st().searches.contains_key("q"));
+    s.st()
+        .searches
+        .get_mut("q")
+        .unwrap()
+        .push(result("a", &[r"x\cover.jpg"]));
+    let CoreEvent::SearchResults { hits, .. } =
+        h.want("batch", |e| matches!(e, CoreEvent::SearchResults { .. }))
+    else {
+        unreachable!()
+    };
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn same_query_twice_ends_the_first_and_cancel_finishes() {
+    let h = harness();
+    let _s = h.online();
+    let a = h.core.search("q");
+    let b = h.core.search("q");
+    let e = h.want("first finished", |e| {
+        matches!(e, CoreEvent::SearchFinished { .. })
+    });
+    assert_eq!(
+        e,
+        CoreEvent::SearchFinished {
+            search: a,
+            total_files: 0
+        }
+    );
+    h.core.cancel_search(b);
+    let e = h.want("second finished", |e| {
+        matches!(e, CoreEvent::SearchFinished { .. })
+    });
+    assert_eq!(
+        e,
+        CoreEvent::SearchFinished {
+            search: b,
+            total_files: 0
+        }
+    );
+}
+
+#[test]
+fn search_offline_errors_and_finishes() {
+    let h = harness();
+    let id = h.core.search("q");
+    h.want(
+        "error",
+        |e| matches!(e, CoreEvent::Error { context, .. } if context == "search"),
+    );
+    h.want("finished", |e| {
+        *e == CoreEvent::SearchFinished {
+            search: id,
+            total_files: 0,
+        }
+    });
+}
+
+// -------------------------------------------------------------------- browse
+
+#[test]
+fn browse_result_and_timeout() {
+    let h = harness();
+    let s = h.online();
+    s.st()
+        .browses
+        .insert("bob".into(), vec![dir(r"Music\Album", &["01.flac"])]);
+    h.core.browse("bob");
+    let CoreEvent::BrowseResult { username, dirs } =
+        h.want("browse", |e| matches!(e, CoreEvent::BrowseResult { .. }))
+    else {
+        unreachable!()
+    };
+    assert_eq!(username, "bob");
+    assert_eq!(dirs[0].path, r"Music\Album");
+    assert_eq!(dirs[0].files[0].path, r"Music\Album\01.flac");
+    assert_eq!(dirs[0].files[0].username, "bob");
+    assert_eq!(dirs[0].files[0].attrs.duration_secs, Some(200));
+
+    h.core.browse("ghost");
+    let e = h.want("BrowseFailed", |e| {
+        matches!(e, CoreEvent::BrowseFailed { .. })
+    });
+    assert!(matches!(e, CoreEvent::BrowseFailed { username, .. } if username == "ghost"));
+}
+
+// ----------------------------------------------------------- folder download
+
+#[test]
+fn folder_download_from_contents_keeps_folder_name() {
+    let h = harness();
+    let s = h.online();
+    s.st().folders.insert(
+        ("alice".into(), r"Music\Album (2019)".into()),
+        vec![dir(r"Music\Album (2019)", &["01.flac", "02.flac"])],
+    );
+    h.core.download_folder("alice", r"Music\Album (2019)\");
+    h.want("contents", |e| {
+        matches!(e, CoreEvent::FolderContents { .. })
+    });
+    for _ in 0..2 {
+        h.want("queued", |e| {
+            matches!(
+                e,
+                CoreEvent::TransferQueued {
+                    kind: TransferKind::Download,
+                    ..
+                }
+            )
+        });
+    }
+    wait_until("2 downloads", || s.st().downloads.len() == 2);
+    let staging = h.downloads_dir().join(crate::paths::STAGING_DIR_NAME);
+    assert!(s.st().downloads.iter().all(|d| d.dir.starts_with(&staging)));
+    let id_done = {
+        s.progress(0, b"abcd", 4);
+        s.complete(0);
+        h.want("done", |e| matches!(e, CoreEvent::TransferDone { .. }))
+    };
+    assert_eq!(
+        done_path(id_done),
+        h.downloads_dir().join("Album (2019)").join("01.flac")
+    );
+}
+
+#[test]
+fn folder_download_falls_back_to_full_browse_g14() {
+    let h = harness();
+    let s = h.online();
+    // The peer never answers the folder request under our spelling…
+    h.core.download_folder("alice", r"music\album");
+    wait_until("fallback browse", || {
+        s.st().browse_requests.contains(&"alice".to_string())
+    });
+    // …but the full listing has it (different case).
+    s.st().browses.insert(
+        "alice".into(),
+        vec![
+            dir(r"Music\Album", &["01.flac"]),
+            dir(r"Music\Other", &["x.flac"]),
+        ],
+    );
+    let e = h.want("queued", |e| matches!(e, CoreEvent::TransferQueued { .. }));
+    let CoreEvent::TransferQueued { file, .. } = e else {
+        unreachable!()
+    };
+    assert_eq!(file.path, r"Music\Album\01.flac");
+    h.none_within(Duration::from_millis(100), |e| {
+        matches!(e, CoreEvent::BrowseResult { .. })
+    });
+    assert_eq!(s.st().downloads.len(), 1);
+}
+
+// ----------------------------------------------------------------- transfers
+
+#[test]
+fn play_fetch_goes_to_cache_only_and_reports_part_path() {
+    let h = harness();
+    let s = h.online();
+    let t = h.core.play_fetch(&rfile(r"Music\Album\01.flac", 4));
+    let CoreEvent::TransferQueued {
+        id,
+        kind,
+        part_path,
+        ..
+    } = h.want("queued", |e| matches!(e, CoreEvent::TransferQueued { .. }))
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        (id, kind, &part_path),
+        (t.id, TransferKind::Play, &t.part_path)
+    );
+    wait_until("lib download", || s.st().downloads.len() == 1);
+    assert_eq!(
+        s.st().downloads[0].dir,
+        crate::paths::cache_transfer_dir(&h.cache_dir(), t.id)
+    );
+    let part = s.progress(0, b"ab", 4);
+    assert_eq!(part, t.part_path);
+    let e = h.want("progress", |e| {
+        matches!(e, CoreEvent::TransferProgress { .. })
+    });
+    assert_eq!(
+        e,
+        CoreEvent::TransferProgress {
+            id: t.id,
+            bytes: 2,
+            total: 4,
+            speed: 1000.0,
+            part_path: t.part_path.clone()
+        }
+    );
+    std::fs::write(&part, b"abcd").unwrap();
+    s.complete(0);
+    assert_eq!(done_path(h.want("done", is_done(t.id))), t.final_path);
+    assert!(
+        files_under(&h.downloads_dir()).is_empty(),
+        "▶ never writes to downloads"
+    );
+}
+
+#[test]
+fn download_during_play_is_promoted_not_refetched() {
+    let h = harness();
+    let s = h.online();
+    let f = rfile(r"Music\Album\01.flac", 4);
+    let t = h.core.play_fetch(&f);
+    wait_until("lib download", || s.st().downloads.len() == 1);
+    s.progress(0, b"ab", 4);
+    let d = h.core.download(&f);
+    let CoreEvent::TransferQueued { part_path, .. } = h.want(
+        "dl queued",
+        |e| matches!(e, CoreEvent::TransferQueued { id, .. } if *id == d),
+    ) else {
+        unreachable!()
+    };
+    assert_eq!(part_path, t.part_path, "↓ reports the in-flight ▶ bytes");
+    std::fs::write(&t.part_path, b"abcd").unwrap();
+    s.complete(0);
+    let p = done_path(h.want("play done", is_done(t.id)));
+    assert_eq!(p, t.final_path);
+    let dl = done_path(h.want("dl done", is_done(d)));
+    assert_eq!(dl, h.downloads_dir().join("Album").join("01.flac"));
+    assert_eq!(std::fs::read(&dl).unwrap(), b"abcd");
+    assert!(t.final_path.exists(), "cache copy stays for the player");
+    assert_eq!(s.st().downloads.len(), 1, "only one library transfer");
+}
+
+#[test]
+fn completed_cache_is_reused_for_download_and_replay() {
+    let h = harness();
+    let s = h.online();
+    let f = rfile(r"Music\Album\01.flac", 4);
+    let t = h.core.play_fetch(&f);
+    wait_until("lib download", || s.st().downloads.len() == 1);
+    s.progress(0, b"abcd", 4);
+    s.complete(0);
+    h.want("done", is_done(t.id));
+
+    let d = h.core.download(&f);
+    let dl = done_path(h.want("dl done", is_done(d)));
+    assert_eq!(std::fs::read(&dl).unwrap(), b"abcd");
+
+    let t2 = h.core.play_fetch(&f);
+    h.want(
+        "replay progress",
+        |e| matches!(e, CoreEvent::TransferProgress { id, .. } if *id == t2.id),
+    );
+    assert!(
+        t2.part_path.exists(),
+        "progress means part_path is openable"
+    );
+    assert_eq!(
+        done_path(h.want("replay done", is_done(t2.id))),
+        t2.final_path
+    );
+    assert_eq!(std::fs::read(&t2.final_path).unwrap(), b"abcd");
+    assert_eq!(s.st().downloads.len(), 1, "no refetch");
+}
+
+#[test]
+fn cache_index_survives_restart() {
+    let h = harness();
+    let s = h.online();
+    let f = rfile(r"Music\Album\01.flac", 4);
+    let t = h.core.play_fetch(&f);
+    wait_until("lib download", || s.st().downloads.len() == 1);
+    s.progress(0, b"abcd", 4);
+    s.complete(0);
+    h.want("done", is_done(t.id));
+    let H { core, tmp, .. } = h;
+    drop(core);
+
+    let conn = Arc::new(FakeConnector::default());
+    let settings = Settings {
+        download_dir: tmp.path().join("downloads"),
+        cache_dir: tmp.path().join("cache"),
+        port_mapping: false,
+        ..Settings::default()
+    };
+    let (core, ev) = Core::start_with(settings, conn.clone(), tunables()).unwrap();
+    let h = H {
+        core,
+        ev,
+        conn,
+        tmp,
+    };
+    let d = h.core.download(&f); // offline: must come from cache
+    assert!(d.0 > t.id.0, "ids never reuse an existing t<id>");
+    let dl = done_path(h.want("dl done", is_done(d)));
+    assert_eq!(std::fs::read(dl).unwrap(), b"abcd");
+}
+
+#[test]
+fn cancelling_the_play_keeps_a_promoted_download_running() {
+    let h = harness();
+    let s = h.online();
+    let f = rfile(r"Music\Album\01.flac", 4);
+    let t = h.core.play_fetch(&f);
+    wait_until("lib download", || s.st().downloads.len() == 1);
+    let d = h.core.download(&f);
+    h.want(
+        "dl queued",
+        |e| matches!(e, CoreEvent::TransferQueued { id, .. } if *id == d),
+    );
+    h.core.cancel(t.id);
+    h.want("cancelled", |e| {
+        *e == CoreEvent::TransferCancelled { id: t.id }
+    });
+    assert!(s.st().cancels.is_empty(), "library transfer must survive");
+    s.progress(0, b"abcd", 4);
+    s.complete(0);
+    let dl = done_path(h.want("dl done", is_done(d)));
+    assert!(dl.starts_with(h.downloads_dir()));
+
+    // Cancelling the last subscriber cancels the library transfer.
+    let g = rfile(r"Music\Album\02.flac", 4);
+    let t2 = h.core.play_fetch(&g);
+    wait_until("2nd lib download", || s.st().downloads.len() == 2);
+    h.core.cancel(t2.id);
+    h.want("cancelled", |e| {
+        *e == CoreEvent::TransferCancelled { id: t2.id }
+    });
+    wait_until("lib cancel", || {
+        s.st().cancels == vec![("alice".into(), r"Music\Album\02.flac".into())]
+    });
+}
+
+#[test]
+fn play_attached_to_running_download_gets_its_own_growing_link() {
+    let h = harness();
+    let s = h.online();
+    let f = rfile(r"Music\Album\01.flac", 4);
+    let d = h.core.download(&f);
+    wait_until("lib download", || s.st().downloads.len() == 1);
+    let t = h.core.play_fetch(&f);
+    h.want(
+        "play queued",
+        |e| matches!(e, CoreEvent::TransferQueued { id, .. } if *id == t.id),
+    );
+    s.progress(0, b"ab", 4);
+    h.want(
+        "play progress",
+        |e| matches!(e, CoreEvent::TransferProgress { id, .. } if *id == t.id),
+    );
+    assert_eq!(
+        std::fs::read(&t.part_path).unwrap(),
+        b"ab",
+        "ticket path shows the growing bytes"
+    );
+    s.complete(0);
+    assert_eq!(done_path(h.want("play done", is_done(t.id))), t.final_path);
+    let dl = done_path(h.want("dl done", is_done(d)));
+    assert!(dl.starts_with(h.downloads_dir().join("Album")));
+    wait_until("staging cleaned up", || {
+        !h.downloads_dir()
+            .join(crate::paths::STAGING_DIR_NAME)
+            .exists()
+    });
+}
+
+#[test]
+fn duplicate_download_is_refused() {
+    let h = harness();
+    let s = h.online();
+    let f = rfile(r"Music\Album\01.flac", 4);
+    let _a = h.core.download(&f);
+    wait_until("lib download", || s.st().downloads.len() == 1);
+    let b = h.core.download(&f);
+    h.want(
+        "refused",
+        |e| matches!(e, CoreEvent::TransferFailed { id, .. } if *id == b),
+    );
+    assert_eq!(s.st().downloads.len(), 1);
+}
+
+#[test]
+fn play_that_never_starts_times_out_and_is_cancelled_then_retry_resumes() {
+    let h = harness();
+    let s = h.online();
+    let f = rfile(r"Music\Album\01.flac", 4);
+    let t = h.core.play_fetch(&f);
+    h.want(
+        "remote queued",
+        |e| matches!(e, CoreEvent::TransferRemoteQueued { id, .. } if *id == t.id),
+    );
+    let e = h.want("failed", |e| matches!(e, CoreEvent::TransferFailed { .. }));
+    assert!(matches!(e, CoreEvent::TransferFailed { id, .. } if id == t.id));
+    assert_eq!(s.st().cancels.len(), 1);
+    assert!(s.st().place_requests >= 1);
+
+    h.core.retry(t.id);
+    wait_until("retried", || s.st().downloads.len() == 2);
+    {
+        let st = s.st();
+        assert_eq!(
+            st.downloads[1].dir, st.downloads[0].dir,
+            "same dir → library resumes the .part"
+        );
+    }
+    s.progress(1, b"abcd", 4);
+    s.complete(1);
+    h.want("done", is_done(t.id));
+}
+
+#[test]
+fn library_failure_and_session_loss_fail_transfers() {
+    let h = harness();
+    let s = h.online();
+    let t = h.core.play_fetch(&rfile(r"a\1.flac", 4));
+    wait_until("lib download", || s.st().downloads.len() == 1);
+    s.st().downloads[0]
+        .tx
+        .send(DownloadStatus::Failed(Some("peer said no".into())))
+        .unwrap();
+    let e = h.want("failed", |e| matches!(e, CoreEvent::TransferFailed { .. }));
+    assert_eq!(
+        e,
+        CoreEvent::TransferFailed {
+            id: t.id,
+            reason: "peer said no".into()
+        }
+    );
+
+    let d = h.core.download(&rfile(r"a\2.flac", 4));
+    wait_until("lib download 2", || s.st().downloads.len() == 2);
+    h.script(Ok(Arc::new(FakeSession::default())));
+    s.st().loss = Some(SessionLoss::Disconnected);
+    h.want(
+        "dl failed",
+        |e| matches!(e, CoreEvent::TransferFailed { id, .. } if *id == d),
+    );
+}
+
+#[test]
+fn cache_is_evicted_oldest_first_but_not_the_current_play() {
+    let h = harness_with(|s, _| s.cache_cap_bytes = 6);
+    let s = h.online();
+    let mut tickets = Vec::new();
+    for (i, name) in ["1.flac", "2.flac", "3.flac"].iter().enumerate() {
+        let t = h.core.play_fetch(&rfile(&format!(r"a\{name}"), 4));
+        wait_until("lib download", || s.st().downloads.len() == i + 1);
+        s.progress(i, b"abcd", 4);
+        s.complete(i);
+        h.want("done", is_done(t.id));
+        std::thread::sleep(Duration::from_millis(20)); // distinct mtimes
+        tickets.push(t);
+    }
+    wait_until("evicted", || {
+        !tickets[0].final_path.exists() && !tickets[1].final_path.exists()
+    });
+    assert!(tickets[2].final_path.exists(), "current play is protected");
+}
+
+// ------------------------------------------------------------ shares/uploads
+
+#[test]
+fn shares_offline_scan_and_online_rescan() {
+    let mut h = harness();
+    let music = h.tmp.path().join("music");
+    std::fs::create_dir_all(music.join("album")).unwrap();
+    std::fs::write(music.join("album").join("a.flac"), b"x").unwrap();
+    h.core.set_shares(vec![music.clone()]);
+    let e = h.want("counts", |e| matches!(e, CoreEvent::ShareCounts { .. }));
+    assert_eq!(
+        e,
+        CoreEvent::ShareCounts {
+            folders: 1,
+            files: 1
+        }
+    );
+
+    let s = h.online();
+    assert_eq!(
+        h.conn.params.lock().unwrap()[0].share_dirs,
+        vec![music.to_string_lossy().into_owned()]
+    );
+    h.core.rescan_shares();
+    wait_until("rescan", || s.st().share_sets.len() == 1);
+    h.want("online counts", |e| {
+        *e == CoreEvent::ShareCounts {
+            folders: 1,
+            files: 42,
+        }
+    });
+}
+
+#[test]
+fn uploads_snapshot_and_cancel() {
+    let h = harness();
+    let s = h.online();
+    s.st().uploads.push(UploadInfo {
+        username: "peer".into(),
+        filename: r"music\a.flac".into(),
+        size: 10,
+        bytes_sent: 5,
+        status: UploadStatus::InProgress,
+        speed_bytes_per_sec: 2.0,
+    });
+    let CoreEvent::Uploads(rows) = h.want(
+        "uploads",
+        |e| matches!(e, CoreEvent::Uploads(r) if !r.is_empty()),
+    ) else {
+        unreachable!()
+    };
+    assert_eq!(rows[0].state, UploadState::InProgress);
+    assert_eq!(rows[0].bytes_sent, 5);
+    h.core.cancel_upload("peer", r"music\a.flac");
+    wait_until("cancelled", || s.st().upload_cancels.len() == 1);
+}

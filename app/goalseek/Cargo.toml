@@ -1,0 +1,10 @@
+[package]
+name = "goalseek"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rune = { workspace = true }
+goalseek-core = { workspace = true }
+goalseek-audio = { workspace = true }

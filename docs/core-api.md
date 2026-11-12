@@ -1,4 +1,4 @@
-# goalseek-core — library survey & core API (CP0)
+# goalseek-core — library survey & core API (CP0, implemented in CP1)
 
 Library: `soulseek-rs-lib` @ `434dcc0155ed87203cafcd1cf7b1a1073f88a63d` (lib crate `soulseek_rs`).
 File references are relative to `soulseek-rs-lib/src/` in that revision unless prefixed
@@ -167,9 +167,28 @@ No separate rescan call: rescan = `set_shared_directories(same dirs)`.
 | G13 | Library logger writes ANSI to stderr by default. | Noise in a GUI. | App sets `LOG_FILE` (e.g. `~/.cache/goalseek/slsk.log`) or `logger::set_log_level`. |
 | G14 | Folder contents are keyed by the folder string the peer echoes. | Lookup could miss if a peer echoes a different spelling. | Fall back to the peer's full browse listing. |
 
+### 2.1 CP1 status per gap
+
+| # | Status | How (where) |
+|---|---|---|
+| G1 | Out of MVP (TL) | Only `upload_slots` → `set_upload_slots`. |
+| G2 | **Done** | `src/port_mapping/` (MIT-attributed port), `CoreEvent::PortMapping { port, outcome }`; started after each login with the bound port when `port_mapping` is on, stopped on logout/reconnect/drop. |
+| G3 | **Done** | Worker tick `POLL_TICK` (150 ms) polls session loss, search counts, browse/folder answers, download status channels, uploads (1 s). |
+| G4 | **Done** | Search window 15 s on a helper thread (`search_with_cancel`); deltas `results[seen..]` ranked per batch; a repeat of a live query ends the old `SearchId` first; `forget_search` on finish/cancel (deferred until the helper returns). Offline/empty query → `Error` + `SearchFinished { total_files: 0 }`. |
+| G5 | **Done** | ▶ into `cache/t<id>/`. ↓ streams into `downloads/.goalseek-partial/t<id>/` and is moved to `downloads/<folder>/` on completion; existing names get ` (1)`, ` (2)` … — never overwritten. `TransferQueued/Progress.part_path` is the real growing file. |
+| G6 | **Done** | `Disconnected{Network, will_retry:true}` → reconnect after 2 s, doubling, max 60 s (reset on success). `LoginRejected` / `Displaced` / `User` → no retry. Login while connected restarts the session. |
+| G7 | Accepted | `DisconnectReason::LoginRejected`. |
+| G8 | **Done** | ▶ that sends no bytes within 30 s → `TransferFailed` ("…try another source"), library transfer cancelled unless a ↓ shares it. Browse fails after 60 s, folder contents falls back after 30 s. After 5 s without bytes: `TransferRemoteQueued { place: None }`, then the polled place when known. |
+| G9 | Open | Upstream request before release. |
+| G10 | **Done** | `connect` (share scan) on a connect helper thread; `set_shares`/`rescan_shares` on a shares helper thread; offline, `ShareCounts` comes from a local scan. |
+| G11 | **Done** | One library transfer per (user, path); further ▶/↓ subscribe to it. ↓ during ▶ = promotion (cache copy kept, ↓ gets a hard link/copy). ▶ during ↓ gets a hard link to the growing `.part` at its ticket path. Second ↓ of the same file → `TransferFailed("already being downloaded …")`. `cancel` only cancels the library transfer when the last subscriber leaves. |
+| G12 | **Done** | `Connected { listen_port }` = bound port; port mapping uses it. |
+| G13 | **Done** | `goalseek_core::config::init_logging(&default_log_path())` (unsafe: call first in `main`) → `~/.cache/goalseek/slsk.log`, Info level. |
+| G14 | **Done** | Folder contents: exact (case/slash-insensitive) match, else the whole reply; no reply within 30 s → full browse of the user, then the folder is picked from it. |
+
 ---
 
-## 3. Proposed goalseek-core interface (skeleton compiled in `crates/goalseek-core`)
+## 3. goalseek-core interface (implemented)
 
 Design: one `Core` handle, non-blocking commands, one ordered event channel. A single worker
 thread owns the `soulseek_rs::Client` (in an `Arc` so a search helper thread can poll), receives
@@ -192,6 +211,9 @@ impl Core {
     pub fn set_shares(&mut self, Vec<PathBuf>);
     pub fn rescan_shares(&self);
     pub fn apply_settings(&mut self, Settings);  // port change → reconnect
+    // additive (CP1)
+    pub fn set_audio_only(&self, on: bool);      // search batch filter, default on
+    pub fn cancel_upload(&self, username: &str, path: &str);  // then an Uploads snapshot
 }
 
 // src/event.rs
@@ -212,8 +234,12 @@ pub enum CoreEvent {
     ShareCounts { folders, files },
     Uploads(Vec<UploadRow>),
     Error { context, message },
+    // additive (CP1)
+    PortMapping { port: u16, outcome: PortMapOutcome /* Mapped { method, external: Option<String> } | Unavailable(String) */ },
 }
 ```
+
+`Command` gained `SetAudioOnly(bool)` and `CancelUpload { username, path }` (additive).
 
 Data (`src/model.rs`): `RemoteFile { username, path, size, attrs: AudioAttrs }`,
 `SearchHit { file, free_slot, speed }`, `BrowseDir { path, files }`, `UploadRow`, `Settings`
@@ -224,31 +250,72 @@ Helpers (real, tested): `paths` (`.part`/final/cache-dir/download-dir rules), `r
 (audio filter, FLAC → MP3 → other audio, then free slot, speed; conversion from
 `soulseek_rs::SearchResult`).
 
-Play / download rules:
-- ▶ `play_fetch` → `download(…, cache/t<id>/)`; path known immediately; player opens the `.part`
-  after the first `TransferProgress`. Never writes to downloads.
-- ↓ `download` → if the same (user, path) is complete in cache, `fs::rename` (copy+delete across
-  filesystems) into `downloads/<folder>/`; if a play of it is in flight, mark it "keep" and move on
-  `TransferDone`; else fetch into `downloads/<folder>/`.
-- Cache cap: on each `TransferDone` of a play, evict oldest `cache/t*/` dirs that are not playing.
+Play / download rules (as implemented):
+- ▶ `play_fetch` → library download into `cache/t<id>/` (ticket paths known immediately; the
+  player opens `part_path` after the first `TransferProgress`). Never writes to downloads. A
+  complete cached copy of the same (user, path) — also from a previous run, via
+  `cache/t<id>/.goalseek-meta` — is linked into the new ticket dir: `TransferQueued`,
+  one `TransferProgress { bytes = total }`, `TransferDone`, no network.
+- ↓ `download` → complete in cache: hard link (copy across filesystems) into
+  `downloads/<folder>/`, cache untouched. In flight (▶ or ↓): subscribe (G11). Else fetch
+  via the staging dir (G5).
+- `retry` reuses the same `t<id>` dir so the library resumes the `.part`.
+- `cancel` of a failed transfer just emits `TransferCancelled` (lets the UI clear the row).
+- Cache cap: at start, on each completed fetch and on cap change, delete the oldest
+  `cache/t*/` dirs (by mtime) until under `cache_cap_bytes`, never the current/active play.
+- Ids start above the largest `t<id>` found in the cache and staging dirs.
+- `Core::start` does no network and persists nothing.
 
-### 3.1 Port mapping (CP1 item, G2)
+### 3.1 Port mapping (G2, done)
 
 - New module `goalseek-core/src/port_mapping/` ported from `soulseek-rs/src/port_mapping/mod.rs`
   and `nat_pmp.rs` @ 434dcc0. Each ported file keeps a header with the original copyright
   (Michel de Graaf, soulseek-rs, MIT) and the source path/revision.
-- Shape kept from upstream: `PortMapper::spawn(port) -> PortMapper` (background thread, renews at
+- Shape kept from upstream, plus a report callback: `PortMapper::spawn(port, report) -> PortMapper` (background thread, renews at
   half the lease, removes the mapping on `Drop`, never blocks shutdown >1 s). UPnP-IGD first via
   `igd-next`, then std-only NAT-PMP. Replace upstream's use of `soulseek_rs::utils::logger` levels
   with our own logging as needed.
 - The worker starts it after `connect()` with the **bound** port (`Client::listen_port()`, G12)
   when `Settings.port_mapping` is true, and restarts it on reconnect/port change. Outcome surfaces
-  as a `CoreEvent` (e.g. `PortMapping { external: Option<SocketAddr>, method }`) for settings.
-- Needs `igd-next` added to root `[workspace.dependencies]` by the TL at CP1.
+  as `CoreEvent::PortMapping { port, outcome }` (method `"upnp"`/`"natpmp"`, `external` = `"ip:port"` when UPnP reports it).
+- `igd-next = "0.17"` is a direct dependency in `crates/goalseek-core/Cargo.toml` (not in the
+  root workspace table; TL may hoist it).
 
-**CP0 status:** types, handle, id allocation, path rules, ranking and the worker/channel plumbing are
-implemented and tested. Worker protocol arms are stubs that emit
-`CoreEvent::Error { context, message: "not implemented yet (CP1)" }` (no `todo!()` panics).
+### 3.2 Persistence — `goalseek_core::config` (CP1)
+
+Called by the app before `Core::start`; the worker never touches config or keyring.
+
+```rust
+pub fn load() -> io::Result<Loaded>;            // Loaded { settings, credentials: Option<Credentials>, keyring_available }
+pub fn save_settings(&Settings) -> io::Result<()>;          // keeps the remembered username
+pub fn save_credentials(&Credentials) -> Result<(), KeyringUnavailable>;
+pub fn forget_credentials() -> io::Result<()>;
+// *_in(dir, [&Arc<dyn SecretStore>], …) variants for tests; SecretStore { get, set, delete }
+pub fn config_dir() -> PathBuf;                 // $XDG_CONFIG_HOME/goalseek
+pub fn default_log_path() -> PathBuf;           // $XDG_CACHE_HOME/goalseek/slsk.log
+pub unsafe fn init_logging(&Path) -> io::Result<()>;  // G13; first thing in main
+```
+
+- `config.toml`: `username` + `[settings]` (serde, every field defaulted, so partial files load).
+  Atomic write (temp + rename). Invalid TOML → `Err(InvalidData)`.
+- Password only in the OS keyring (service `goalseek`, account = username; Secret Service on Linux
+  via the pure-Rust zbus backend). Never in the file, never logged. Each keyring call is bounded by
+  `KEYRING_TIMEOUT` (5 s). Unreachable keyring: `load` → `keyring_available: false`,
+  `credentials: None`; `save_credentials` → `Err(KeyringUnavailable(msg))` (username is still saved).
+- `Settings::default()`: downloads `$XDG_DOWNLOAD_DIR/goalseek`, cache `$XDG_CACHE_HOME/goalseek`,
+  cap 1 GiB, port 2234, 10 upload slots, port mapping on.
+
+### 3.3 Tests
+
+Offline: `cargo test -p goalseek-core` — paths, ranking, cache scan/eviction plan, config round
+trip with a temp dir and in-memory keyring, backoff, and the worker against a fake
+session/connector (login/reject/backoff/displaced, search deltas, browse timeout, folder fallback,
+cache-only play, promotion, cache reuse across restart, timeouts + retry, eviction, shares, uploads).
+
+Live (`#[ignore]`, needs `GOALSEEK_USER`/`GOALSEEK_PASS`):
+`cargo test -p goalseek-core --test live -- --ignored --nocapture` — login, search
+(`GOALSEEK_QUERY`, default "aphex twin"), top FLAC hits, browse the top user, `play_fetch` with time to
+first `TransferProgress`, cancel, assert the downloads dir is empty. **Not run yet.**
 
 ## 4. Smoke example
 
