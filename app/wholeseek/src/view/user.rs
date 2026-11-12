@@ -198,6 +198,7 @@ fn folder(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
             selected: tab.selected.as_deref() == Some(f.path.as_str()),
             highlighted: b.highlight.as_deref() == Some(f.path.as_str()),
             more_key: more_key(tab.id, &f.path),
+            find: None,
         };
         list = list.child(file_row(s, &format!("file-{i}"), f, 0.0, &ctx, t));
     }

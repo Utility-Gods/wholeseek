@@ -914,13 +914,8 @@ fn format_chips_multi_select_as_a_union_and_none_means_all() {
         counts.contains(&("WAV", 0)) && counts.contains(&("FLAC", 12)),
         "{counts:?}"
     );
-    // A chip at 0 is dimmed but still clickable.
-    let (_, opacity) = rt.presented("fmt-wav").unwrap();
-    assert!(opacity < 0.6);
-    click(&mut rt, "fmt-wav");
-    assert!(rt.state.tab().search().unwrap().filters.has("WAV"));
-    assert_eq!(visible(&rt), 0);
-    assert!(rt.find("no-results").is_some() || rt.find("empty").is_some() || visible(&rt) == 0);
+    // A format left with nothing has no chip at all.
+    assert!(rt.find("fmt-wav").is_none() && rt.find("fmt-flac").is_some());
     assert_eq!(
         count_calls(&rt, |c| matches!(c, Call::Search(_))),
         searches,
@@ -969,6 +964,8 @@ fn format_groups_merge_aliases_and_overflow_into_a_menu() {
             query: "x".into(),
             hits,
             finished: true,
+            keys: Vec::new(),
+            matched: Default::default(),
         });
     });
     run(&mut rt, 0.05);
@@ -2755,4 +2752,371 @@ fn play_album_only_shows_for_a_folder_with_something_playable() {
     assert!(rt.find("details-play").is_none(), "nothing there decodes");
     click(&mut rt, "folder-0-0");
     assert!(rt.find("details-play").is_some());
+}
+
+// ---- "Filter results": narrowing the received results -------------------------------------------
+
+fn hit_at(user: &str, path: &str) -> wholeseek_core::SearchHit {
+    wholeseek_core::SearchHit {
+        file: wholeseek_core::RemoteFile {
+            username: user.into(),
+            path: path.into(),
+            size: 1,
+            attrs: Default::default(),
+        },
+        free_slot: true,
+        speed: 1,
+    }
+}
+
+#[test]
+fn filter_words_match_word_prefixes_of_path_and_user() {
+    use crate::tabs::{TextQuery, search_key};
+    let key = search_key(&hit_at(
+        "DJ_Ivo",
+        r"Música\Beyoncé - Crazy in Love\01 Crazy_in-Love (Remix).FLAC",
+    ));
+    let m = |q: &str| TextQuery::parse(q).matches(&key);
+    assert!(m("craz"), "prefix");
+    assert!(m("CRAZY love"), "case-insensitive, every word, any order");
+    assert!(!m("razy"), "not inside a word");
+    assert!(m("beyonce") && m("musica"), "accents folded");
+    assert!(m("beyoncé"), "accented query too");
+    assert!(
+        m("in-love remix"),
+        "punctuation is a separator in the query"
+    );
+    assert!(m("dj ivo") && m("dj_iv"), "the username counts");
+    assert!(m("flac") && m("01"), "extension and track number");
+    assert!(!m("crazy jazz"), "all words must match");
+    assert!(m("crazy -live") && !m("crazy -remix"), "-word excludes");
+    assert!(m("-"), "a lone dash is no word");
+    assert!(TextQuery::parse("  ").is_empty());
+    let apos = search_key(&hit_at("u", r"x\Wazn't Me.mp3"));
+    assert!(
+        TextQuery::parse("waznt").matches(&apos) && TextQuery::parse("wazn't me").matches(&apos)
+    );
+}
+
+#[test]
+fn match_spans_mark_the_matched_prefix_in_the_original_text() {
+    use crate::tabs::TextQuery;
+    let q = TextQuery::parse("coast beyonce");
+    assert_eq!(q.spans("06 Coastline.flac"), [(3, 8)]);
+    let t = "Beyoncé — Halo";
+    assert_eq!(
+        q.spans(t),
+        [(0, t.find(" —").unwrap())],
+        "the whole folded word, é included"
+    );
+    assert!(
+        TextQuery::parse("-coast").spans("Coastline").is_empty(),
+        "excluded words aren't marked"
+    );
+}
+
+fn type_find(rt: &mut Runtime<App>, text: &str) {
+    rt.update(|s, _| {
+        s.tab_mut().search_mut().unwrap().find.replace_text(text);
+        s.find_changed();
+    });
+    run(rt, 0.05);
+}
+
+#[test]
+fn the_filter_box_narrows_results_with_chips_and_counts() {
+    let mut rt = searched();
+    let searches = count_calls(&rt, |c| matches!(c, Call::Search(_)));
+    assert!(rt.find("filter").is_some() && rt.find("find-count").is_none());
+    type_find(&mut rt, "coast");
+    let st = rt.state.tab().search().unwrap();
+    let v = st.search.as_ref().unwrap();
+    let f = st.shown_filters();
+    assert_eq!(v.visible(&f), 10);
+    assert_eq!(text_of(&rt, "find-count").as_deref(), Some("10 of 20"));
+    // Groups without a matching row are gone; dj_ivo's MP3s don't say "coast".
+    assert!(v.groups(&f).iter().all(|g| g.username != "dj_ivo"));
+    // Chips count the filtered set, and a format left with nothing has no chip.
+    assert_eq!(
+        text_of(&rt, "fmt-flac/n")
+            .or_else(|| {
+                rt.elements()
+                    .into_iter()
+                    .find(|e| e.path.ends_with("fmt-flac/n"))
+                    .and_then(|e| e.text)
+            })
+            .as_deref(),
+        Some("8")
+    );
+    assert!(rt.find("fmt-mp3").is_none(), "no 0 chip");
+    // Composes with chips: WAV ∩ "coast".
+    click(&mut rt, "fmt-wav");
+    let st = rt.state.tab().search().unwrap();
+    assert_eq!(st.search.as_ref().unwrap().visible(&st.shown_filters()), 2);
+    assert_eq!(text_of(&rt, "find-count").as_deref(), Some("2 of 20"));
+    // The tab badge keeps the total under the chips only (not the filter box).
+    assert_eq!(
+        rt.state.tab().search().unwrap().filters.text,
+        Default::default()
+    );
+    // New results keep being filtered.
+    rt.update(|s, _| {
+        let id = s.tab().search().unwrap().search.as_ref().unwrap().id;
+        s.apply(wholeseek_core::CoreEvent::SearchResults {
+            search: id,
+            hits: vec![
+                hit_at("zed", r"Coast\x.wav"),
+                hit_at("zed", r"Inland\y.wav"),
+            ],
+        });
+    });
+    run(&mut rt, 0.05);
+    assert_eq!(text_of(&rt, "find-count").as_deref(), Some("3 of 22"));
+    assert_eq!(
+        count_calls(&rt, |c| matches!(c, Call::Search(_))),
+        searches,
+        "all local"
+    );
+    click(&mut rt, "filter-clear");
+    assert!(rt.state.tab().search().unwrap().find.text.is_empty());
+    assert!(rt.find("find-count").is_none());
+}
+
+#[test]
+fn nothing_matching_shows_one_line_and_clear_filter() {
+    let mut rt = searched();
+    type_find(&mut rt, "xyz");
+    assert_eq!(
+        text_of(&rt, "nothing-matches-title").as_deref(),
+        Some("Nothing matches “xyz”")
+    );
+    assert!(rt.find("columns").is_none(), "no empty table header");
+    assert!(
+        rt.find("filter").is_some(),
+        "the box stays to fix the words"
+    );
+    click(&mut rt, "clear-filter");
+    assert!(rt.state.tab().search().unwrap().find.text.is_empty());
+    assert!(rt.find("row-0").is_some() && rt.find("nothing-matches").is_none());
+}
+
+#[test]
+fn zero_results_hide_the_tools_and_offer_search_again() {
+    let mut rt = signed_in();
+    rt.update(|s, _| s.search_for("Wazn't Me"));
+    run(&mut rt, 0.05);
+    // Still searching: the progress line only.
+    assert!(rt.find("searching").is_some());
+    assert!(rt.find("no-results-title").is_none() && rt.find("chips").is_none());
+    run(&mut rt, 12.0);
+    assert_eq!(
+        text_of(&rt, "no-results-title").as_deref(),
+        Some("No results for “Wazn't Me”")
+    );
+    for gone in [
+        "chips",
+        "fmt-flac",
+        "free-slot",
+        "filter",
+        "columns",
+        "search-bar/count",
+    ] {
+        assert!(
+            rt.find(gone).is_none(),
+            "{gone} hidden with nothing to show"
+        );
+    }
+    let before = count_calls(&rt, |c| matches!(c, Call::Search(_)));
+    click(&mut rt, "search-again");
+    assert_eq!(
+        count_calls(&rt, |c| matches!(c, Call::Search(_))),
+        before + 1
+    );
+    assert_eq!(
+        calls(&rt)
+            .iter()
+            .rev()
+            .find(|c| matches!(c, Call::Search(_))),
+        Some(&Call::Search("Wazn't Me".into()))
+    );
+}
+
+#[test]
+fn the_filter_is_per_tab_and_a_new_tab_starts_without_it() {
+    let mut rt = searched();
+    type_find(&mut rt, "coast");
+    click(&mut rt, "new-tab");
+    assert!(rt.state.tab().search().unwrap().find.text.is_empty());
+    rt.update(|s, _| s.search_for("hollow lights"));
+    run(&mut rt, 1.6);
+    assert!(rt.find("find-count").is_none());
+    click(&mut rt, "tab-0");
+    assert_eq!(rt.state.tab().search().unwrap().find.text, "coast");
+    assert_eq!(text_of(&rt, "find-count").as_deref(), Some("10 of 20"));
+}
+
+#[test]
+fn the_details_pane_drops_a_folder_the_filter_hides() {
+    let mut rt = searched_at(1920.0);
+    click(&mut rt, "folder-0-0"); // alice's Coastline
+    type_find(&mut rt, "coast");
+    assert_eq!(
+        rt.state.tab().group,
+        Some(("alice".into(), COAST.into())),
+        "still listed"
+    );
+    type_find(&mut rt, "ferry");
+    assert_eq!(rt.state.tab().group, None, "filtered out: cleared");
+    assert!(rt.find("details-empty").is_some());
+    // Chips can hide it too.
+    type_find(&mut rt, "");
+    click(&mut rt, "folder-0-0");
+    click(&mut rt, "fmt-mp3");
+    assert_eq!(rt.state.tab().group, None);
+}
+
+#[test]
+fn filter_keys_find_select_all_escape_and_down() {
+    let mut rt = searched();
+    type_find(&mut rt, "coast");
+    rt.update(|_, tx| tx.blur());
+    press(&mut rt, ctrl(Key::Command('f')));
+    assert_eq!(
+        focused(&rt).as_deref(),
+        Some("filter"),
+        "⌘/Ctrl+F: the filter"
+    );
+    let st = rt.state.tab().search().unwrap();
+    assert_eq!((st.find.anchor, st.find.focus), (0, 5), "all selected");
+    // ↓ goes into the results, on the first row shown.
+    press(
+        &mut rt,
+        KeyEvent {
+            key: Key::Down,
+            mods: Mods::default(),
+        },
+    );
+    let first = {
+        let st = rt.state.tab().search().unwrap();
+        let g = st.search.as_ref().unwrap().groups(&st.shown_filters());
+        format!("row-{}", g[0].folders[0].1[0])
+    };
+    assert_eq!(focused(&rt), Some(first));
+    // Esc: clears, then a second Esc leaves the box. The query is never touched.
+    press(&mut rt, ctrl(Key::Command('f')));
+    press(
+        &mut rt,
+        KeyEvent {
+            key: Key::Escape,
+            mods: Mods::default(),
+        },
+    );
+    assert!(rt.state.tab().search().unwrap().find.text.is_empty());
+    assert_eq!(focused(&rt).as_deref(), Some("filter"));
+    press(
+        &mut rt,
+        KeyEvent {
+            key: Key::Escape,
+            mods: Mods::default(),
+        },
+    );
+    assert_ne!(focused(&rt).as_deref(), Some("filter"));
+    assert_eq!(rt.state.tab().search().unwrap().edit.text, "hollow lights");
+    // ⌘L still goes to the query; with no results ⌘F does too.
+    press(&mut rt, ctrl(Key::Command('l')));
+    assert_eq!(focused(&rt).as_deref(), Some("query"));
+    click(&mut rt, "new-tab");
+    rt.update(|_, tx| tx.blur());
+    press(&mut rt, ctrl(Key::Command('f')));
+    assert_eq!(focused(&rt).as_deref(), Some("query"));
+}
+
+#[test]
+fn tab_order_is_query_filter_chips_results() {
+    let mut rt = searched();
+    rt.update(|_, tx| tx.focus("query", true));
+    let mut order = Vec::new();
+    for _ in 0..4 {
+        press(
+            &mut rt,
+            KeyEvent {
+                key: Key::Tab,
+                mods: Mods::default(),
+            },
+        );
+        order.push(focused(&rt).unwrap_or_default());
+    }
+    assert_eq!(order[0], "filter", "{order:?}");
+    assert!(order[1].starts_with("fmt-"), "{order:?}");
+}
+
+#[test]
+fn filtering_5000_results_takes_under_16_ms_per_keystroke() {
+    use crate::tabs::{Filters, SearchView, TextQuery};
+    let words = [
+        "coast", "salt", "harbour", "tide", "glass", "ferry", "dune", "lamp", "night", "road",
+    ];
+    let mut v = SearchView {
+        id: wholeseek_core::SearchId(1),
+        query: "x".into(),
+        hits: (0..5000)
+            .map(|i| {
+                hit_at(
+                    &format!("user_{}", i % 300),
+                    &format!(
+                        r"Music\Artist {}\{} {} ({})\{:02} {} {}.flac",
+                        i % 97,
+                        words[i % 10],
+                        words[(i / 10) % 10],
+                        1990 + i % 30,
+                        i % 14,
+                        words[(i / 7) % 10],
+                        words[(i / 3) % 10]
+                    ),
+                )
+            })
+            .collect(),
+        finished: true,
+        keys: Vec::new(),
+        matched: Default::default(),
+    };
+    v.reindex(); // once, as results arrive
+    // Each keystroke's time is the median of several runs, so one preempted run under a
+    // loaded parallel test run doesn't count. The 16 ms budget is a release build's; a debug
+    // build only guards against gross regressions.
+    let budget = std::time::Duration::from_millis(if cfg!(debug_assertions) { 250 } else { 16 });
+    let mut worst = std::time::Duration::ZERO;
+    for typed in [
+        "c",
+        "co",
+        "coa",
+        "coas",
+        "coast",
+        "coast s",
+        "coast sa",
+        "coast salt -1999",
+    ] {
+        let mut runs: Vec<std::time::Duration> = (0..7)
+            .map(|_| {
+                v.matched.take(); // a fresh keystroke: nothing cached
+                let f = Filters {
+                    text: TextQuery::parse(typed),
+                    ..Default::default()
+                };
+                let t0 = std::time::Instant::now();
+                let shown = v.visible(&f);
+                let groups = v.groups(&f);
+                let chips = v.format_counts(&f);
+                std::hint::black_box((shown, groups, chips));
+                t0.elapsed()
+            })
+            .collect();
+        runs.sort();
+        worst = worst.max(runs[runs.len() / 2]);
+    }
+    eprintln!("filter 5000 rows: slowest keystroke (median of 7) {worst:?}");
+    assert!(
+        worst < budget,
+        "slowest keystroke {worst:?}, budget {budget:?}"
+    );
 }

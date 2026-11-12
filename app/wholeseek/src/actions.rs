@@ -46,6 +46,7 @@ impl App {
                     let chosen = st.filters.clone();
                     self.last_filters = chosen;
                 }
+                self.find_changed();
             }
             MenuAction::Download(f) => self.download(&f),
             MenuAction::DownloadFolder { username, folder } => {

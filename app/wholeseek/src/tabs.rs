@@ -33,6 +33,46 @@ pub struct SearchTab {
     pub edit: TextEdit,
     pub search: Option<SearchView>,
     pub filters: Filters,
+    /// "Filter results": narrows the received results locally, per tab.
+    pub find: Box<TextEdit>,
+}
+
+impl SearchTab {
+    pub fn new(filters: Filters) -> Self {
+        Self {
+            edit: TextEdit::new(""),
+            search: None,
+            filters,
+            find: Box::new(TextEdit::new("")),
+        }
+    }
+
+    /// Whether the filter box holds any words.
+    pub fn filtering(&self) -> bool {
+        !TextQuery::parse(&self.find.text).is_empty()
+    }
+
+    /// Drop the details pane's folder when nothing of it is listed any more.
+    pub fn keep_group_visible(&self, group: &mut Option<(String, String)>) {
+        let (Some((u, d)), Some(v)) = (group.as_ref(), self.search.as_ref()) else {
+            return;
+        };
+        let f = self.shown_filters();
+        let listed = (0..v.hits.len()).any(|i| {
+            let h = &v.hits[i].file;
+            &h.username == u && h.folder() == d && v.shows(i, &f)
+        });
+        if !listed {
+            *group = None;
+        }
+    }
+
+    /// The chips plus the filter box: what the results list shows.
+    pub fn shown_filters(&self) -> Filters {
+        let mut f = self.filters.clone();
+        f.text = TextQuery::parse(&self.find.text);
+        f
+    }
 }
 
 pub struct SearchView {
@@ -40,6 +80,170 @@ pub struct SearchView {
     pub query: String,
     pub hits: Vec<SearchHit>,
     pub finished: bool,
+    /// Per hit, computed once as results arrive ([`SearchView::reindex`]) so a keystroke in
+    /// the filter box only compares strings.
+    pub keys: Vec<RowIndex>,
+    /// The last filter words and which hits they match: the list, its count and the chips
+    /// all ask within one frame, so a keystroke matches each row once.
+    pub matched: std::cell::RefCell<Option<(TextQuery, std::rc::Rc<[bool]>)>>,
+}
+
+/// What filtering and grouping need of a hit, precomputed.
+pub struct RowIndex {
+    /// [`search_key`]: the normalized user and path.
+    pub key: String,
+    pub format: Option<&'static str>,
+    /// Position of its file name in natural order among all hits (sorting within folders).
+    pub name_order: u32,
+}
+
+/// Lowercased, accent-folded words of `s`, punctuation as separators and apostrophes
+/// dropped, each preceded by a space: " hollow lights coastline 2019 01 northern glass flac".
+/// A word-prefix test is then `key.contains(" " + word)`.
+pub fn normalize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 1);
+    let mut gap = true;
+    for c in s.chars() {
+        if matches!(c, '\'' | '’' | '`') {
+            continue;
+        }
+        for l in c.to_lowercase() {
+            let folded = fold(l);
+            let word = match folded {
+                Some(f) => {
+                    if gap {
+                        out.push(' ');
+                        gap = false;
+                    }
+                    out.push_str(f);
+                    true
+                }
+                None if l.is_alphanumeric() => {
+                    if gap {
+                        out.push(' ');
+                        gap = false;
+                    }
+                    out.push(l);
+                    true
+                }
+                None => false,
+            };
+            if !word {
+                gap = true;
+            }
+        }
+    }
+    out
+}
+
+/// The plain letters of a lowercase accented Latin letter.
+fn fold(c: char) -> Option<&'static str> {
+    Some(match c {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => "a",
+        'æ' => "ae",
+        'ç' | 'ć' | 'č' | 'ĉ' => "c",
+        'ď' | 'đ' | 'ð' => "d",
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ė' | 'ę' | 'ě' => "e",
+        'ğ' | 'ģ' => "g",
+        'ì' | 'í' | 'î' | 'ï' | 'ī' | 'į' | 'ı' => "i",
+        'ķ' => "k",
+        'ł' | 'ľ' | 'ĺ' | 'ļ' => "l",
+        'ñ' | 'ń' | 'ň' | 'ņ' => "n",
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ő' => "o",
+        'œ' => "oe",
+        'ř' | 'ŕ' => "r",
+        'ś' | 'š' | 'ş' | 'ș' => "s",
+        'ß' => "ss",
+        'ť' | 'ţ' | 'ț' => "t",
+        'þ' => "th",
+        'ù' | 'ú' | 'û' | 'ü' | 'ū' | 'ů' | 'ű' | 'ų' => "u",
+        'ý' | 'ÿ' => "y",
+        'ź' | 'ż' | 'ž' => "z",
+        _ => return None,
+    })
+}
+
+/// What the filter box matches against: the user and the full remote path.
+pub fn search_key(h: &SearchHit) -> String {
+    normalize(&format!("{} {}", h.file.username, h.file.path))
+}
+
+/// A parsed "Filter results" text: every word must start a word of the row's key; a
+/// `-word` must not.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TextQuery {
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl TextQuery {
+    pub fn parse(text: &str) -> Self {
+        let mut q = Self::default();
+        for token in text.split_whitespace() {
+            let (neg, body) = match token.strip_prefix('-') {
+                Some(rest) if !rest.is_empty() => (true, rest),
+                _ => (false, token),
+            };
+            for w in normalize(body).split_whitespace() {
+                let w = format!(" {w}");
+                if neg {
+                    q.exclude.push(w)
+                } else {
+                    q.include.push(w)
+                }
+            }
+        }
+        q
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+
+    /// Byte ranges of `text` that the query's words match (word prefixes), to highlight.
+    pub fn spans(&self, text: &str) -> Vec<(usize, usize)> {
+        if self.include.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let mut k = 0;
+        while k < chars.len() {
+            let in_word = |c: char| c.is_alphanumeric() || matches!(c, '\'' | '’' | '`');
+            if !chars[k].1.is_alphanumeric() {
+                k += 1;
+                continue;
+            }
+            // One word: its folded form, and where each original char ends in it.
+            let start = chars[k].0;
+            let mut folded = String::new();
+            let mut ends: Vec<(usize, usize)> = Vec::new(); // (folded len, byte end)
+            while k < chars.len() && in_word(chars[k].1) {
+                let (b, c) = chars[k];
+                folded.push_str(&normalize(&c.to_string()).replace(' ', ""));
+                ends.push((folded.len(), b + c.len_utf8()));
+                k += 1;
+            }
+            let best = self
+                .include
+                .iter()
+                .map(|w| &w[1..])
+                .filter(|w| folded.starts_with(*w))
+                .map(str::len)
+                .max();
+            if let Some(n) = best
+                && let Some(&(_, end)) = ends.iter().find(|(l, _)| *l >= n)
+            {
+                out.push((start, end));
+            }
+        }
+        out
+    }
+
+    pub fn matches(&self, key: &str) -> bool {
+        self.include.iter().all(|w| key.contains(w.as_str()))
+            && !self.exclude.iter().any(|w| key.contains(w.as_str()))
+    }
 }
 
 /// Natural filename order, the one order for files inside a folder (search groups, user
@@ -128,6 +332,8 @@ pub struct Filters {
     /// Selected format chips (labels from [`format_of`]).
     pub formats: BTreeSet<&'static str>,
     pub free_slot: bool,
+    /// The filter box (per tab: never carried into a new tab).
+    pub text: TextQuery,
 }
 
 impl Filters {
@@ -162,47 +368,133 @@ pub struct Group {
 }
 
 impl SearchView {
+    /// Rebuild [`SearchView::keys`] after hits arrive or are re-ranked.
+    pub fn reindex(&mut self) {
+        let mut by_name: Vec<usize> = (0..self.hits.len()).collect();
+        by_name.sort_by(|&a, &b| {
+            natural_cmp(self.hits[a].file.basename(), self.hits[b].file.basename())
+        });
+        let mut order = vec![0u32; self.hits.len()];
+        for (rank, i) in by_name.into_iter().enumerate() {
+            order[i] = rank as u32;
+        }
+        self.keys = self
+            .hits
+            .iter()
+            .zip(order)
+            .map(|(h, name_order)| RowIndex {
+                key: search_key(h),
+                format: format_of(&h.file.path),
+                name_order,
+            })
+            .collect();
+        self.matched.take();
+    }
+
+    /// Which hits the filter words match (cached per query until the hits change).
+    fn text_mask(&self, q: &TextQuery) -> Option<std::rc::Rc<[bool]>> {
+        if q.is_empty() {
+            return None;
+        }
+        if let Some((cq, m)) = &*self.matched.borrow()
+            && cq == q
+            && m.len() == self.hits.len()
+        {
+            return Some(m.clone());
+        }
+        let m: std::rc::Rc<[bool]> = (0..self.hits.len()).map(|i| self.text_ok(i, q)).collect();
+        *self.matched.borrow_mut() = Some((q.clone(), m.clone()));
+        Some(m)
+    }
+
+    /// [`Self::shows`] with the text match looked up in `mask`.
+    fn shows_in(&self, i: usize, filters: &Filters, mask: Option<&[bool]>) -> bool {
+        filters.accepts_except_format(&self.hits[i])
+            && (filters.formats.is_empty()
+                || self.format(i).is_some_and(|f| filters.formats.contains(f)))
+            && mask.is_none_or(|m| m[i])
+    }
+
+    /// The index of hit `i`, when it is current (a test may build a view without one).
+    fn indexed(&self, i: usize) -> Option<&RowIndex> {
+        (self.keys.len() == self.hits.len()).then(|| &self.keys[i])
+    }
+
+    fn format(&self, i: usize) -> Option<&'static str> {
+        match self.indexed(i) {
+            Some(r) => r.format,
+            None => format_of(&self.hits[i].file.path),
+        }
+    }
+
+    fn text_ok(&self, i: usize, q: &TextQuery) -> bool {
+        if q.is_empty() {
+            return true;
+        }
+        match self.indexed(i) {
+            Some(r) => q.matches(&r.key),
+            None => q.matches(&search_key(&self.hits[i])),
+        }
+    }
+
+    /// Whether hit `i` is listed under `filters` (chips, Free slot and the filter box).
+    pub fn shows(&self, i: usize, filters: &Filters) -> bool {
+        let mask = self.text_mask(&filters.text);
+        self.shows_in(i, filters, mask.as_deref())
+    }
+
     /// Hits that pass `filters`, grouped by user then folder, in rank order: a group sits
     /// where its best file ranks, and its folders and files keep their order.
     pub fn groups(&self, filters: &Filters) -> Vec<Group> {
+        use std::collections::HashMap;
         let mut groups: Vec<Group> = Vec::new();
+        let mut by_user: HashMap<&str, usize> = HashMap::new();
+        let mut by_folder: HashMap<(usize, &str), usize> = HashMap::new();
+        let mask = self.text_mask(&filters.text);
         for (i, h) in self.hits.iter().enumerate() {
-            if !filters.accepts(h) {
+            if !self.shows_in(i, filters, mask.as_deref()) {
                 continue;
             }
-            let g = match groups.iter().position(|g| g.username == h.file.username) {
-                Some(g) => &mut groups[g],
-                None => {
-                    groups.push(Group {
-                        username: h.file.username.clone(),
-                        free_slot: h.free_slot,
-                        speed: h.speed,
-                        folders: Vec::new(),
-                        files: 0,
-                    });
-                    groups.last_mut().expect("just pushed")
-                }
-            };
+            let gi = *by_user.entry(h.file.username.as_str()).or_insert_with(|| {
+                groups.push(Group {
+                    username: h.file.username.clone(),
+                    free_slot: h.free_slot,
+                    speed: h.speed,
+                    folders: Vec::new(),
+                    files: 0,
+                });
+                groups.len() - 1
+            });
+            let g = &mut groups[gi];
             g.files += 1;
             let folder = h.file.folder();
-            match g.folders.iter_mut().find(|(f, _)| f == folder) {
-                Some((_, v)) => v.push(i),
-                None => g.folders.push((folder.to_string(), vec![i])),
-            }
+            let fi = *by_folder.entry((gi, folder)).or_insert_with(|| {
+                g.folders.push((folder.to_string(), Vec::new()));
+                g.folders.len() - 1
+            });
+            g.folders[fi].1.push(i);
         }
         // Ranking orders users and their folders; inside a folder, files go by name.
+        let indexed = self.keys.len() == self.hits.len();
         for g in &mut groups {
             for (_, v) in &mut g.folders {
-                v.sort_by(|&a, &b| {
-                    natural_cmp(self.hits[a].file.basename(), self.hits[b].file.basename())
-                });
+                if indexed {
+                    v.sort_unstable_by_key(|&i| self.keys[i].name_order);
+                } else {
+                    v.sort_by(|&a, &b| {
+                        natural_cmp(self.hits[a].file.basename(), self.hits[b].file.basename())
+                    });
+                }
             }
         }
         groups
     }
 
     pub fn visible(&self, filters: &Filters) -> usize {
-        self.hits.iter().filter(|h| filters.accepts(h)).count()
+        let mask = self.text_mask(&filters.text);
+        (0..self.hits.len())
+            .filter(|&i| self.shows_in(i, filters, mask.as_deref()))
+            .count()
     }
 
     /// One chip per format present in the results, with its count under the other filters
@@ -214,9 +506,11 @@ impl SearchView {
             Some((_, c)) => *c += k,
             None => n.push((f, k)),
         };
-        for h in &self.hits {
-            if let Some(f) = format_of(&h.file.path) {
-                add(f, usize::from(filters.accepts_except_format(h)));
+        let mask = self.text_mask(&filters.text);
+        for (i, h) in self.hits.iter().enumerate() {
+            if let Some(f) = self.format(i) {
+                let ok = filters.accepts_except_format(h) && mask.as_ref().is_none_or(|m| m[i]);
+                add(f, usize::from(ok));
             }
         }
         for f in &filters.formats {

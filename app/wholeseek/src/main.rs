@@ -117,7 +117,7 @@ fn spawn_loader(tx: Sender<Booted>, wake: rune::Waker) {
 
 /// Window shortcuts (Ctrl off macOS, ⌘ on it — Rune's `mods.cmd` / `is_command`; Ctrl also
 /// works for Tab and arrows there): Ctrl+T new search tab, Ctrl+W close tab, Ctrl+(Shift+)Tab cycle tabs,
-/// Ctrl+L / Ctrl+F the search field, Space play/pause, Ctrl+→ / Ctrl+← next / previous
+/// Ctrl+L the search field, Ctrl+F the results filter (the search field before results), Space play/pause, Ctrl+→ / Ctrl+← next / previous
 /// track, Escape closes a menu. Only keys the focused control left alone get here.
 pub fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if s.screen != app::Screen::Main {
@@ -143,6 +143,9 @@ pub fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         _ if ev.is_command('w') => {
             s.close_active();
             s.restore_scroll(tx);
+        }
+        _ if ev.is_command('f') && s.focus_find() => {
+            tx.focus("filter", true);
         }
         _ if ev.is_command('l') || ev.is_command('f') => {
             s.show_search_tab();
@@ -188,6 +191,28 @@ fn scene_results(s: &mut App) {
     s.play(&demo_file("alice", "02 Salt Roads.flac"));
     s.download(&demo_file("alice", "03 Low Tide Radio.flac"));
     s.download(&demo_file("vinyl_rips", "A1 Northern Glass.flac"));
+}
+
+/// A search that finds nothing ("Wazn't Me").
+fn scene_no_results(s: &mut App) {
+    s.demo_login();
+    s.search_for("Wazn't Me");
+}
+
+/// The results narrowed by the filter box ("coast"), Coastline selected for the pane.
+fn scene_filtered(s: &mut App) {
+    scene_wide(s);
+    if let Some(st) = s.tab_mut().search_mut() {
+        st.find.replace_text("coast");
+    }
+}
+
+/// A filter that hides every result.
+fn scene_nothing_matches(s: &mut App) {
+    scene_results(s);
+    if let Some(st) = s.tab_mut().search_mut() {
+        st.find.replace_text("xyz");
+    }
 }
 
 /// The results with alice's Coastline selected: on a wide window the details pane shows it.
@@ -313,6 +338,9 @@ fn main() {
         scenes: &[
             ("search-tab", scene_results),
             ("wide", scene_wide),
+            ("no-results", scene_no_results),
+            ("filtered", scene_filtered),
+            ("nothing-matches", scene_nothing_matches),
             ("user-tab", scene_browse),
             ("three-tabs", scene_three_tabs),
             ("transfers-drawer", scene_transfers),

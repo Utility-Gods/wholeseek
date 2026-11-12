@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use wholeseek_core::RemoteFile;
 
-use super::files::{RowCtx, columns, file_row, more_key};
+use super::files::{RowCtx, action, columns, file_row, more_key};
 use super::{META, amber, field_box, green, hairline, icons, input, tnum, vline};
 use crate::app::{App, MAX_ROWS};
 use crate::fmt;
@@ -29,12 +29,134 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
     .grow(1.0)
     .max_w(560.0)
     .child(icons::search(11.0, t.text_secondary));
-    let f = &st.filters;
-    let mut chips = row().key("chips").gap(6.0).center_y();
-    if let Some(v) = &st.search {
-        let counts = v.format_counts(f);
-        let (shown, rest) = counts.split_at(counts.len().min(MAX_FORMAT_CHIPS));
-        for &(label, n) in shown {
+    let mut bar = row()
+        .key("search-bar")
+        .h(44.0)
+        .w_full()
+        .px(12.0)
+        .gap(12.0)
+        .center_y()
+        .child(query)
+        .child(el().grow(1.0));
+    let Some(search) = &st.search else {
+        return col()
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .child(bar)
+            .child(hairline(t))
+            .child(
+                col()
+                    .key("empty")
+                    .grow(1.0)
+                    .center()
+                    .gap(6.0)
+                    .help({
+                        use crate::desktop::chord;
+                        format!(
+                            "{} new tab · {} close · {} switch · {} search · {} filter results",
+                            chord("T"),
+                            chord("W"),
+                            chord("Tab"),
+                            chord("L"),
+                            chord("F")
+                        )
+                    })
+                    .child(
+                        text("Search Soulseek")
+                            .font(type_::TITLE)
+                            .color(t.text_secondary),
+                    ),
+            );
+    };
+    // "128 results · 34 users · searching…" while the core's window is open.
+    let searching = !search.finished || s.status.searches.iter().any(|p| p.id == search.id);
+    let total = search.hits.len();
+    let users = {
+        let mut u: Vec<&str> = search
+            .hits
+            .iter()
+            .map(|h| h.file.username.as_str())
+            .collect();
+        u.sort_unstable();
+        u.dedup();
+        u.len()
+    };
+    let mut summary = row().gap(8.0).center_y();
+    if total > 0 {
+        summary = summary.child(
+            text(format!(
+                "{total} {} · {users} {}",
+                if total == 1 { "result" } else { "results" },
+                if users == 1 { "user" } else { "users" }
+            ))
+            .key("count")
+            .font(tnum(META))
+            .color(t.text_secondary),
+        );
+    }
+    if searching {
+        summary = summary.child(
+            text("searching…")
+                .key("searching")
+                .font(META)
+                .color(amber()),
+        );
+    }
+    bar = bar.child(summary);
+
+    // Nothing came back: no chips, filter or table, just what happened and what to do.
+    if total == 0 {
+        let mut body = col().key("no-results").grow(1.0).w_full().center().gap(6.0);
+        if !searching {
+            body = body
+                .child(
+                    text(format!("No results for “{}”", search.query))
+                        .key("no-results-title")
+                        .font(type_::BODY)
+                        .color(t.text_secondary)
+                        .max_w(640.0)
+                        .truncate(),
+                )
+                .child(
+                    text("Check the spelling or use fewer words")
+                        .font(META)
+                        .color(t.text_secondary.alpha(0.75)),
+                )
+                .child(
+                    action(
+                        "search-again",
+                        "Search again",
+                        icons::retry(10.0, t.text),
+                        t,
+                    )
+                    .mt(8.0)
+                    .on_press(|s: &mut App| s.search_again()),
+                );
+        }
+        return col()
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .child(bar)
+            .child(hairline(t))
+            .child(body);
+    }
+
+    let f = st.shown_filters();
+    let f = &f;
+    let groups = search.groups(f);
+    let shown = search.visible(f);
+    let mut chips = row().key("chips").gap(6.0).center_y().shrink().min_w(0.0);
+    {
+        // No 0-count chip, except one that is on (so it can be turned off again).
+        let counts: Vec<_> = search
+            .format_counts(f)
+            .into_iter()
+            .filter(|&(l, n)| n > 0 || f.has(l))
+            .collect();
+        let (shown_chips, rest) = counts.split_at(counts.len().min(MAX_FORMAT_CHIPS));
+        for &(label, n) in shown_chips {
             chips = chips.child(chip(
                 crate::tabs::format_key(label),
                 label,
@@ -56,73 +178,29 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
         |f| f.free_slot = !f.free_slot,
         t,
     ));
-    let mut bar = row()
-        .key("search-bar")
-        .h(44.0)
-        .w_full()
+    let first_row = groups
+        .first()
+        .and_then(|g| g.folders.first())
+        .and_then(|(_, v)| v.first())
+        .map(|i| format!("row-{i}"));
+    // Chips left, the filter right. Built right-to-left so the filter comes first in Tab
+    // order (query → filter → chips → results) while it sits at the right end.
+    // In the wide layout the filter ends where the table it narrows ends, not over the pane.
+    let tools = row().key("tools").h(36.0);
+    let tools = if super::details::wide(s) {
+        tools.w(super::details::TABLE_MAX_W)
+    } else {
+        tools.w_full()
+    };
+    let tools = tools
         .px(12.0)
         .gap(12.0)
         .center_y()
-        .child(query)
-        .child(chips)
-        .child(el().grow(1.0));
-    let Some(search) = &st.search else {
-        return col()
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .child(bar)
-            .child(hairline(t))
-            .child(
-                col()
-                    .key("empty")
-                    .grow(1.0)
-                    .center()
-                    .gap(6.0)
-                    .help({
-                        use crate::desktop::chord;
-                        format!(
-                            "{} new tab · {} close · {} switch · {} search",
-                            chord("T"),
-                            chord("W"),
-                            chord("Tab"),
-                            chord("L")
-                        )
-                    })
-                    .child(
-                        text("Search Soulseek")
-                            .font(type_::TITLE)
-                            .color(t.text_secondary),
-                    ),
-            );
-    };
-    let groups = search.groups(f);
-    let shown = search.visible(f);
-    // "128 results · 34 users · searching…" while the core's window is open.
-    let searching = !search.finished || s.status.searches.iter().any(|p| p.id == search.id);
-    let mut summary = row().gap(8.0).center_y().child(
-        text(format!(
-            "{shown} {} · {} {}",
-            if shown == 1 { "result" } else { "results" },
-            groups.len(),
-            if groups.len() == 1 { "user" } else { "users" }
-        ))
-        .key("count")
-        .font(tnum(META))
-        .color(t.text_secondary),
-    );
-    if shown < search.hits.len() {
-        summary = summary.help(format!("{} hidden by filters", search.hits.len() - shown));
-    }
-    if searching {
-        summary = summary.child(
-            text("searching…")
-                .key("searching")
-                .font(META)
-                .color(amber()),
-        );
-    }
-    bar = bar.child(summary);
+        .dir(rune::Direction::Rtl)
+        .child(find_box(st, shown, total, first_row, t))
+        .child(el().grow(1.0))
+        .child(chips.dir(rune::Direction::Ltr));
+    let find = Some(std::rc::Rc::new(f.text.clone())).filter(|q| !q.is_empty());
 
     let mut list = col().w_full().pb(8.0);
     let mut drawn = 0;
@@ -148,6 +226,7 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
                         .key("user")
                         .font(type_::TITLE)
                         .color(t.text)
+                        .spans(super::files::match_spans(find.as_deref(), &g.username))
                         .cursor(Cursor::Pointer)
                         .role("link")
                         .help("Open this user in a tab")
@@ -170,13 +249,13 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
                 &format!("folder-{gi}-{fi}"),
                 &g.username,
                 folder,
-                s.tab().id,
+                s,
                 super::details::wide(s)
                     && tab
                         .group
                         .as_ref()
                         .is_some_and(|(u, d)| u == &g.username && d == folder),
-                super::details::table_max_w(s),
+                find.as_deref(),
                 t,
             ));
             let files: Rc<[RemoteFile]> = s.folder_files(&g.username, folder).into();
@@ -192,6 +271,7 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
                     selected: tab.selected.as_deref() == Some(f.path.as_str()),
                     highlighted: false,
                     more_key: more_key(tab.id, &f.path),
+                    find: find.clone(),
                 };
                 list = list.child(file_row(s, &format!("row-{i}"), f, FILE_INDENT, &ctx, t));
             }
@@ -206,19 +286,8 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
                 .pt(10.0),
         );
     }
-    if search.finished && shown == 0 {
-        list = list.child(
-            text(if search.hits.is_empty() {
-                "No results"
-            } else {
-                "No matches for these filters"
-            })
-            .key("no-results")
-            .font(type_::BODY)
-            .color(t.text_secondary)
-            .px(12.0)
-            .pt(12.0),
-        );
+    if shown == 0 {
+        list = list.child(nothing_matches(st, t));
     }
     let saved = tab.scroll.clone();
     let wide = super::details::wide(s);
@@ -228,18 +297,20 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
     } else {
         results.w_full().grow(1.0)
     };
-    let results = results
-        .child(columns(s, FILE_INDENT, t))
-        .child(hairline(t))
-        .child(
-            list.key(tab.list_key())
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                })
-                .on_scroll_offset(move |at: ScrollPos| saved.set(at.offset[1]))
-                .shrink()
-                .min_h(0.0),
-        );
+    let results = if shown > 0 {
+        results.child(columns(s, FILE_INDENT, t)).child(hairline(t))
+    } else {
+        results
+    };
+    let results = results.child(
+        list.key(tab.list_key())
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .on_scroll_offset(move |at: ScrollPos| saved.set(at.offset[1]))
+            .shrink()
+            .min_h(0.0),
+    );
     let body = if wide {
         // Wide window: the table at its natural width, the selected folder beside it.
         row()
@@ -258,8 +329,126 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
         .grow(1.0)
         .min_h(0.0)
         .child(bar)
+        .child(tools)
         .child(hairline(t))
         .child(body)
+}
+
+/// "Nothing matches …" when the filter box or chips hide every result.
+fn nothing_matches(st: &SearchTab, t: &Theme) -> El {
+    let words = st.find.text.trim();
+    let (title, button, clear): (String, &str, fn(&mut App)) = if words.is_empty() {
+        (
+            "Nothing matches these filters".into(),
+            "Clear filters",
+            |s| {
+                if let Some(st) = s.tab_mut().search_mut() {
+                    st.filters.formats.clear();
+                    st.filters.free_slot = false;
+                    let chosen = st.filters.clone();
+                    s.last_filters = chosen;
+                }
+            },
+        )
+    } else {
+        (
+            format!("Nothing matches “{words}”"),
+            "Clear filter",
+            |s| s.clear_find(),
+        )
+    };
+    col()
+        .key("nothing-matches")
+        .w_full()
+        .pt(64.0)
+        .items_center()
+        .gap(10.0)
+        .child(
+            text(title)
+                .key("nothing-matches-title")
+                .font(type_::BODY)
+                .color(t.text_secondary)
+                .max_w(560.0)
+                .truncate(),
+        )
+        .child(
+            action("clear-filter", button, icons::close(8.0, t.text), t).on_press_tx(
+                move |s: &mut App, tx| {
+                    clear(s);
+                    tx.focus("filter", false);
+                },
+            ),
+        )
+}
+
+/// The "Filter results" box: secondary to the query (smaller, muted icon); while it holds
+/// words, "42 of 257" and × beside it. Esc clears, then leaves; ↓ goes to the first result.
+fn find_box(
+    st: &SearchTab,
+    shown: usize,
+    total: usize,
+    first_row: Option<String>,
+    t: &Theme,
+) -> El {
+    let active = !st.find.text.trim().is_empty();
+    let field = input(&st.find, "Filter results", t)
+        .key("filter")
+        .font(META)
+        .on_edit(|s: &mut App| &mut s.tab_mut().search_mut().expect("search tab is shown").find)
+        .on_input_change(|s: &mut App, _| s.find_changed())
+        .on_input_key(move |s: &mut App, e, tx| match e.key {
+            rune::Key::Escape => {
+                let filled = s.tab().search().is_some_and(|st| !st.find.text.is_empty());
+                if filled {
+                    s.clear_find();
+                } else {
+                    tx.blur();
+                }
+                true
+            }
+            rune::Key::Down => {
+                if let Some(r) = &first_row {
+                    tx.focus(r.clone(), true);
+                }
+                true
+            }
+            _ => false,
+        });
+    let mut b = row()
+        .key("find")
+        .h(28.0)
+        .w(220.0)
+        .pl(8.0)
+        .pr(4.0)
+        .gap(6.0)
+        .center_y()
+        .radius(4.0)
+        .fill(t.card)
+        .border(1.0, t.card_border)
+        .help("Narrow these results: words match the start of words in the path or user; -word excludes")
+        .child(icons::filter(10.0, t.text_secondary.alpha(0.8)))
+        .child(field.grow(1.0).shrink().min_w(0.0));
+    if active {
+        b = b.child(
+            super::icon_button("filter-clear", icons::close(7.0, t.text_secondary), t)
+                .size(18.0, 18.0)
+                .label("Clear filter")
+                .on_press_tx(|s: &mut App, tx| {
+                    s.clear_find();
+                    tx.focus("filter", false);
+                }),
+        );
+    }
+    let mut r = row().gap(8.0).center_y().dir(rune::Direction::Ltr);
+    if active {
+        r = r.child(
+            text(format!("{shown} of {total}"))
+                .key("find-count")
+                .font(tnum(META))
+                .color(t.text_secondary),
+        );
+    }
+    r.child(b)
 }
 
 /// Format chips shown before the rest fold into "+N".
@@ -278,6 +467,8 @@ fn more_formats(rest: &[(&'static str, usize)], f: &Filters, t: &Theme) -> El {
         .border(1.0, if on { t.control_track } else { t.separator })
         .cursor(Cursor::Pointer)
         .role("button")
+        .focusable(true)
+        .focus_ring(1.0, -1.0, super::accent().alpha(0.6))
         .label(format!("{} more formats", rest.len()))
         .hover(t.hover)
         .press(t.press)
@@ -318,6 +509,8 @@ fn chip(
         .border(1.0, if on { t.control_track } else { t.separator })
         .cursor(Cursor::Pointer)
         .role("switch")
+        .focusable(true)
+        .focus_ring(1.0, -1.0, super::accent().alpha(0.6))
         .label(spoken)
         .checked(on)
         .hover(t.hover)
@@ -328,6 +521,7 @@ fn chip(
                 let chosen = st.filters.clone();
                 s.last_filters = chosen;
             }
+            s.find_changed();
         })
         .child(text(label.to_string()).font(META).color(if on {
             t.text
@@ -360,11 +554,12 @@ fn folder_line(
     key: &str,
     username: &str,
     folder: &str,
-    tab: crate::tabs::TabId,
+    s: &App,
     selected: bool,
-    max_w: f32,
+    find: Option<&crate::tabs::TextQuery>,
     t: &Theme,
 ) -> El {
+    let (tab, max_w) = (s.tab().id, super::details::table_max_w(s));
     let parts: Vec<&str> = folder.split('\\').collect();
     let shown: Vec<Option<usize>> = if parts.len() > MAX_SEGMENTS {
         let n = parts.len();
@@ -410,6 +605,7 @@ fn folder_line(
                 .key(format!("seg-{i}"))
                 .font(META)
                 .color(t.text_secondary)
+                .spans(super::files::match_spans(find, parts[i]))
                 .truncate()
                 .shrink()
                 .cursor(Cursor::Pointer)

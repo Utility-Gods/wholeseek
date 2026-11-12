@@ -77,6 +77,8 @@ pub struct RowCtx {
     pub selected: bool,
     pub highlighted: bool,
     pub more_key: String,
+    /// The search tab's filter words: their matches in the name are drawn in the accent.
+    pub find: Option<Rc<crate::tabs::TextQuery>>,
 }
 
 /// One file. `indent` nests it under a folder line; non-audio files are dimmed and get no ▶.
@@ -178,6 +180,7 @@ pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t
                 .key("name")
                 .font(type_::BODY)
                 .color(fg)
+                .spans(match_spans(ctx.find.as_deref(), f.basename()))
                 .truncate()
                 .grow(1.0)
                 .shrink(),
@@ -209,6 +212,16 @@ pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t
         r = r.fill(t.hover);
     }
     r
+}
+
+/// Accent-coloured [`rune::Span`]s over `text` where the filter words match (colour only, so
+/// nothing shifts).
+pub fn match_spans(q: Option<&crate::tabs::TextQuery>, text: &str) -> Vec<rune::Span> {
+    q.map(|q| q.spans(text))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(a, b)| rune::Span::new(a, b).color(accent()))
+        .collect()
 }
 
 /// The ⋯ key for a file in the shown tab (unique across the page).

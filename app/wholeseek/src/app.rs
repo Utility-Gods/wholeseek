@@ -525,6 +525,7 @@ impl App {
                 if let Some(s) = self.search_by_id(search) {
                     s.hits.extend(hits);
                     rank::rank(&mut s.hits, true);
+                    s.reindex();
                 }
             }
             CoreEvent::SearchFinished { search, .. } => {
@@ -773,6 +774,8 @@ impl App {
                 query,
                 hits: Vec::new(),
                 finished: false,
+                keys: Vec::new(),
+                matched: Default::default(),
             });
         }
         if let Some(t) = self.tabs.get(self.active) {
@@ -795,14 +798,52 @@ impl App {
         self.active = at;
     }
 
+    /// "Search again" on an empty result: the same query once more.
+    pub fn search_again(&mut self) {
+        let Some(st) = self.tabs.get_mut(self.active).and_then(Tab::search_mut) else {
+            return;
+        };
+        if let Some(q) = st.search.as_ref().map(|v| v.query.clone()) {
+            st.edit.replace_text(&q);
+            self.submit_search();
+        }
+    }
+
+    /// ⌘/Ctrl+F: on a search tab with results, select all of the filter box (the caller
+    /// focuses it). False when there is no filter box to go to.
+    pub fn focus_find(&mut self) -> bool {
+        let Some(st) = self.tabs.get_mut(self.active).and_then(Tab::search_mut) else {
+            return false;
+        };
+        if !st.search.as_ref().is_some_and(|v| !v.hits.is_empty()) {
+            return false;
+        }
+        let n = st.find.text.len();
+        st.find.set_selection(0, n);
+        true
+    }
+
+    /// Clear the shown search tab's filter box (Esc, ×, "Clear filter").
+    pub fn clear_find(&mut self) {
+        let tab = &mut self.tabs[self.active];
+        if let TabKind::Search(st) = &mut tab.kind {
+            st.find.replace_text("");
+        }
+    }
+
+    /// The filter box changed: a details pane folder with nothing left listed is dropped.
+    pub fn find_changed(&mut self) {
+        let tab = &mut self.tabs[self.active];
+        if let TabKind::Search(st) = &tab.kind {
+            st.keep_group_visible(&mut tab.group);
+        }
+    }
+
     /// ＋ / Ctrl+T: an empty search tab, shown.
     pub fn new_search_tab(&mut self) {
-        let filters = self.last_filters.clone();
-        self.push_tab(TabKind::Search(SearchTab {
-            edit: edit(""),
-            search: None,
-            filters,
-        }));
+        let mut filters = self.last_filters.clone();
+        filters.text = Default::default(); // the filter box is per tab
+        self.push_tab(TabKind::Search(SearchTab::new(filters)));
     }
 
     /// Show the user's tab, opening it (browse + profile requests) if there is none.

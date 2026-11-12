@@ -103,6 +103,17 @@ pub fn close(size: f32, c: Color) -> El {
     )
 }
 
+/// A funnel: three lines narrowing downwards ("filter").
+pub fn filter(size: f32, c: Color) -> El {
+    icon(
+        size,
+        Shape::new()
+            .line([1.2, 2.2], [8.8, 2.2], 1.2, LineCap::Round, c)
+            .line([2.8, 5.0], [7.2, 5.0], 1.2, LineCap::Round, c)
+            .line([4.3, 7.8], [5.7, 7.8], 1.2, LineCap::Round, c),
+    )
+}
+
 pub fn check(size: f32, c: Color) -> El {
     icon(
         size,
