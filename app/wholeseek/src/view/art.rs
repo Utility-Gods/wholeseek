@@ -64,6 +64,8 @@ pub struct Art {
     /// Tests: a cover cache for a backend that has none (the demo).
     #[cfg(test)]
     pub test_covers: Option<Covers>,
+    /// Demo mode: generated covers for most demo folders (made on first use).
+    demo: std::cell::OnceCell<Option<Covers>>,
 }
 
 impl Default for Art {
@@ -87,6 +89,7 @@ impl Default for Art {
             results: mpsc::channel(),
             #[cfg(test)]
             test_covers: None,
+            demo: std::cell::OnceCell::new(),
         }
     }
 }
@@ -130,7 +133,29 @@ fn covers_of(s: &App) -> Option<&Covers> {
     if let Some(c) = &s.art.test_covers {
         return Some(c);
     }
+    if s.demo && !cfg!(test) {
+        return s.art.demo.get_or_init(demo_covers).as_ref();
+    }
     s.backend.covers()
+}
+
+/// Gradient covers for the demo's folders (every third one has none), in a temp dir.
+fn demo_covers() -> Option<Covers> {
+    let dir = std::env::temp_dir().join("wholeseek-demo-covers");
+    let covers = Covers::open(&dir);
+    let mut folders: Vec<(String, String)> = crate::demo::catalog()
+        .iter()
+        .map(|f| (f.username.clone(), f.folder().to_string()))
+        .collect();
+    folders.sort();
+    folders.dedup();
+    for (i, (u, d)) in folders.iter().enumerate() {
+        if i % 3 != 2 && covers.cached(u, d).is_none() {
+            let png = wholeseek_core::cover::demo_png(i as u64, 128);
+            covers.store_embedded(u, d, &png).ok()?;
+        }
+    }
+    Some(covers)
 }
 
 /// The cover of (user, folder) if it is cached and decoded. Memory only.

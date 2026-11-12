@@ -142,6 +142,30 @@ pub fn test_png(w: u32, h: u32) -> Vec<u8> {
     out.into_inner()
 }
 
+/// A `size`² two-tone gradient PNG picked by `seed` (demo covers; no real artwork).
+#[doc(hidden)]
+#[must_use]
+pub fn demo_png(seed: u64, size: u32) -> Vec<u8> {
+    const PALETTE: [[u8; 3]; 6] = [
+        [30, 58, 95],
+        [71, 85, 105],
+        [154, 52, 18],
+        [21, 94, 117],
+        [88, 28, 135],
+        [20, 83, 45],
+    ];
+    let a = PALETTE[(seed % 6) as usize];
+    let b = PALETTE[((seed / 6 + 3) % 6) as usize];
+    let img = image::RgbImage::from_fn(size, size, |x, y| {
+        let t = (x + y) as f32 / (2 * size.max(1)) as f32;
+        let mix = |i: usize| (f32::from(a[i]) * (1.0 - t) + f32::from(b[i]) * t) as u8;
+        image::Rgb([mix(0), mix(1), mix(2)])
+    });
+    let mut out = std::io::Cursor::new(Vec::new());
+    let _ = img.write_to(&mut out, image::ImageFormat::Png);
+    out.into_inner()
+}
+
 /// Called after any cover changes state (the app passes its window waker).
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
