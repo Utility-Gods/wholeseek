@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # attach the builds to the release on tag pushes
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-15 # arm64; macos-14 images are retired ("macos-14-arm64-us-default is not supported")
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-apple-darwin
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-apple-silicon
+
+      - name: Build Apple Silicon app + DMG
+        id: dmg
+        run: packaging/macos/build-dmg.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.dmg.outputs.name }}
+          path: ${{ steps.dmg.outputs.dmg }}
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          DMG: ${{ steps.dmg.outputs.dmg }}
+        run: |
+          # Race-safe with the linux job: whoever loses the create sees it exists.
+          gh release create "$TAG" --title "wholeseek $TAG" --generate-notes 2>/dev/null \
+            || gh release view "$TAG" >/dev/null
+          # Stable name so websites can link to
+          # https://github.com/Utility-Gods/wholeseek/releases/latest/download/wholeseek-macos-apple-silicon.dmg
+          stable="$(dirname "$DMG")/wholeseek-macos-apple-silicon.dmg"
+          cp "$DMG" "$stable"
+          gh release upload "$TAG" "$DMG" "$stable" --clobber
+
+  linux:
+    # Oldest supported Ubuntu runner → oldest glibc → runs on more distros.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-x86_64
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libdbus-1-dev librsvg2-bin
+
+      - name: Build tarball
+        id: tar
+        run: packaging/linux/build-tarball.sh
+
+      - name: Show glibc floor
+        run: |
+          objdump -T target/release/wholeseek | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+          ldd target/release/wholeseek
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.tar.outputs.name }}
+          path: ${{ steps.tar.outputs.tarball }}
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          TARBALL: ${{ steps.tar.outputs.tarball }}
+        run: |
+          gh release create "$TAG" --title "wholeseek $TAG" --generate-notes 2>/dev/null \
+            || gh release view "$TAG" >/dev/null
+          # Stable name: .../releases/latest/download/wholeseek-linux-x86_64.tar.gz
+          stable="$(dirname "$TARBALL")/wholeseek-linux-x86_64.tar.gz"
+          cp "$TARBALL" "$stable"
+          gh release upload "$TAG" "$TARBALL" "$stable" --clobber

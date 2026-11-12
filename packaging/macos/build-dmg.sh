@@ -30,8 +30,9 @@ app="$dist/Wholeseek.app"
 rm -rf "$dist"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
-lipo -create -output "$app/Contents/MacOS/wholeseek" \
-  $(for t in "${targets[@]}"; do echo "target/$t/release/wholeseek"; done)
+bins=()
+for t in "${targets[@]}"; do bins+=("target/$t/release/wholeseek"); done
+lipo -create -output "$app/Contents/MacOS/wholeseek" "${bins[@]}"
 lipo -info "$app/Contents/MacOS/wholeseek"
 
 sed "s/@VERSION@/$version/g" "$here/Info.plist" >"$app/Contents/Info.plist"
