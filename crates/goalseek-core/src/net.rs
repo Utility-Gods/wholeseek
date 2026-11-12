@@ -1,6 +1,8 @@
 //! The slice of `soulseek_rs::Client` the worker uses, behind a trait so the
 //! worker's logic is tested offline against a fake.
 
+use soulseek_rs::UserInfo;
+use soulseek_rs::message::peer::PeerInfo;
 use soulseek_rs::{
     Client, ClientSettings, DownloadStatus, SearchResult, SessionLoss, SharedDirectory, SoulseekRs,
     UploadInfo,
@@ -40,6 +42,12 @@ pub(crate) trait Session: Send + Sync {
     fn shared_counts(&self) -> (u32, u32);
     fn uploads(&self) -> Vec<UploadInfo>;
     fn cancel_upload(&self, username: &str, path: &str) -> bool;
+    /// Server presence + stats; replies polled with `user_info`.
+    fn request_user_info(&self, username: &str) -> Result<(), String>;
+    fn user_info(&self, username: &str) -> Option<UserInfo>;
+    /// Peer UserInfo (code 15/16); reply polled with `peer_info`.
+    fn request_peer_info(&self, username: &str) -> Result<(), String>;
+    fn peer_info(&self, username: &str) -> Option<PeerInfo>;
     fn set_upload_slots(&self, slots: usize);
 }
 
@@ -167,6 +175,18 @@ impl Session for Client {
     }
     fn cancel_upload(&self, username: &str, path: &str) -> bool {
         Client::cancel_upload(self, username, path)
+    }
+    fn request_user_info(&self, username: &str) -> Result<(), String> {
+        Client::request_user_info(self, username).map_err(|e| e.to_string())
+    }
+    fn user_info(&self, username: &str) -> Option<UserInfo> {
+        Client::user_info(self, username)
+    }
+    fn request_peer_info(&self, username: &str) -> Result<(), String> {
+        Client::request_peer_info(self, username).map_err(|e| e.to_string())
+    }
+    fn peer_info(&self, username: &str) -> Option<PeerInfo> {
+        Client::peer_info(self, username)
     }
 }
 

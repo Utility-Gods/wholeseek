@@ -151,6 +151,49 @@ fn live_core_end_to_end() {
         other => println!("3. browse: {other:?}"),
     }
 
+    // 3b. Profile of the browsed user (server presence/stats + peer UserInfo).
+    let t_p = Instant::now();
+    core.user_profile(&top.file.username);
+    let mut last = None;
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match ev.recv_timeout(left) {
+            Ok(CoreEvent::UserProfile { username, profile }) if username == top.file.username => {
+                println!(
+                    "3b. profile of {username} after {:.1}s: online={:?} avg_speed={:?} B/s files={:?} dirs={:?} \
+                     slots={:?} free_slot={:?} queue={:?} picture={:?} description={:?}",
+                    t_p.elapsed().as_secs_f32(),
+                    profile.online,
+                    profile.avg_speed,
+                    profile.shared_files,
+                    profile.shared_dirs,
+                    profile.upload_slots,
+                    profile.free_slot,
+                    profile.queue_size,
+                    profile.picture.as_ref().map(Vec::len),
+                    profile
+                        .description
+                        .as_deref()
+                        .map(|d| d.chars().take(120).collect::<String>()),
+                );
+                last = Some(profile);
+            }
+            Ok(CoreEvent::UserProfileFailed { username, reason })
+                if username == top.file.username =>
+            {
+                println!("3b. profile of {username} failed: {reason}");
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let profile = last.expect("no UserProfile event for the browsed user");
+    assert!(
+        profile.online.is_some() || profile.shared_files.is_some(),
+        "server part missing"
+    );
+
     // 4. Play-fetch candidates (top FLAC first) until one sends bytes.
     let mut started = false;
     for cand in flac.iter().copied().chain(hits.iter()).take(5) {

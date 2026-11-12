@@ -419,7 +419,7 @@ fn username_opens_browse_with_tree_and_back_returns() {
     let mut rt = searched();
     let (i, _) = row_of(&rt, "alice", "01 Northern Glass.flac");
     click(&mut rt, &format!("row-{i}/user"));
-    assert_eq!(calls(&rt).last(), Some(&Call::Browse("alice".into())));
+    assert!(calls(&rt).contains(&Call::Browse("alice".into())));
     run(&mut rt, 0.6);
     let b = rt.state.browse.as_ref().unwrap();
     assert!(b.dirs.is_some() && b.selected.is_some());
@@ -665,4 +665,158 @@ fn port_mapping_result_shows_in_settings() {
             .unwrap()
             .starts_with("Port 2234 not mapped — forward it manually.")
     );
+}
+
+// ---- profile header ------------------------------------------------------------------------
+
+fn browsing(user: &str) -> Runtime<App> {
+    let mut rt = signed_in();
+    rt.update(|s, _| s.open_user(user));
+    run(&mut rt, 0.05);
+    rt
+}
+
+fn shown(rt: &Runtime<App>, key: &str) -> bool {
+    rt.find(key).is_some()
+}
+
+#[test]
+fn profile_is_requested_with_browse_and_shows_loading_until_the_first_answer() {
+    let mut rt = browsing("alice");
+    let c = calls(&rt);
+    assert!(
+        c.contains(&Call::Browse("alice".into())) && c.contains(&Call::UserProfile("alice".into()))
+    );
+    assert!(shown(&rt, "profile-loading") && !shown(&rt, "profile"));
+    run(&mut rt, 0.3);
+    assert!(!shown(&rt, "profile-loading") && shown(&rt, "profile"));
+}
+
+#[test]
+fn profile_header_renders_known_fields_and_grows_as_answers_arrive() {
+    let mut rt = browsing("alice");
+    run(&mut rt, 0.3);
+    // First answer: server stats only.
+    assert!(
+        shown(&rt, "profile-name") && shown(&rt, "profile-online") && shown(&rt, "profile-stats")
+    );
+    assert!(!shown(&rt, "profile-desc") && !shown(&rt, "profile-picture"));
+    let stats = crate::profile::stats_line(&rt.state.profiles.get("alice").unwrap().profile);
+    assert_eq!(stats, "3.1 MB/s · 24,558 files · 2,524 folders");
+    run(&mut rt, 0.5);
+    // Second: the peer's part. The picture decodes off-thread.
+    let e = rt.state.profiles.get("alice").unwrap();
+    e.picture
+        .as_ref()
+        .unwrap()
+        .wait()
+        .expect("demo PNG decodes");
+    run(&mut rt, 0.05);
+    assert!(
+        shown(&rt, "profile-desc") && shown(&rt, "profile-picture") && shown(&rt, "profile-more")
+    );
+    assert!(
+        crate::profile::stats_line(&rt.state.profiles.get("alice").unwrap().profile)
+            .ends_with(" · free slot")
+    );
+    // Clamped to 3 lines; "more" expands it.
+    let clamped = rt.presented("profile-desc").unwrap().0[3];
+    click(&mut rt, "profile-more");
+    let open = rt.presented("profile-desc").unwrap().0[3];
+    assert!(open > clamped + 1.0, "expanded {open} > clamped {clamped}");
+}
+
+#[test]
+fn profile_header_hides_unknown_fields() {
+    let mut rt = browsing("vinyl_rips");
+    run(&mut rt, 1.0);
+    assert!(shown(&rt, "profile-name") && shown(&rt, "profile-stats"));
+    assert!(
+        !shown(&rt, "profile-desc")
+            && !shown(&rt, "profile-picture")
+            && !shown(&rt, "profile-more")
+    );
+    // Queue without a free slot; an undecodable picture is skipped, the rest shows.
+    let mut rt = browsing("marten_k");
+    run(&mut rt, 1.0);
+    assert!(
+        crate::profile::stats_line(&rt.state.profiles.get("marten_k").unwrap().profile)
+            .ends_with(" · queue 12")
+    );
+    assert!(shown(&rt, "profile-desc") && !shown(&rt, "profile-more"));
+    let mut rt = browsing("dj_ivo");
+    run(&mut rt, 0.8);
+    let _ = rt
+        .state
+        .profiles
+        .get("dj_ivo")
+        .unwrap()
+        .picture
+        .as_ref()
+        .unwrap()
+        .wait();
+    run(&mut rt, 0.05);
+    assert!(shown(&rt, "profile-desc") && !shown(&rt, "profile-picture"));
+}
+
+#[test]
+fn profile_events_for_another_user_are_ignored() {
+    let mut rt = browsing("alice");
+    let other = goalseek_core::UserProfile {
+        description: Some("not alice".into()),
+        ..Default::default()
+    };
+    rt.update(|s, _| {
+        s.apply(goalseek_core::CoreEvent::UserProfile {
+            username: "mallory".into(),
+            profile: other.clone(),
+        })
+    });
+    rt.update(|s, _| {
+        s.apply(goalseek_core::CoreEvent::UserProfileFailed {
+            username: "mallory".into(),
+            reason: "x".into(),
+        })
+    });
+    run(&mut rt, 0.02);
+    assert!(shown(&rt, "profile-loading"), "still waiting for alice");
+    assert!(rt.state.profiles.get("mallory").is_none());
+    // A late answer for a user we already left doesn't show up on the next one.
+    click(&mut rt, "back");
+    rt.update(|s, _| s.open_user("vinyl_rips"));
+    rt.update(|s, _| {
+        s.apply(goalseek_core::CoreEvent::UserProfile {
+            username: "alice".into(),
+            profile: other,
+        })
+    });
+    run(&mut rt, 0.02);
+    assert!(shown(&rt, "profile-loading") && rt.state.profiles.get("alice").is_none());
+}
+
+#[test]
+fn profile_failure_hides_the_header_but_folders_still_work() {
+    let mut rt = browsing("nightbus");
+    assert!(shown(&rt, "profile-loading"));
+    run(&mut rt, 1.0);
+    assert!(matches!(
+        rt.state.profiles.get("nightbus").unwrap().status,
+        crate::profile::ProfileStatus::Failed(_)
+    ));
+    assert!(!shown(&rt, "profile") && !shown(&rt, "profile-loading"));
+    assert!(
+        shown(&rt, "dir-0") && shown(&rt, "file-0/play"),
+        "folders still work"
+    );
+    // A failure after fields arrived keeps them.
+    let mut rt = browsing("alice");
+    run(&mut rt, 1.0);
+    rt.update(|s, _| {
+        s.apply(goalseek_core::CoreEvent::UserProfileFailed {
+            username: "alice".into(),
+            reason: "timeout".into(),
+        })
+    });
+    run(&mut rt, 0.02);
+    assert!(shown(&rt, "profile-stats"));
 }

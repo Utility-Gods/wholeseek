@@ -523,13 +523,16 @@ fn browse(s: &App, b: &BrowseView, t: &Theme) -> El {
             .child(vline(t))
             .child(folder(s, b, t))
     };
-    col()
+    let mut page = col()
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .child(crumbs)
-        .child(hairline(t))
-        .child(body)
+        .child(hairline(t));
+    if let Some(h) = super::profile::header(&b.username, s.profiles.get(&b.username), t) {
+        page = page.child(h).child(hairline(t));
+    }
+    page.child(body)
 }
 
 fn tree(b: &BrowseView, t: &Theme) -> El {

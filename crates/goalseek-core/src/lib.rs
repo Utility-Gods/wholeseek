@@ -19,7 +19,7 @@ pub use crate::core::{Command, Core, NOT_IMPLEMENTED, POLL_TICK};
 pub use event::{CoreEvent, DisconnectReason, PortMapOutcome};
 pub use model::{
     AudioAttrs, BrowseDir, Credentials, PlayTicket, RemoteFile, SearchHit, SearchId, Settings,
-    TransferId, TransferKind, UploadRow, UploadState,
+    TransferId, TransferKind, UploadRow, UploadState, UserProfile,
 };
 
 /// Client version goalseek reports on login. Major 176 is reserved for

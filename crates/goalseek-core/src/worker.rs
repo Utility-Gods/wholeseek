@@ -10,12 +10,15 @@ use crate::core::Command;
 use crate::event::{CoreEvent, DisconnectReason, PortMapOutcome};
 use crate::model::{
     AudioAttrs, BrowseDir, Credentials, RemoteFile, SearchId, Settings, TransferId, TransferKind,
-    UploadRow, UploadState,
+    UploadRow, UploadState, UserProfile,
 };
 use crate::net::{self, ConnectParams, Connector, LoginError, Session};
 use crate::port_mapping::{self, PortMapper};
 use crate::{paths, rank};
-use soulseek_rs::{DownloadStatus, SessionLoss, SharedDirectory, UploadStatus};
+use soulseek_rs::message::peer::PeerInfo;
+use soulseek_rs::{
+    DownloadStatus, SessionLoss, SharedDirectory, UploadStatus, UserInfo, UserStatus,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,6 +36,7 @@ pub(crate) struct Tunables {
     pub play_start_timeout: Duration,
     pub queue_place_after: Duration,
     pub uploads_every: Duration,
+    pub profile_timeout: Duration,
     pub backoff: fn(u32) -> Duration,
 }
 
@@ -46,6 +50,7 @@ impl Default for Tunables {
             play_start_timeout: Duration::from_secs(30),
             queue_place_after: Duration::from_secs(5),
             uploads_every: Duration::from_secs(1),
+            profile_timeout: Duration::from_secs(10),
             backoff: net::backoff,
         }
     }
@@ -89,6 +94,11 @@ struct LiveSearch {
     delivered: usize,
     cancel: Arc<AtomicBool>,
     session: Arc<dyn Session>,
+}
+
+struct ProfileReq {
+    deadline: Instant,
+    sent: Option<UserProfile>,
 }
 
 struct BrowseReq {
@@ -169,6 +179,7 @@ pub(crate) struct Worker {
     searches: Vec<LiveSearch>,
     orphan_searches: HashMap<SearchId, (String, Arc<dyn Session>)>,
     browses: HashMap<String, BrowseReq>,
+    profiles: HashMap<String, ProfileReq>,
     browse_cache: Vec<(String, Vec<BrowseDir>)>,
     folders: Vec<FolderReq>,
     transfers: HashMap<TransferId, Transfer>,
@@ -208,6 +219,7 @@ impl Worker {
             searches: Vec::new(),
             orphan_searches: HashMap::new(),
             browses: HashMap::new(),
+            profiles: HashMap::new(),
             browse_cache: Vec::new(),
             folders: Vec::new(),
             transfers: HashMap::new(),
@@ -287,6 +299,7 @@ impl Worker {
             Command::RescanShares => self.rescan(),
             Command::ApplySettings(s) => self.apply_settings(s),
             Command::SetAudioOnly(on) => self.audio_only = on,
+            Command::UserProfile(username) => self.user_profile(username),
             Command::CancelUpload { username, path } => {
                 match self.session() {
                     Some(s) if s.cancel_upload(&username, &path) => {}
@@ -352,6 +365,7 @@ impl Worker {
             self.poll_search(id);
         }
         self.poll_browses();
+        self.poll_profiles();
         self.poll_folders();
         self.poll_transfers();
         self.poll_uploads();
@@ -465,6 +479,14 @@ impl Worker {
         for (username, b) in std::mem::take(&mut self.browses) {
             if b.user_requested {
                 self.emit(CoreEvent::BrowseFailed {
+                    username,
+                    reason: why.to_string(),
+                });
+            }
+        }
+        for (username, p) in std::mem::take(&mut self.profiles) {
+            if p.sent.is_none() {
+                self.emit(CoreEvent::UserProfileFailed {
                     username,
                     reason: why.to_string(),
                 });
@@ -772,6 +794,74 @@ impl Worker {
                     self.t.browse_timeout.as_secs()
                 );
                 self.browse_failed(u, req.is_some_and(|r| r.user_requested), &why);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- profile
+
+    fn user_profile(&mut self, username: String) {
+        let Some(s) = self.session() else {
+            self.emit(CoreEvent::UserProfileFailed {
+                username,
+                reason: "not connected".into(),
+            });
+            return;
+        };
+        // Both requests drop the previous answer first, so polling only sees fresh replies.
+        let server = s.request_user_info(&username);
+        let peer = s.request_peer_info(&username);
+        if let (Err(e), Err(_)) = (&server, &peer) {
+            let reason = e.clone();
+            self.emit(CoreEvent::UserProfileFailed { username, reason });
+            return;
+        }
+        let deadline = Instant::now() + self.t.profile_timeout;
+        self.profiles.insert(
+            username,
+            ProfileReq {
+                deadline,
+                sent: None,
+            },
+        );
+    }
+
+    fn poll_profiles(&mut self) {
+        let Some(s) = self.session() else { return };
+        let users: Vec<String> = self.profiles.keys().cloned().collect();
+        for u in users {
+            let server = s.user_info(&u);
+            let peer = s.peer_info(&u);
+            let profile = to_profile(server.as_ref(), peer.as_ref());
+            let Some(req) = self.profiles.get_mut(&u) else {
+                continue;
+            };
+            if !profile.is_empty() && req.sent.as_ref() != Some(&profile) {
+                req.sent = Some(profile.clone());
+                self.emit(CoreEvent::UserProfile {
+                    username: u.clone(),
+                    profile: profile.clone(),
+                });
+            }
+            // Done: everything arrived, or the server says offline (no peer answer will come).
+            let server_done = server.as_ref().is_some_and(UserInfo::is_complete);
+            let complete = server_done && (peer.is_some() || profile.online == Some(false));
+            let expired = self
+                .profiles
+                .get(&u)
+                .is_some_and(|r| Instant::now() >= r.deadline);
+            if complete || expired {
+                let req = self.profiles.remove(&u);
+                if req.is_some_and(|r| r.sent.is_none()) {
+                    let reason = format!(
+                        "no answer about {u} within {}s",
+                        self.t.profile_timeout.as_secs()
+                    );
+                    self.emit(CoreEvent::UserProfileFailed {
+                        username: u,
+                        reason,
+                    });
+                }
             }
         }
     }
@@ -1422,6 +1512,26 @@ impl Worker {
             let _ = std::fs::remove_dir_all(&dir);
             self.cache_index.retain(|_, p| !p.starts_with(&dir));
         }
+    }
+}
+
+pub(crate) fn to_profile(server: Option<&UserInfo>, peer: Option<&PeerInfo>) -> UserProfile {
+    let stats = server.and_then(|s| s.stats);
+    UserProfile {
+        online: server
+            .and_then(|s| s.presence)
+            .map(|p| p.status != UserStatus::Offline),
+        avg_speed: stats.map(|s| s.average_speed),
+        shared_files: stats.map(|s| s.shared_files),
+        shared_dirs: stats.map(|s| s.shared_folders),
+        description: peer.map(|p| p.description.clone()),
+        // The pinned library skips the picture bytes (only their length is kept).
+        picture: None,
+        // The first int after the picture is the peer's upload slot count
+        // (soulseek-rs names it `total_uploads`; Nicotine+ sends its slots there).
+        upload_slots: peer.map(|p| p.total_uploads),
+        free_slot: peer.map(|p| p.slots_free),
+        queue_size: peer.map(|p| p.queue_size),
     }
 }
 

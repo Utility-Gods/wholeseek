@@ -4,13 +4,16 @@ use crate::core::Core;
 use crate::event::{CoreEvent, DisconnectReason};
 use crate::model::{
     AudioAttrs, Credentials, RemoteFile, Settings, TransferId, TransferKind, UploadState,
+    UserProfile,
 };
 use crate::net::{ConnectParams, Connector, LoginError, Session};
 use crate::worker::Tunables;
+use soulseek_rs::message::peer::PeerInfo;
 use soulseek_rs::{
     DownloadStatus, File, SearchResult, SessionLoss, SharedDirectory, SharedFileEntry, UploadInfo,
     UploadStatus,
 };
+use soulseek_rs::{UserInfo, UserPresence, UserStats, UserStatus};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +44,9 @@ struct FakeState {
     uploads: Vec<UploadInfo>,
     upload_cancels: Vec<(String, String)>,
     share_sets: Vec<Vec<String>>,
+    user_infos: HashMap<String, UserInfo>,
+    peer_infos: HashMap<String, PeerInfo>,
+    profile_requests: Vec<String>,
     slots: usize,
 }
 
@@ -159,6 +165,22 @@ impl Session for FakeSession {
         self.st().upload_cancels.push((u.into(), p.into()));
         true
     }
+    fn request_user_info(&self, u: &str) -> Result<(), String> {
+        let mut st = self.st();
+        st.user_infos.remove(u);
+        st.profile_requests.push(u.to_string());
+        Ok(())
+    }
+    fn user_info(&self, u: &str) -> Option<UserInfo> {
+        self.st().user_infos.get(u).cloned()
+    }
+    fn request_peer_info(&self, u: &str) -> Result<(), String> {
+        self.st().peer_infos.remove(u);
+        Ok(())
+    }
+    fn peer_info(&self, u: &str) -> Option<PeerInfo> {
+        self.st().peer_infos.get(u).cloned()
+    }
     fn set_upload_slots(&self, n: usize) {
         self.st().slots = n;
     }
@@ -200,6 +222,7 @@ fn tunables() -> Tunables {
         play_start_timeout: Duration::from_millis(400),
         queue_place_after: Duration::from_millis(50),
         uploads_every: Duration::from_millis(20),
+        profile_timeout: Duration::from_millis(300),
         backoff: |_| Duration::from_millis(30),
     }
 }
@@ -1053,4 +1076,168 @@ fn uploads_snapshot_and_cancel() {
     assert_eq!(rows[0].bytes_sent, 5);
     h.core.cancel_upload("peer", r"music\a.flac");
     wait_until("cancelled", || s.st().upload_cancels.len() == 1);
+}
+
+// ------------------------------------------------------------------- profile
+
+fn server_info(u: &str, status: Option<UserStatus>, stats: Option<(u32, u32, u32)>) -> UserInfo {
+    let mut i = UserInfo::pending(u.to_string());
+    i.presence = status.map(|status| UserPresence {
+        status,
+        privileged: false,
+    });
+    i.stats = stats.map(|(average_speed, shared_files, shared_folders)| UserStats {
+        average_speed,
+        shared_files,
+        shared_folders,
+    });
+    i
+}
+
+fn is_profile(e: &CoreEvent) -> bool {
+    matches!(
+        e,
+        CoreEvent::UserProfile { .. } | CoreEvent::UserProfileFailed { .. }
+    )
+}
+
+#[test]
+fn profile_merges_server_and_peer_parts_as_they_arrive() {
+    let h = harness();
+    let s = h.online();
+    h.core.user_profile("bob");
+    wait_until("requested", || s.st().profile_requests == ["bob"]);
+    s.st().user_infos.insert(
+        "bob".into(),
+        server_info("bob", Some(UserStatus::Away), None),
+    );
+    let e = h.want("presence", is_profile);
+    let expect1 = UserProfile {
+        online: Some(true),
+        ..UserProfile::default()
+    };
+    assert_eq!(
+        e,
+        CoreEvent::UserProfile {
+            username: "bob".into(),
+            profile: expect1
+        }
+    );
+
+    s.st().user_infos.insert(
+        "bob".into(),
+        server_info("bob", Some(UserStatus::Away), Some((1000, 50, 4))),
+    );
+    s.st().peer_infos.insert(
+        "bob".into(),
+        PeerInfo {
+            description: "flac only".into(),
+            picture_bytes: Some(10),
+            total_uploads: 3,
+            queue_size: 9,
+            slots_free: false,
+            upload_allowed: Some(1),
+        },
+    );
+    let CoreEvent::UserProfile { profile, .. } = h.want(
+        "full",
+        |e| matches!(e, CoreEvent::UserProfile { profile, .. } if profile.description.is_some()),
+    ) else {
+        unreachable!()
+    };
+    assert_eq!(
+        profile,
+        UserProfile {
+            online: Some(true),
+            avg_speed: Some(1000),
+            shared_files: Some(50),
+            shared_dirs: Some(4),
+            description: Some("flac only".into()),
+            picture: None,
+            upload_slots: Some(3),
+            free_slot: Some(false),
+            queue_size: Some(9),
+        }
+    );
+    // Complete → no further events, no failure at the deadline.
+    h.none_within(Duration::from_millis(400), is_profile);
+}
+
+#[test]
+fn profile_with_server_stats_only_is_partial_not_failed() {
+    let h = harness();
+    let s = h.online();
+    h.core.user_profile("carol");
+    wait_until("requested", || !s.st().profile_requests.is_empty());
+    s.st().user_infos.insert(
+        "carol".into(),
+        server_info("carol", Some(UserStatus::Online), Some((5, 6, 7))),
+    );
+    let CoreEvent::UserProfile { profile, .. } = h.want(
+        "stats",
+        |e| matches!(e, CoreEvent::UserProfile { profile, .. } if profile.shared_files.is_some()),
+    ) else {
+        unreachable!()
+    };
+    assert_eq!(profile.online, Some(true));
+    assert_eq!(
+        (profile.avg_speed, profile.shared_files, profile.shared_dirs),
+        (Some(5), Some(6), Some(7))
+    );
+    assert_eq!(
+        (profile.description, profile.upload_slots, profile.free_slot),
+        (None, None, None)
+    );
+    // The peer never answers: the timeout passes without UserProfileFailed.
+    h.none_within(Duration::from_millis(400), |e| {
+        matches!(e, CoreEvent::UserProfileFailed { .. })
+    });
+}
+
+#[test]
+fn offline_user_finishes_without_waiting_for_the_peer() {
+    let h = harness();
+    let s = h.online();
+    h.core.user_profile("ghost");
+    wait_until("requested", || !s.st().profile_requests.is_empty());
+    s.st().user_infos.insert(
+        "ghost".into(),
+        server_info("ghost", Some(UserStatus::Offline), Some((0, 0, 0))),
+    );
+    let CoreEvent::UserProfile { profile, .. } = h.want("profile", is_profile) else {
+        unreachable!()
+    };
+    assert_eq!(profile.online, Some(false));
+    h.none_within(Duration::from_millis(400), is_profile);
+}
+
+#[test]
+fn profile_fails_on_timeout_and_when_offline() {
+    let h = harness();
+    h.core.user_profile("dave");
+    assert_eq!(
+        h.want("not connected", is_profile),
+        CoreEvent::UserProfileFailed {
+            username: "dave".into(),
+            reason: "not connected".into()
+        }
+    );
+    let _s = h.online();
+    h.core.user_profile("dave");
+    let e = h.want("timeout", is_profile);
+    assert!(
+        matches!(e, CoreEvent::UserProfileFailed { ref username, .. } if username == "dave"),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn profile_pending_at_session_loss_fails() {
+    let h = harness();
+    let s = h.online();
+    h.core.user_profile("erin");
+    wait_until("requested", || !s.st().profile_requests.is_empty());
+    s.st().loss = Some(SessionLoss::Displaced);
+    let e = h.want("failed", is_profile);
+    assert!(matches!(e, CoreEvent::UserProfileFailed { .. }), "{e:?}");
 }

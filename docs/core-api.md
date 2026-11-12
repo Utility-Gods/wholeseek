@@ -166,6 +166,7 @@ No separate rescan call: rescan = `set_shared_directories(same dirs)`.
 | G12 | Listener silently falls back to an ephemeral port if the configured one is busy. | UPnP/forwarding mismatch. | Report the bound port in `Connected { listen_port }`; settings shows it. |
 | G13 | Library logger writes ANSI to stderr by default. | Noise in a GUI. | App sets `LOG_FILE` (e.g. `~/.cache/goalseek/slsk.log`) or `logger::set_log_level`. |
 | G14 | Folder contents are keyed by the folder string the peer echoes. | Lookup could miss if a peer echoes a different spelling. | Fall back to the peer's full browse listing. |
+| G15 | Peer UserInfo picture bytes are parsed past and dropped (`PeerInfo::picture_bytes` is only a length). | Profile header cannot show the peer's picture. | `UserProfile.picture` stays `None`; needs an upstream change to keep the bytes (with a cap). |
 
 ### 2.1 CP1 status per gap
 
@@ -185,6 +186,7 @@ No separate rescan call: rescan = `set_shared_directories(same dirs)`.
 | G12 | **Done** | `Connected { listen_port }` = bound port; port mapping uses it. |
 | G13 | **Done** | `goalseek_core::config::init_logging(&default_log_path())` (unsafe: call first in `main`) → `~/.cache/goalseek/slsk.log`, Info level. |
 | G14 | **Done** | Folder contents: exact (case/slash-insensitive) match, else the whole reply; no reply within 30 s → full browse of the user, then the folder is picked from it. |
+| G15 | Open (upstream) | See §3.4; everything else in the profile is served. |
 
 ---
 
@@ -214,6 +216,7 @@ impl Core {
     // additive (CP1)
     pub fn set_audio_only(&self, on: bool);      // search batch filter, default on
     pub fn cancel_upload(&self, username: &str, path: &str);  // then an Uploads snapshot
+    pub fn user_profile(&self, username: &str);  // → UserProfile* events (§3.4)
 }
 
 // src/event.rs
@@ -236,10 +239,12 @@ pub enum CoreEvent {
     Error { context, message },
     // additive (CP1)
     PortMapping { port: u16, outcome: PortMapOutcome /* Mapped { method, external: Option<String> } | Unavailable(String) */ },
+    UserProfile { username: String, profile: UserProfile },        // may repeat; each = all known so far
+    UserProfileFailed { username: String, reason: String },        // only if nothing at all came back
 }
 ```
 
-`Command` gained `SetAudioOnly(bool)` and `CancelUpload { username, path }` (additive).
+`Command` gained `SetAudioOnly(bool)`, `CancelUpload { username, path }` and `UserProfile(String)` (additive).
 
 Data (`src/model.rs`): `RemoteFile { username, path, size, attrs: AudioAttrs }`,
 `SearchHit { file, free_slot, speed }`, `BrowseDir { path, files }`, `UploadRow`, `Settings`
@@ -304,6 +309,43 @@ pub unsafe fn init_logging(&Path) -> io::Result<()>;  // G13; first thing in mai
   `credentials: None`; `save_credentials` → `Err(KeyringUnavailable(msg))` (username is still saved).
 - `Settings::default()`: downloads `$XDG_DOWNLOAD_DIR/goalseek`, cache `$XDG_CACHE_HOME/goalseek`,
   cap 1 GiB, port 2234, 10 upload slots, port mapping on.
+
+### 3.4 User profile (additive)
+
+```rust
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UserProfile {
+    pub online: Option<bool>,          // server presence (away counts as online)
+    pub avg_speed: Option<u32>,        // B/s, server stats
+    pub shared_files: Option<u32>,
+    pub shared_dirs: Option<u32>,
+    pub description: Option<String>,   // peer UserInfo reply
+    pub picture: Option<Vec<u8>>,      // raw image bytes from peer, if any
+    pub upload_slots: Option<u32>,
+    pub free_slot: Option<bool>,
+    pub queue_size: Option<u32>,
+}
+```
+
+- `Core::user_profile(u)` sends `Client::request_user_info` (server GetUserStatus + GetUserStats)
+  and `Client::request_peer_info` (peer UserInfoRequest, code 15) — both exist at the pinned rev,
+  no lib changes. Both drop the previous answer first, so polling sees only fresh replies.
+- The worker polls `user_info(u)` / `peer_info(u)` each tick and emits `UserProfile` whenever the
+  merged snapshot changes (non-empty). Finished when server presence + stats are in and either the
+  peer answered or the server says the user is offline (no peer answer will come). Timeout 10 s:
+  if nothing at all arrived → `UserProfileFailed { reason }`; if something did, no failure event
+  (the last `UserProfile` stands, with `None` for missing parts). Offline → immediate
+  `UserProfileFailed { reason: "not connected" }`; pending requests at session loss fail the same way.
+- Field mapping: `online = status != Offline`; `avg_speed/shared_files/shared_dirs` from
+  `UserStats`; `description`, `free_slot = slots_free`, `queue_size` from `PeerInfo`;
+  `upload_slots` = `PeerInfo::total_uploads` (the wire field after the picture is the peer's upload
+  slot count; Nicotine+ shows it as "upload slots" and soulseek-rs itself sends its slot count there).
+- **Gap G15 — `picture` is always `None`** at the pinned rev: `UserInfoResponseHandler` skips the image
+  bytes and keeps only `picture_bytes: Option<usize>`. Surfacing it needs an upstream change
+  (keep the bytes, with a size cap); not forked here.
+- Our side: the library already answers peers' UserInfoRequest itself (`ClientOperation::UserInfoRequested`
+  → `build_user_info(upload_slots, upload queue length, has free slot)`, empty description, no
+  picture). Nothing to do in goalseek-core.
 
 ### 3.3 Tests
 

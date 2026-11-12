@@ -5,6 +5,7 @@ mod main_view;
 mod onboarding;
 mod panels;
 mod player;
+mod profile;
 
 use rune::tok::{self, TextStyle, Theme, type_};
 use rune::{Color, Cursor, Cx, El, TextEdit, col, el, oklch, row, text};

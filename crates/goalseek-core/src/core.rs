@@ -67,6 +67,8 @@ pub enum Command {
         username: String,
         path: String,
     },
+    /// Additive: fetch a user's profile (server stats + peer UserInfo).
+    UserProfile(String),
     Shutdown,
 }
 
@@ -245,6 +247,14 @@ impl Core {
             username: username.to_string(),
             path: path.to_string(),
         });
+    }
+
+    /// Additive: ask the server (presence, stats) and the peer (description,
+    /// slots, queue) about `username`. Answers arrive as one or more
+    /// `CoreEvent::UserProfile`, or `UserProfileFailed` if nothing came back
+    /// within 10 s.
+    pub fn user_profile(&self, username: &str) {
+        self.send(Command::UserProfile(username.to_string()));
     }
 
     /// Apply new settings. A changed listen port reconnects the session.

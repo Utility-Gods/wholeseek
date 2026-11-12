@@ -12,6 +12,7 @@ mod backend;
 mod demo;
 mod fmt;
 mod playback;
+mod profile;
 mod store;
 mod view;
 
@@ -62,6 +63,7 @@ pub fn poll(s: &mut App, t: f64, tx: &mut Tx) -> bool {
 
 fn setup(s: &mut App, wake: rune::Waker) {
     s.store.set_waker(wake.clone());
+    s.profiles.set_waker(wake.clone());
     s.backend.set_waker(wake);
 }
 
@@ -108,6 +110,18 @@ fn scene_browse(s: &mut App) {
     let f = demo_file("alice", "03 Low Tide Radio.flac");
     s.download(&f);
     s.open_folder_of(&f);
+}
+
+/// Browse alice: picture, stats, long description (clamped).
+fn scene_browse_profile(s: &mut App) {
+    s.demo_search();
+    s.open_user("alice");
+}
+
+/// Browse vinyl_rips: stats only.
+fn scene_browse_profile_minimal(s: &mut App) {
+    s.demo_search();
+    s.open_user("vinyl_rips");
 }
 
 fn scene_transfers(s: &mut App) {
@@ -175,6 +189,8 @@ fn main() {
             ("onboarding-error", scene_onboarding_error),
             ("rejected", scene_rejected),
             ("uploads", scene_uploads),
+            ("browse-profile", scene_browse_profile),
+            ("browse-profile-minimal", scene_browse_profile_minimal),
             ("no-keyring", scene_no_keyring),
         ],
         min_size: Some((820.0, 520.0)),

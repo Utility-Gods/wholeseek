@@ -27,6 +27,8 @@ pub trait Backend {
     fn rescan_shares(&mut self);
     fn apply_settings(&mut self, settings: Settings);
     fn cancel_upload(&mut self, username: &str, path: &str);
+    /// Ask for a peer's profile; answers arrive as `UserProfile` / `UserProfileFailed`.
+    fn user_profile(&mut self, username: &str);
     fn set_audio_only(&mut self, on: bool);
     /// Every event ready now. Never blocks. `now` is the frame clock (virtual when headless).
     fn drain(&mut self, now: f64) -> Vec<CoreEvent>;
@@ -103,6 +105,9 @@ impl Backend for RealBackend {
     }
     fn cancel_upload(&mut self, username: &str, path: &str) {
         self.core.cancel_upload(username, path);
+    }
+    fn user_profile(&mut self, username: &str) {
+        self.core.user_profile(username);
     }
     fn set_audio_only(&mut self, on: bool) {
         self.core.set_audio_only(on);

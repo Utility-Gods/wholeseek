@@ -2,7 +2,7 @@
 //! each frame and never blocks on the core.
 
 use crate::model::{
-    BrowseDir, RemoteFile, SearchHit, SearchId, TransferId, TransferKind, UploadRow,
+    BrowseDir, RemoteFile, SearchHit, SearchId, TransferId, TransferKind, UploadRow, UserProfile,
 };
 use std::path::PathBuf;
 
@@ -123,6 +123,20 @@ pub enum CoreEvent {
     PortMapping {
         port: u16,
         outcome: PortMapOutcome,
+    },
+
+    /// Answer to [`crate::Core::user_profile`]. May be sent several times as
+    /// parts arrive; each carries everything known so far. Additive.
+    UserProfile {
+        username: String,
+        profile: UserProfile,
+    },
+
+    /// Nothing at all about the user could be fetched (not connected, or no
+    /// server or peer answer within the timeout). Additive.
+    UserProfileFailed {
+        username: String,
+        reason: String,
     },
 
     /// A command could not be carried out (bad state, I/O error), or a

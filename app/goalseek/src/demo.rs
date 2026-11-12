@@ -15,7 +15,8 @@ use std::rc::Rc;
 use goalseek_audio::{PlayState, PlayerSnapshot, SeekError};
 use goalseek_core::{
     AudioAttrs, BrowseDir, CoreEvent, Credentials, DisconnectReason, PlayTicket, RemoteFile,
-    SearchHit, SearchId, Settings, TransferId, TransferKind, UploadRow, UploadState, paths, rank,
+    SearchHit, SearchId, Settings, TransferId, TransferKind, UploadRow, UploadState, UserProfile,
+    paths, rank,
 };
 
 use crate::backend::Backend;
@@ -38,6 +39,7 @@ pub enum Call {
     RescanShares,
     ApplySettings(Settings),
     CancelUpload(String, String),
+    UserProfile(String),
     SetAudioOnly(bool),
 }
 
@@ -773,6 +775,13 @@ impl Backend for DemoBackend {
         }
     }
 
+    fn user_profile(&mut self, username: &str) {
+        self.calls.push(Call::UserProfile(username.into()));
+        for (delay, e) in demo_profile(username) {
+            self.at(delay, e);
+        }
+    }
+
     fn set_audio_only(&mut self, on: bool) {
         self.calls.push(Call::SetAudioOnly(on));
         self.audio_only = on;
@@ -936,4 +945,89 @@ impl Playback for FakePlayer {
             _ => {}
         }
     }
+}
+
+/// The demo's profile answers: server stats first, then the peer's description (and picture),
+/// as the real core sends them.
+///
+/// - alice: everything, picture included (a PNG).
+/// - vinyl_rips: stats only.
+/// - marten_k: no free slot, queue 12, short description.
+/// - dj_ivo: picture bytes no decoder accepts (the header skips the thumbnail).
+/// - nightbus (folders browse fine), ghost and unknown users: failure.
+pub fn demo_profile(username: &str) -> Vec<(f64, CoreEvent)> {
+    // nightbus shares folders but answers nothing about itself.
+    let peer = PEERS
+        .iter()
+        .find(|p| p.name == username && p.name != "nightbus");
+    let Some(peer) = peer else {
+        return vec![(
+            0.6,
+            CoreEvent::UserProfileFailed {
+                username: username.into(),
+                reason: "no answer from the server or the peer".into(),
+            },
+        )];
+    };
+    let files = catalog().iter().filter(|f| f.username == username).count() as u32;
+    let stats = UserProfile {
+        online: Some(true),
+        avg_speed: Some(peer.speed),
+        shared_files: Some(files * 1_637 + 3),
+        shared_dirs: Some(files * 168 + 4),
+        ..UserProfile::default()
+    };
+    let mut full = UserProfile {
+        free_slot: Some(peer.free_slot),
+        upload_slots: Some(3),
+        queue_size: Some(if peer.free_slot { 0 } else { 12 }),
+        ..stats.clone()
+    };
+    match username {
+        "alice" => {
+            full.description = Some(
+                "Lossless only, mostly ambient, post-rock and old Warp records. Ripped from my own \
+                 CDs with EAC, logs and cues included.\n\n\
+                 Please don't queue whole discographies at once — take what you like and share \
+                 back.\n\
+                 Slow upload in the evenings: the house is on a long DSL line.\n\
+                 Requests by message, I check on weekends."
+                    .into(),
+            );
+            full.picture = Some(include_bytes!("../assets/demo-avatar.png").to_vec());
+        }
+        "vinyl_rips" => {
+            return vec![(
+                0.3,
+                CoreEvent::UserProfile {
+                    username: username.into(),
+                    profile: stats,
+                },
+            )];
+        }
+        "marten_k" => {
+            full.description = Some("24/96 needle drops. Be patient with the queue.".into())
+        }
+        "dj_ivo" => {
+            full.description = Some("Mixes and edits.".into());
+            full.picture = Some(b"not an image".to_vec());
+        }
+        _ => {}
+    }
+    vec![
+        (
+            0.3,
+            CoreEvent::UserProfile {
+                username: username.into(),
+                profile: stats,
+            },
+        ),
+        (
+            0.7,
+            CoreEvent::UserProfile {
+                username: username.into(),
+                profile: full,
+            },
+        ),
+    ]
 }

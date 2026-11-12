@@ -83,6 +83,35 @@ pub struct SearchHit {
 }
 
 /// One folder of a browsed user's shares; `files` are direct children.
+/// What is known about another user (header of a browse). Server parts
+/// (presence, stats) and peer parts (description, slots, queue) arrive
+/// separately; `None` = not (yet) known.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UserProfile {
+    /// Server presence (away counts as online).
+    pub online: Option<bool>,
+    /// B/s, server stats.
+    pub avg_speed: Option<u32>,
+    pub shared_files: Option<u32>,
+    pub shared_dirs: Option<u32>,
+    /// Peer UserInfo reply.
+    pub description: Option<String>,
+    /// Raw image bytes from the peer, if any. Always `None` with the pinned
+    /// soulseek-rs, which parses past the picture without keeping it.
+    pub picture: Option<Vec<u8>>,
+    pub upload_slots: Option<u32>,
+    pub free_slot: Option<bool>,
+    pub queue_size: Option<u32>,
+}
+
+impl UserProfile {
+    /// Nothing known at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowseDir {
     /// Full virtual path (`Music\Album (2019)`).

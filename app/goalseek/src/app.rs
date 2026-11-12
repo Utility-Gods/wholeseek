@@ -16,6 +16,7 @@ use rune::TextEdit;
 use crate::backend::{Backend, RealBackend};
 use crate::demo::{DemoBackend, FakePlayer, World};
 use crate::playback::{Playback, RealPlayer};
+use crate::profile::Profiles;
 use crate::store::{MemoryStore, RealStore, Store, StoreNote};
 
 /// Results drawn at most; the rest are counted ("showing 300 of 4 120").
@@ -159,6 +160,8 @@ pub struct App {
     /// Credentials typed in onboarding, saved once the server accepts them.
     pending_credentials: Option<Credentials>,
     pub audio_only: bool,
+    /// Peer profiles by username (one per open user view).
+    pub profiles: Profiles,
 }
 
 /// What `config::load()` found at startup (real mode).
@@ -212,6 +215,7 @@ impl App {
             keyring_available: startup.keyring_available,
             pending_credentials: None,
             audio_only: true,
+            profiles: Profiles::default(),
         };
         // A remembered account skips onboarding and signs straight in.
         if let Some(c) = startup.credentials {
@@ -379,6 +383,12 @@ impl App {
                         }
                     }
                 }
+            }
+            CoreEvent::UserProfile { username, profile } => {
+                self.profiles.loaded(&username, profile);
+            }
+            CoreEvent::UserProfileFailed { username, reason } => {
+                self.profiles.failed(&username, reason);
             }
             CoreEvent::BrowseFailed { username, reason } => {
                 if let Some(b) = self.browse.as_mut().filter(|b| b.username == username) {
@@ -599,7 +609,12 @@ impl App {
     }
 
     pub fn open_user(&mut self, username: &str) {
+        if let Some(old) = self.browse.as_ref().map(|b| b.username.clone()) {
+            self.profiles.forget(&old);
+        }
         self.backend.browse(username);
+        self.backend.user_profile(username);
+        self.profiles.requested(username);
         self.browse = Some(BrowseView {
             username: username.to_string(),
             dirs: None,
@@ -618,7 +633,9 @@ impl App {
     }
 
     pub fn back(&mut self) {
-        self.browse = None;
+        if let Some(b) = self.browse.take() {
+            self.profiles.forget(&b.username);
+        }
     }
 
     // ---- play & download -----------------------------------------------------------------
