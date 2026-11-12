@@ -63,7 +63,7 @@ impl App {
         if self
             .playing
             .as_ref()
-            .is_some_and(|p| &p.file == file && p.failed.is_none())
+            .is_some_and(|p| crate::tabs::same_file(&p.file, file) && p.failed.is_none())
         {
             self.toggle_pause();
             return;
@@ -73,7 +73,7 @@ impl App {
             .filter(|f| crate::tabs::is_playable(f))
             .cloned()
             .collect();
-        let start = match files.iter().position(|f| f == file) {
+        let start = match files.iter().position(|f| crate::tabs::same_file(f, file)) {
             Some(i) => i,
             None => {
                 files = vec![file.clone()];
@@ -124,7 +124,8 @@ impl App {
             .folder_files(username, folder)
             .iter()
             .any(crate::tabs::is_playable);
-        crate::menu::folder_items(username, folder, playable)
+        let recent = &self.backend.settings().recent_download_dirs;
+        crate::menu::folder_items(username, folder, playable, recent)
     }
 
     /// The files of a remote folder as far as the app knows them, in natural name order
@@ -156,6 +157,7 @@ impl App {
 
     fn start_queue(&mut self, files: Vec<RemoteFile>, start: usize) {
         self.stop_current();
+        self.play_from = Some(self.tab().id);
         let items: Vec<QItem> = files
             .into_iter()
             .map(|f| QItem {

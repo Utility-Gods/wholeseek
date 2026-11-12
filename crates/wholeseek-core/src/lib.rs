@@ -7,8 +7,10 @@
 pub mod cache;
 pub mod config;
 mod core;
+pub mod cover;
 mod event;
 pub mod group;
+pub mod history;
 mod model;
 mod net;
 pub mod paths;
@@ -20,7 +22,9 @@ mod worker;
 
 pub use crate::core::{Command, Core, NOT_IMPLEMENTED, POLL_TICK};
 pub use crate::worker::PLAY_STALLED;
+pub use cover::{CoverState, Covers};
 pub use event::{CoreEvent, DisconnectReason, PortMapOutcome};
+pub use history::{DownloadedKeys, HistoryEntry, HistoryQuery, Outcome};
 pub use model::{
     AudioAttrs, BrowseDir, Credentials, PlayTicket, RemoteFile, SearchHit, SearchId, Settings,
     TransferId, TransferKind, UploadRow, UploadState, UserProfile,

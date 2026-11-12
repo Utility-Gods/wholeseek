@@ -276,6 +276,7 @@ fn harness_tuned(t: Tunables, f: impl FnOnce(&mut Settings, &Path)) -> H {
     let mut settings = Settings {
         download_dir: tmp.path().join("downloads"),
         cache_dir: tmp.path().join("cache"),
+        data_dir: tmp.path().join("data"),
         port_mapping: false,
         ..Settings::default()
     };
@@ -833,7 +834,7 @@ fn download_during_play_is_promoted_not_refetched() {
     let p = done_path(h.want("play done", is_done(t.id)));
     assert_eq!(p, t.final_path);
     let dl = done_path(h.want("dl done", is_done(d)));
-    assert_eq!(dl, h.downloads_dir().join("Album").join("01.flac"));
+    assert_eq!(dl, h.downloads_dir().join("01.flac"), "flat by default");
     assert_eq!(std::fs::read(&dl).unwrap(), b"abcd");
     assert!(t.final_path.exists(), "cache copy stays for the player");
     assert_eq!(s.st().downloads.len(), 1, "only one library transfer");
@@ -888,6 +889,7 @@ fn cache_index_survives_restart() {
     let settings = Settings {
         download_dir: tmp.path().join("downloads"),
         cache_dir: tmp.path().join("cache"),
+        data_dir: tmp.path().join("data"),
         port_mapping: false,
         ..Settings::default()
     };
@@ -964,7 +966,7 @@ fn play_attached_to_running_download_gets_its_own_growing_link() {
     s.complete(0);
     assert_eq!(done_path(h.want("play done", is_done(t.id))), t.final_path);
     let dl = done_path(h.want("dl done", is_done(d)));
-    assert!(dl.starts_with(h.downloads_dir().join("Album")));
+    assert_eq!(dl.parent().unwrap(), h.downloads_dir());
     wait_until("staging cleaned up", || {
         !h.downloads_dir()
             .join(crate::paths::STAGING_DIR_NAME)
@@ -1753,6 +1755,7 @@ fn share_status_is_filled_at_startup_without_login() {
     let settings = Settings {
         download_dir: tmp.path().join("downloads"),
         cache_dir: tmp.path().join("cache"),
+        data_dir: tmp.path().join("data"),
         share_dirs: vec![a.clone()],
         port_mapping: false,
         ..Settings::default()
@@ -2016,7 +2019,8 @@ fn wishlist_respects_a_longer_server_interval() {
 
 #[test]
 fn download_to_another_folder_keeps_layout_staging_and_collision_rules() {
-    let mut h = harness();
+    // With the album-subfolder setting on (flat is covered below).
+    let mut h = harness_with(|s, _| s.single_file_subfolder = true);
     let s = h.online();
     let elsewhere = h.tmp.path().join("other disk");
     // An existing file with the same name: the new one gets a unique name, as
@@ -2058,10 +2062,10 @@ fn download_to_another_folder_keeps_layout_staging_and_collision_rules() {
         !h.downloads_dir().join("Album").exists(),
         "nothing in the default dir"
     );
-    assert!(
-        std::fs::read_dir(&staging).map_or(true, |mut d| d.next().is_none()),
-        "staging cleaned"
-    );
+    // Cleanup may land just after the event.
+    wait_until("staging cleaned", || {
+        std::fs::read_dir(&staging).map_or(true, |mut d| d.next().is_none())
+    });
     assert_eq!(h.core.settings().recent_download_dirs, [elsewhere]);
 }
 
@@ -2137,4 +2141,235 @@ fn recent_download_dirs_are_mru_capped_at_five() {
         .map(|p| p.to_str().unwrap())
         .collect();
     assert_eq!(got, ["c", "f", "e", "d", "b"]);
+}
+
+// ------------------------------------------------ single-file subfolder setting
+
+#[test]
+fn single_downloads_are_flat_by_default_and_never_overwrite() {
+    let h = harness();
+    let s = h.online();
+    assert!(!h.core.settings().single_file_subfolder);
+    let a = h.core.download(&rfile(r"Music\Album A\01.flac", 1));
+    let b = h.core.download(&rfile(r"Music\Album B\01.flac", 1));
+    wait_until("2 lib downloads", || s.st().downloads.len() == 2);
+    for i in 0..2 {
+        s.progress(i, b"x", 1);
+        s.complete(i);
+    }
+    let pa = done_path(h.want(
+        "a done",
+        |e| matches!(e, CoreEvent::TransferDone { id, .. } if *id == a || *id == b),
+    ));
+    let pb = done_path(h.want(
+        "b done",
+        |e| matches!(e, CoreEvent::TransferDone { id, .. } if *id == a || *id == b),
+    ));
+    assert_eq!(pa.parent().unwrap(), h.downloads_dir());
+    assert_eq!(pb.parent().unwrap(), h.downloads_dir());
+    assert_ne!(
+        pa, pb,
+        "same name from two albums: unique name, no overwrite"
+    );
+    let mut names = vec![
+        pa.file_name().unwrap().to_owned(),
+        pb.file_name().unwrap().to_owned(),
+    ];
+    names.sort();
+    assert_eq!(names, ["01 (2).flac", "01.flac"]);
+    assert!(!h.downloads_dir().join("Album A").exists());
+}
+
+#[test]
+fn single_download_uses_the_album_folder_when_the_setting_is_on() {
+    let h = harness_with(|s, _| s.single_file_subfolder = true);
+    let s = h.online();
+    let id = h.core.download(&rfile(r"Music\Album A\01.flac", 1));
+    wait_until("lib download", || s.st().downloads.len() == 1);
+    s.progress(0, b"x", 1);
+    s.complete(0);
+    assert_eq!(
+        done_path(h.want("done", is_done(id))),
+        h.downloads_dir().join("Album A").join("01.flac")
+    );
+}
+
+#[test]
+fn keeping_a_cached_play_follows_the_setting() {
+    for on in [false, true] {
+        let h = harness_with(|s, _| s.single_file_subfolder = on);
+        let s = h.online();
+        let f = rfile(r"Music\Album\01.flac", 2);
+        let t = h.core.play_fetch(&f);
+        wait_until("lib download", || s.st().downloads.len() == 1);
+        s.progress(0, b"ab", 2);
+        s.complete(0);
+        h.want("play done", is_done(t.id));
+        let d = h.core.download(&f);
+        let p = done_path(h.want("kept", is_done(d)));
+        let want = if on {
+            h.downloads_dir().join("Album").join("01.flac")
+        } else {
+            h.downloads_dir().join("01.flac")
+        };
+        assert_eq!(p, want, "single_file_subfolder = {on}");
+        assert_eq!(s.st().downloads.len(), 1, "from the cache, not refetched");
+    }
+}
+
+#[test]
+fn folder_and_album_downloads_always_keep_the_folder() {
+    let mut h = harness(); // single_file_subfolder = false
+    let s = h.online();
+    s.st().folders.insert(
+        ("alice".into(), r"Music\Album".into()),
+        vec![dir(r"Music\Album", &["01.flac"])],
+    );
+    h.core.download_folder("alice", r"Music\Album");
+    wait_until("folder download", || s.st().downloads.len() == 1);
+    let elsewhere = h.tmp.path().join("usb");
+    let t = h
+        .core
+        .download_album_file(&rfile(r"Music\Other\02.flac", 1), None);
+    let u = h
+        .core
+        .download_album_file(&rfile(r"Music\Other\03.flac", 1), Some(&elsewhere));
+    wait_until("3 downloads", || s.st().downloads.len() == 3);
+    for i in 0..3 {
+        s.progress(i, b"x", 1);
+        s.complete(i);
+    }
+    let mut got: Vec<PathBuf> = (0..3)
+        .map(|_| done_path(h.want("done", |e| matches!(e, CoreEvent::TransferDone { .. }))))
+        .collect();
+    got.sort();
+    let mut want = vec![
+        h.downloads_dir().join("Album").join("01.flac"),
+        h.downloads_dir().join("Other").join("02.flac"),
+        elsewhere.join("Other").join("03.flac"),
+    ];
+    want.sort();
+    assert_eq!(got, want);
+    let _ = (t, u);
+    assert_eq!(h.core.settings().recent_download_dirs, [elsewhere]);
+}
+
+// ------------------------------------------------------------ download history
+
+fn history(h: &H) -> Vec<crate::history::HistoryEntry> {
+    h.core.history(&crate::history::HistoryQuery::default())
+}
+
+#[test]
+fn history_records_downloads_and_kept_plays_but_not_plain_plays() {
+    use crate::history::Outcome;
+    let h = harness();
+    let s = h.online();
+    // ▶ only: cache, not history.
+    let play = rfile(r"Music\Album\01.flac", 2);
+    let t = h.core.play_fetch(&play);
+    wait_until("play fetch", || s.st().downloads.len() == 1);
+    s.progress(0, b"ab", 2);
+    s.complete(0);
+    h.want("play done", is_done(t.id));
+    assert!(history(&h).is_empty(), "plain ▶ is not history");
+    assert!(!h.core.was_downloaded("alice", r"Music\Album\01.flac"));
+    // ▶ kept (↓ from the cache): history.
+    let k = h.core.download(&play);
+    let kept = done_path(h.want("kept", is_done(k)));
+    // A fresh ↓.
+    let f = RemoteFile {
+        attrs: crate::model::AudioAttrs {
+            bitrate_kbps: Some(320),
+            ..Default::default()
+        },
+        ..rfile(r"Music\Other\02.mp3", 1)
+    };
+    let d = h.core.download(&f);
+    wait_until("lib download", || s.st().downloads.len() == 2);
+    s.progress(1, b"x", 1);
+    s.complete(1);
+    let got = done_path(h.want("done", is_done(d)));
+    let all = history(&h);
+    assert_eq!(all.len(), 2);
+    let (new, old) = (&all[0], &all[1]);
+    assert_eq!(
+        new.local_path.as_deref(),
+        Some(got.as_path()),
+        "newest first"
+    );
+    assert_eq!((new.format.as_str(), new.album.as_str()), ("mp3", "Other"));
+    assert_eq!(
+        (new.size, new.bitrate_kbps, new.outcome),
+        (1, Some(320), Outcome::Done)
+    );
+    assert_eq!(old.local_path.as_deref(), Some(kept.as_path()));
+    assert!(new.exists_on_disk());
+    std::fs::remove_file(&got).unwrap();
+    assert!(!new.exists_on_disk(), "deleted file noticed lazily");
+    assert!(h.core.was_downloaded(&f.username, &f.path));
+    assert!(h.core.was_downloaded(&play.username, &play.path));
+    assert_eq!(h.core.downloaded_keys().len(), 2);
+}
+
+#[test]
+fn history_marks_failed_and_cancelled_downloads() {
+    use crate::history::Outcome;
+    let h = harness();
+    let s = h.online();
+    let a = h.core.download(&rfile(r"Music\A\01.flac", 4));
+    wait_until("lib download", || s.st().downloads.len() == 1);
+    let dup = h.core.download(&rfile(r"Music\A\01.flac", 4));
+    h.want("dup refused", is_failed(dup));
+    h.core.cancel(a);
+    h.want(
+        "cancelled",
+        |e| matches!(e, CoreEvent::TransferCancelled { id } if *id == a),
+    );
+    let all = history(&h);
+    assert_eq!(
+        all.len(),
+        1,
+        "duplicate refusal is not a history row: {all:?}"
+    );
+    assert_eq!(all[0].outcome, Outcome::Cancelled);
+    assert!(all[0].local_path.is_none());
+    assert!(!h.core.was_downloaded("alice", r"Music\A\01.flac"));
+    // Offline ↓ fails and is marked with the reason.
+    let h = harness();
+    let b = h.core.download(&rfile(r"Music\B\02.flac", 4));
+    h.want("failed", is_failed(b));
+    let all = history(&h);
+    assert_eq!(all[0].outcome, Outcome::Failed);
+    assert_eq!(all[0].reason.as_deref(), Some("not connected"));
+}
+
+#[test]
+fn history_survives_restart_and_clear_remove_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    {
+        let h = harness_with(|st, _| st.data_dir = data.clone());
+        let s = h.online();
+        for (i, p) in [r"Music\A\01.flac", r"Music\A\02.flac"].iter().enumerate() {
+            let id = h.core.download(&rfile(p, 1));
+            wait_until("lib download", || s.st().downloads.len() == i + 1);
+            s.progress(i, b"x", 1);
+            s.complete(i);
+            h.want("done", is_done(id));
+        }
+    }
+    let h = harness_with(|st, _| st.data_dir = data.clone());
+    let all = history(&h);
+    assert_eq!(all.len(), 2, "reloaded from {}", data.display());
+    assert!(h.core.was_downloaded("alice", r"Music\A\01.flac"));
+    assert!(h.core.history_remove(all[1].id));
+    assert!(!h.core.history_remove(all[1].id));
+    assert!(!h.core.was_downloaded("alice", r"Music\A\01.flac"));
+    assert!(h.core.was_downloaded("alice", r"Music\A\02.flac"));
+    h.core.history_clear().unwrap();
+    assert!(history(&h).is_empty() && h.core.downloaded_keys().is_empty());
+    drop(h);
+    let h = harness_with(|st, _| st.data_dir = data.clone());
+    assert!(history(&h).is_empty(), "clear persisted");
 }

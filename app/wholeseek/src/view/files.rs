@@ -21,13 +21,13 @@ const QUALITY_W: f32 = 92.0;
 const DL_W: f32 = 56.0;
 
 /// Column titles over a file list. `indent` lines them up with indented rows.
-pub fn columns(s: &App, indent: f32, t: &Theme) -> El {
+pub fn columns(_s: &App, indent: f32, t: &Theme) -> El {
     let h = |s: &str| text(s.to_string()).font(META).color(t.text_secondary);
     row()
         .key("columns")
         .h(24.0)
         .w_full()
-        .max_w(super::details::table_max_w(s))
+        .max_w(super::details::TABLE_MAX_W)
         .pl(12.0 + indent)
         .pr(6.0)
         .gap(10.0)
@@ -42,8 +42,12 @@ pub fn columns(s: &App, indent: f32, t: &Theme) -> El {
 }
 
 /// Whether `f` is the current track, and whether it is running (not paused or ended).
-fn now_playing(s: &App, f: &RemoteFile) -> (bool, bool) {
-    let Some(p) = s.playing.as_ref().filter(|p| &p.file == f) else {
+pub fn now_playing(s: &App, f: &RemoteFile) -> (bool, bool) {
+    let Some(p) = s
+        .playing
+        .as_ref()
+        .filter(|p| crate::tabs::same_file(&p.file, f))
+    else {
         return (false, false);
     };
     let running = match p.snapshot.as_ref().map(|sn| &sn.state) {
@@ -101,9 +105,9 @@ pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t
         let icon = if playing && running {
             equalizer(s.now, true, accent())
         } else if playing {
-            icons::play(10.0, accent())
+            icons::play(icons::SM, accent())
         } else {
-            icons::play(10.0, t.text_secondary)
+            icons::play(icons::SM, t.text_secondary)
         };
         let (file, folder) = (f.clone(), ctx.folder.clone());
         icon_button("play", icon, t)
@@ -124,11 +128,15 @@ pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t
     let in_user = ctx.in_user_tab;
     let (file_m, file_k, file_s) = (f.clone(), f.clone(), f.clone());
     let folder_k = ctx.folder.clone();
-    let mut more = icon_button(&ctx.more_key, icons::more(12.0, t.text_secondary), t)
+    let mut more = icon_button(&ctx.more_key, icons::more(icons::MD, t.text_secondary), t)
         .size(24.0, 22.0)
         .label("More")
         .on_press(move |s: &mut App| {
-            let items = crate::menu::file_items(&file_m, in_user);
+            let items = crate::menu::file_items(
+                &file_m,
+                in_user,
+                &s.backend.settings().recent_download_dirs,
+            );
             let key = more_key_of(s, &file_m);
             s.open_menu(MenuAnchor::Key(key), items);
         });
@@ -141,7 +149,7 @@ pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t
         .key(key.to_string())
         .h(ROW_H)
         .w_full()
-        .max_w(super::details::table_max_w(s))
+        .max_w(super::details::TABLE_MAX_W)
         .pl(12.0 + indent)
         .pr(6.0)
         .gap(10.0)
@@ -171,7 +179,11 @@ pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t
         })
         .on_secondary_press(move |s: &mut App, p, _| {
             s.tab_mut().selected = Some(file_s.path.clone());
-            let items = crate::menu::file_items(&file_s, in_user);
+            let items = crate::menu::file_items(
+                &file_s,
+                in_user,
+                &s.backend.settings().recent_download_dirs,
+            );
             super::menu::at_point(s, p, items);
         })
         .child(play)
@@ -203,7 +215,7 @@ pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t
                 .w(DL_W)
                 .h(ROW_H)
                 .center()
-                .child(download_cell(s, f, t)),
+                .child(download_cell(s, f, false, t)),
         )
         .child(more);
     if playing {
@@ -241,16 +253,31 @@ fn rune_ext(f: &RemoteFile) -> String {
     wholeseek_core::rank::extension(&f.path)
 }
 
-/// ↓ (on hover), or the download's progress / done / failed mark.
-pub fn download_cell(s: &App, f: &RemoteFile, t: &Theme) -> El {
+/// ↓ (on hover), or the download's progress / done / failed mark; a file downloaded
+/// before (history, exact user + path) shows a muted ✓ until hovered. `album`: the ↓ keeps
+/// the album folder (a track listed under its album).
+pub fn download_cell(s: &App, f: &RemoteFile, album: bool, t: &Theme) -> El {
     let file = f.clone();
-    let start = move |s: &mut App| s.download(&file);
+    let start = move |s: &mut App| {
+        if album {
+            s.download_album_track(&file)
+        } else {
+            s.download(&file)
+        }
+    };
     match s
         .download_of(f)
         .map(|d| (d.state.clone(), d.fraction(), d.id))
     {
+        None | Some((TState::Cancelled, ..)) if was_downloaded(s, f) => row()
+            .key("downloaded")
+            .size(24.0, 24.0)
+            .center()
+            .label("Downloaded")
+            .help("Downloaded")
+            .child(icons::check(icons::SM, t.text_secondary)),
         None | Some((TState::Cancelled, ..)) => {
-            icon_button("download", icons::down(11.0, t.text), t)
+            icon_button("download", icons::down(icons::MD, t.text), t)
                 .label("Download")
                 .group_opacity(0.0, 1.0)
                 .on_press(start)
@@ -276,14 +303,19 @@ pub fn download_cell(s: &App, f: &RemoteFile, t: &Theme) -> El {
             .center()
             .label("Downloaded")
             .help("Saved to your downloads")
-            .child(icons::check(11.0, green())),
+            .child(icons::check(icons::MD, green())),
         Some((TState::Failed(reason), _, id)) => {
-            icon_button("download", icons::retry(11.0, red()), t)
+            icon_button("download", icons::retry(icons::MD, red()), t)
                 .label("Retry download")
                 .help(format!("Failed: {reason} — click to retry"))
                 .on_press(move |s: &mut App| s.retry(id))
         }
     }
+}
+
+/// Downloaded before (exact user + remote path).
+pub fn was_downloaded(s: &App, f: &RemoteFile) -> bool {
+    s.downloaded.contains(&(f.username.clone(), f.path.clone()))
 }
 
 /// A "↓ Download folder"-style text button with an icon.

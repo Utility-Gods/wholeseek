@@ -8,7 +8,9 @@ use super::pal;
 use crate::app::App;
 use crate::menu::MenuAnchor;
 
+/// Menus grow with their longest label ("Download to › ~/Music/Vinyl") up to [`MENU_MAX_W`].
 const MENU_W: f32 = 200.0;
+const MENU_MAX_W: f32 = 360.0;
 
 pub fn layer(s: &App, t: &Theme) -> Option<El> {
     let m = s.menu.as_ref()?;
@@ -18,7 +20,8 @@ pub fn layer(s: &App, t: &Theme) -> Option<El> {
     };
     let mut items = col()
         .key("menu")
-        .w(MENU_W)
+        .min_w(MENU_W)
+        .max_w(MENU_MAX_W)
         .py(4.0)
         .radius(6.0)
         .fill(pal::raised())
@@ -34,29 +37,52 @@ pub fn layer(s: &App, t: &Theme) -> Option<El> {
         .anchored(anchor_key, Side::Bottom, Align::Start, 2.0);
     for it in &m.items {
         let action = it.action.clone();
-        items = items.child(
-            row()
-                .key(match it.action {
-                    crate::menu::MenuAction::ShowTab(i) => format!("menu-tab-{i}"),
-                    _ => format!("menu-{}", it.id),
-                })
-                .h(26.0)
-                .w_full()
-                .px(10.0)
-                .center_y()
-                .hover(t.hover)
-                .press(t.press)
-                .cursor(Cursor::Pointer)
-                .role("menuitem")
-                .label(it.label.clone())
-                .on_press_tx(move |s: &mut App, tx| {
-                    if let Some(text) = s.run_menu(action.clone()) {
-                        tx.copy(text);
-                    }
-                    s.restore_scroll(tx);
-                })
-                .child(text(it.label.clone()).font(type_::BODY).color(t.text)),
-        );
+        let glyph = match it.icon {
+            Some(i) => super::icons::draw(i, super::icons::MD, t.text_secondary),
+            None => el().size(super::icons::MD, super::icons::MD),
+        };
+        if it.sep {
+            items = items.child(el().h(1.0).w_full().my(4.0).fill(pal::line()));
+        }
+        let mut entry = row()
+            .key(match it.action {
+                crate::menu::MenuAction::ShowTab(i) => format!("menu-tab-{i}"),
+                _ => format!("menu-{}", it.id),
+            })
+            .h(28.0)
+            .w_full()
+            .px(10.0)
+            .gap(10.0)
+            .center_y()
+            .hover(t.hover)
+            .press(t.press)
+            .cursor(Cursor::Pointer)
+            .role("menuitem")
+            .label(it.help.clone().unwrap_or_else(|| it.label.clone()))
+            .on_press_tx(move |s: &mut App, tx| {
+                if let crate::menu::MenuAction::DownloadTo { target, dir: None } = &action {
+                    s.menu = None;
+                    crate::actions::choose_download_dir(s, tx, target.clone());
+                    return;
+                }
+                if let Some(text) = s.run_menu(action.clone()) {
+                    tx.copy(text);
+                }
+                s.restore_scroll(tx);
+            })
+            .child(glyph)
+            .child(
+                text(it.label.clone())
+                    .font(type_::BODY)
+                    .color(t.text)
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
+            );
+        if let Some(h) = &it.help {
+            entry = entry.help(h.clone());
+        }
+        items = items.child(entry);
     }
     let mut layer = el()
         .key("menu-layer")

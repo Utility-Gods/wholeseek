@@ -52,7 +52,7 @@ pub fn view(s: &App, t: &Theme) -> El {
             s.open_menu(crate::menu::MenuAnchor::Key("tabs-more".into()), items);
         })
     });
-    let new = icon_button("new-tab", icons::plus(11.0, t.text_secondary), t)
+    let new = icon_button("new-tab", icons::plus(icons::MD, t.text_secondary), t)
         .label("New search tab")
         .help(format!("New search ({})", crate::desktop::chord("T")))
         .on_press_tx(|s: &mut App, tx| {
@@ -92,7 +92,7 @@ pub fn view(s: &App, t: &Theme) -> El {
         .label("Transfers")
         .on_press(|s: &mut App| s.toggle_panel(Panel::Transfers))
         .child(icons::transfers(
-            12.0,
+            icons::MD,
             if open { accent() } else { t.text_secondary },
         ))
         .child(text("Transfers").font(type_::LABEL).color(if open {
@@ -110,7 +110,7 @@ pub fn view(s: &App, t: &Theme) -> El {
     let mut settings = icon_button(
         "settings",
         icons::gear(
-            13.0,
+            icons::LG,
             if settings_open {
                 accent()
             } else {
@@ -171,10 +171,10 @@ fn tab_el(s: &App, i: usize, tab: &Tab, t: &Theme) -> El {
     let active = i == s.active;
     let (icon, count) = match &tab.kind {
         TabKind::Search(st) => (
-            icons::search(10.0, t.text_secondary),
+            icons::search(icons::SM, t.text_secondary),
             st.search.as_ref().map(|v| v.visible(&st.filters)),
         ),
-        TabKind::User(_) => (icons::user(10.0, t.text_secondary), None),
+        TabKind::User(_) => (icons::user(icons::SM, t.text_secondary), None),
     };
     let mut label = row()
         .gap(6.0)
@@ -193,7 +193,7 @@ fn tab_el(s: &App, i: usize, tab: &Tab, t: &Theme) -> El {
     if let Some(n) = count {
         label = label.child(badge("count", n, t));
     }
-    let close = icon_button("close", icons::close(8.0, t.text_secondary), t)
+    let close = icon_button("close", icons::close(icons::SM, t.text_secondary), t)
         .size(18.0, 18.0)
         .label("Close tab")
         .on_press_tx(move |s: &mut App, tx| {

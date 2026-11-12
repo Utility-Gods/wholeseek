@@ -92,6 +92,17 @@ pub fn header(username: &str, entry: Option<&ProfileEntry>, t: &Theme) -> Option
                         "Show more"
                     })
                     .on_press(move |s: &mut App| s.profiles.toggle_expanded(&user))
+                    .gap(4.0)
+                    .center_y()
+                    .child(super::icons::draw(
+                        if entry.expanded {
+                            &super::icons::CHEVRON_UP
+                        } else {
+                            &super::icons::CHEVRON_DOWN
+                        },
+                        super::icons::SM,
+                        t.text_secondary,
+                    ))
                     .child(
                         text(if entry.expanded { "less" } else { "more" })
                             .font(type_::LABEL)

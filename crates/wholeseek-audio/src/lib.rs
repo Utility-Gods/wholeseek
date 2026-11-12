@@ -4,6 +4,7 @@
 //! - [`Player`]: symphonia decode thread → [`AudioSink`] (cpal device with feature `output`,
 //!   or a capture/null sink), with an optional play queue ([`QueueItem`]) for albums.
 
+pub mod artwork;
 pub mod formats;
 pub mod growing;
 #[cfg(feature = "output")]
@@ -11,6 +12,7 @@ pub mod output;
 pub mod player;
 pub mod sink;
 
+pub use artwork::{ArtLookup, Artwork, embedded_art};
 pub use formats::{PLAYABLE_EXTENSIONS, is_playable};
 pub use growing::{
     GrowingError, GrowingFile, GrowingHandle, PART_SUFFIX, SourceFailed, UNKNOWN_SIZE,

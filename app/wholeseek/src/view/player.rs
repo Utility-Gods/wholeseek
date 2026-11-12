@@ -44,9 +44,9 @@ pub fn strip(s: &App, t: &Theme) -> El {
         .label(if running { "Pause" } else { "Play" })
         .on_press(|s: &mut App| s.toggle_pause())
         .child(if running {
-            icons::pause(12.0, t.text)
+            icons::pause(icons::LG, t.text)
         } else {
-            icons::play(12.0, t.text)
+            icons::play(icons::LG, t.text)
         });
 
     let fetch = s.transfers.iter().find(|x| x.id == p.ticket.id);
@@ -133,7 +133,11 @@ pub fn strip(s: &App, t: &Theme) -> El {
                         .font(type_::TITLE)
                         .color(t.text)
                         .truncate()
-                        .shrink(),
+                        .shrink()
+                        .cursor(rune::Cursor::Pointer)
+                        .role("link")
+                        .help("Show in list")
+                        .on_press(|s: &mut App| s.reveal_playing()),
                 ),
         )
         .child(second);
@@ -184,16 +188,16 @@ pub fn strip(s: &App, t: &Theme) -> El {
     let file = p.file.clone();
     let keep: El = match kept.map(|k| (&k.state, k.fraction())) {
         None | Some((TState::Cancelled | TState::Failed(_), _)) => {
-            action("keep", "Keep", icons::down(11.0, t.text), t)
+            action("keep", "Keep", icons::down(icons::MD, t.text), t)
                 .help("Save this track to your downloads")
-                .on_press(move |s: &mut App| s.download(&file))
+                .on_press(move |s: &mut App| s.keep(&file))
         }
         Some((TState::Done(_), _)) => row()
             .key("keep")
             .gap(5.0)
             .center_y()
             .label("Kept")
-            .child(icons::check(11.0, green()))
+            .child(icons::check(icons::MD, green()))
             .child(text("Kept").font(META).color(t.text_secondary)),
         Some((_, frac)) => row().key("keep").label("Keeping").child(
             text(format!("Keeping {:.0}%", frac * 100.0))
@@ -207,7 +211,7 @@ pub fn strip(s: &App, t: &Theme) -> El {
         .key("volume")
         .gap(6.0)
         .center_y()
-        .child(icons::speaker(12.0, t.text_secondary))
+        .child(icons::speaker(icons::MD, t.text_secondary))
         .child(
             row()
                 .key("volume-track")
@@ -232,7 +236,7 @@ pub fn strip(s: &App, t: &Theme) -> El {
                 ),
         );
     let skip = |key: &str, back: bool| {
-        icon_button(key, icons::skip(10.0, back, t.text_secondary), t)
+        icon_button(key, icons::skip(icons::MD, back, t.text_secondary), t)
             .size(24.0, 24.0)
             .label(if back { "Previous" } else { "Next" })
     };
@@ -271,6 +275,14 @@ pub fn strip(s: &App, t: &Theme) -> El {
             super::menu::at_point(s, p, items);
         })
         .child(controls)
+        .child(super::art::cover(
+            s,
+            "now-cover",
+            &p.file.username,
+            p.file.folder(),
+            super::art::PLAYER,
+            t,
+        ))
         .child(title)
         .child(time("pos", Some(position)))
         .child(seek)

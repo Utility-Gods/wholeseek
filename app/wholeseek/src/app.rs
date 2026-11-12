@@ -2,7 +2,7 @@
 //! Views (`view/`) only read it and attach handlers that call the methods here.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 
@@ -10,7 +10,7 @@ use rune::{TextEdit, Tx};
 use wholeseek_audio::{PlayState, PlayerSnapshot, SeekError};
 use wholeseek_core::{
     CoreEvent, Credentials, DisconnectReason, PlayTicket, PortMapOutcome, RemoteFile, Settings,
-    TransferId, TransferKind, UploadRow, rank,
+    TransferId, TransferKind, UploadRow, paths, rank,
 };
 
 use crate::actions::DrawerUi;
@@ -23,6 +23,8 @@ use crate::profile::Profiles;
 use crate::queue::PlayQueue;
 use crate::store::{MemoryStore, RealStore, Store, StoreNote};
 use crate::tabs::{BrowseView, SearchTab, SearchView, Tab, TabId, TabKind, UserTab};
+
+mod restore;
 
 /// Results drawn at most; the rest are counted ("showing 300 of 4 120").
 pub const MAX_ROWS: usize = 300;
@@ -107,6 +109,9 @@ pub struct Transfer {
     pub total: u64,
     pub speed: f64,
     pub state: TState,
+    /// The folder it is going to, as the core decides it (shown before it is done; the
+    /// final file comes with `TransferDone`). `None` for ▶ fetches and unknown origins.
+    pub dest: Option<PathBuf>,
 }
 
 impl Transfer {
@@ -179,11 +184,19 @@ pub struct App {
     pub strip_w: f32,
     /// The window's width in points (the strip spans it); 0 until first laid out.
     pub window_w: f32,
+    /// Files downloaded before, by (user, remote path): the rows' "Downloaded" mark.
+    /// Fetched from the backend once per tick.
+    pub downloaded: wholeseek_core::DownloadedKeys,
     pub strip_right_w: f32,
     /// What plays in order; the player strip shows its current item.
     pub queue: Option<PlayQueue>,
+    /// Folder downloads asked for and where they go (user, remote folder, local folder),
+    /// so each file the core then queues shows its destination.
+    pub folder_dests: Vec<(String, String, PathBuf)>,
     /// Scroll the highlighted file into view once its folder is listed.
     pub reveal: bool,
+    /// The tab the current queue was started from ("Show in list" goes back to it).
+    pub play_from: Option<TabId>,
     /// The core's polled snapshot, refreshed each frame.
     pub status: wholeseek_core::CoreStatus,
     pub store: Box<dyn Store>,
@@ -193,12 +206,16 @@ pub struct App {
     pending_credentials: Option<Credentials>,
     /// Peer profiles by username (one per open user view).
     pub profiles: Profiles,
+    /// Album covers: decoded images and which folders were asked for (`view::art`).
+    pub art: crate::view::art::Art,
     /// The account signed in with this run, for Reconnect (memory only).
     credentials: Option<Credentials>,
     /// Waiting for the startup load; `Screen::Starting` until it lands.
     pub boot: Option<Boot>,
     /// The window's waker (from setup), handed to a backend started later.
     waker: Option<rune::Waker>,
+    /// Saved tabs: restored at sign-in, saved as they change ([`restore`]).
+    session: restore::SessionState,
 }
 
 /// What the startup load found, and how to start the session with it.
@@ -270,22 +287,27 @@ impl App {
             desktop,
             desktop_log,
             menu: None,
+            folder_dests: Vec::new(),
             drawer: DrawerUi::default(),
             last_filters: crate::tabs::Filters::default(),
             queue_generation: 0,
             strip_w: f32::INFINITY,
             window_w: 0.0,
+            downloaded: Default::default(),
             strip_right_w: 0.0,
             queue: None,
             reveal: false,
+            play_from: None,
             status: wholeseek_core::CoreStatus::default(),
             store,
             keyring_available: startup.keyring_available,
             pending_credentials: None,
             profiles: Profiles::default(),
+            art: crate::view::art::Art::default(),
             credentials: None,
             boot: None,
             waker: None,
+            session: Default::default(),
         };
         app.new_search_tab();
         app.begin(startup);
@@ -303,6 +325,7 @@ impl App {
             self.conn = Conn::Connecting;
             self.credentials = Some(c.clone());
             self.backend.login(c);
+            self.restore_session();
         }
     }
 
@@ -332,6 +355,7 @@ impl App {
     pub fn set_waker(&mut self, wake: rune::Waker) {
         self.store.set_waker(wake.clone());
         self.profiles.set_waker(wake.clone());
+        self.art.set_waker(wake.clone());
         self.backend.set_waker(wake.clone());
         self.player.set_waker(wake.clone());
         self.waker = Some(wake);
@@ -421,6 +445,7 @@ impl App {
         let notes = self.store.drain();
         let mut changed = !events.is_empty() || !notes.is_empty();
         changed |= self.profiles.settle();
+        changed |= self.sync_covers();
         for e in events {
             self.apply(e);
         }
@@ -437,6 +462,12 @@ impl App {
             self.apply_player(e);
         }
         let mut wake = self.backend.next_tick();
+        let downloaded = self.backend.downloaded_keys();
+        if !std::sync::Arc::ptr_eq(&downloaded, &self.downloaded) && *downloaded != *self.downloaded
+        {
+            self.downloaded = downloaded;
+            changed = true;
+        }
         let status = self.backend.status();
         if status != self.status {
             self.status = status;
@@ -480,6 +511,11 @@ impl App {
                 wake = Some(wake.map_or(d, |w| w.min(d)));
             }
         }
+        let (fetched, save_in) = self.session_tick();
+        changed |= fetched;
+        if let Some(d) = save_in {
+            wake = Some(wake.map_or(d, |w| w.min(d)));
+        }
         (changed, wake)
     }
 
@@ -494,6 +530,7 @@ impl App {
                     listen_port,
                 };
                 self.screen = Screen::Main;
+                self.restore_session();
                 self.onboarding.connecting = false;
                 self.onboarding.error = None;
                 // First successful sign-in from onboarding: remember the account and shares.
@@ -580,8 +617,19 @@ impl App {
                 file,
                 part_path,
             } => {
+                let dest = (kind == TransferKind::Download)
+                    .then(|| {
+                        self.folder_dests
+                            .iter()
+                            .find(|(u, d, _)| *u == file.username && d == file.folder())
+                            .map(|(_, _, root)| paths::download_dir_for(root, &file.path))
+                    })
+                    .flatten();
                 let t = self.upsert(id, kind, &file);
                 t.part_path = part_path;
+                if t.dest.is_none() {
+                    t.dest = dest;
+                }
                 t.total = file.size;
                 t.state = TState::Queued;
             }
@@ -665,6 +713,7 @@ impl App {
             total: file.size,
             speed: 0.0,
             state: TState::Queued,
+            dest: None,
         });
         self.transfers.last_mut().expect("just pushed")
     }
@@ -1037,12 +1086,62 @@ impl App {
         self.refresh_snapshot();
     }
 
-    fn show_notice(&mut self, text: String) {
+    pub(crate) fn show_notice(&mut self, text: String) {
         self.notice = Some((text, self.now + 3.0));
     }
 
-    /// ↓ on a file. A file already downloading (or done) is left alone.
+    /// ↓ on a file: into the downloads folder, flat or in its album folder per
+    /// `Settings::single_file_subfolder`. A file already downloading (or done) is left alone.
     pub fn download(&mut self, file: &RemoteFile) {
+        self.start_download(file, None, false);
+    }
+
+    /// Keep on the playing track: a track of an album (a queue of more than one) goes in its
+    /// album folder whatever the setting, so albums are never scattered; a lone track is a
+    /// plain ↓.
+    pub fn keep(&mut self, file: &RemoteFile) {
+        let album = self
+            .queue
+            .as_ref()
+            .is_some_and(|q| q.items.len() > 1 && q.items.iter().any(|i| &i.file == file));
+        self.start_download(file, None, album);
+    }
+
+    /// "Download to…" a folder `dir` (picked, or one of the recent ones).
+    pub fn download_to(&mut self, target: &crate::menu::DlTarget, dir: &Path) {
+        match target {
+            crate::menu::DlTarget::File(f) => self.start_download(f, Some(dir), false),
+            crate::menu::DlTarget::Folder { username, folder } => {
+                self.backend.download_folder_to(username, folder, dir);
+                self.remember_folder_dest(username, folder, dir);
+                self.save_recent_dirs();
+            }
+        }
+    }
+
+    /// Where a folder download's files go, for their rows until they are done.
+    pub(crate) fn remember_folder_dest(&mut self, username: &str, folder: &str, root: &Path) {
+        self.folder_dests
+            .retain(|(u, d, _)| !(u == username && d == folder));
+        self.folder_dests
+            .push((username.into(), folder.into(), root.to_path_buf()));
+    }
+
+    /// `Download to…` moved a folder to the front of the recent ones: save it.
+    fn save_recent_dirs(&mut self) {
+        let settings = self.backend.settings().clone();
+        self.store.save_settings(&settings);
+    }
+
+    /// ↓ `file` into `root` (`None`: the downloads folder). `album`: always in its album
+    /// folder (`Core::download_album_file`); else flat or not per the setting.
+    /// ↓ on one track of an album (the search inspector's track list): always into its album
+    /// folder, like Keep while an album plays.
+    pub fn download_album_track(&mut self, file: &RemoteFile) {
+        self.start_download(file, None, true);
+    }
+
+    fn start_download(&mut self, file: &RemoteFile, root: Option<&Path>, album: bool) {
         if self
             .download_of(file)
             .is_some_and(|t| !matches!(t.state, TState::Failed(_) | TState::Cancelled))
@@ -1052,8 +1151,22 @@ impl App {
         if let Some(p) = self.playing.as_mut().filter(|p| &p.file == file) {
             p.keep = true; // the core promotes the in-flight play fetch
         }
-        let id = self.backend.download(file);
-        self.upsert(id, TransferKind::Download, file);
+        let settings = self.backend.settings();
+        let base = root.map_or_else(|| settings.download_dir.clone(), Path::to_path_buf);
+        let dest = if album || settings.single_file_subfolder {
+            paths::download_dir_for(&base, &file.path)
+        } else {
+            base
+        };
+        let id = match (album, root) {
+            (true, root) => self.backend.download_album_file(file, root),
+            (false, Some(dir)) => self.backend.download_to(file, dir),
+            (false, None) => self.backend.download(file),
+        };
+        self.upsert(id, TransferKind::Download, file).dest = Some(dest);
+        if root.is_some() {
+            self.save_recent_dirs();
+        }
     }
 
     /// Latest download (not play fetch) of this file.

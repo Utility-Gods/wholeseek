@@ -978,7 +978,14 @@ fn format_groups_merge_aliases_and_overflow_into_a_menu() {
     assert!(rt.state.tab().search().unwrap().filters.has("APE"));
     assert_eq!(visible(&rt), 2);
     click(&mut rt, "fmt-more");
-    assert_eq!(rt.state.menu.as_ref().unwrap().items[1].label, "✓ APE 2");
+    let m = rt.state.menu.as_ref().unwrap();
+    assert_eq!(m.items[1].label, "APE 2");
+    assert_eq!(
+        m.items[1].icon.map(|i| i.name),
+        Some("lucide-check"),
+        "on: a check icon"
+    );
+    assert!(m.items[0].icon.is_none());
 }
 
 #[test]
@@ -1459,10 +1466,11 @@ fn menus_offer_what_each_place_needs() {
     let (_, f) = row_of(&rt, "alice", "02 Salt Roads.flac");
     let ids = |v: Vec<crate::menu::MenuItem>| v.iter().map(|i| i.id).collect::<Vec<_>>();
     assert_eq!(
-        ids(crate::menu::file_items(&f, false)),
+        ids(crate::menu::file_items(&f, false, &[])),
         [
             "play",
             "download",
+            "download-to",
             "download-folder",
             "open-folder",
             "browse-user",
@@ -1470,10 +1478,11 @@ fn menus_offer_what_each_place_needs() {
         ]
     );
     assert_eq!(
-        ids(crate::menu::file_items(&f, true)),
+        ids(crate::menu::file_items(&f, true, &[])),
         [
             "play",
             "download",
+            "download-to",
             "download-folder",
             "open-folder",
             "copy-path"
@@ -1484,17 +1493,28 @@ fn menus_offer_what_each_place_needs() {
         ..f.clone()
     };
     assert_eq!(
-        ids(crate::menu::file_items(&cover, true))[0],
+        ids(crate::menu::file_items(&cover, true, &[]))[0],
         "download",
         "no ▶ for non-audio"
     );
     assert_eq!(
-        ids(crate::menu::folder_items("alice", COAST, true)),
-        ["open-folder", "download-folder", "play-folder", "copy-path"]
+        ids(crate::menu::folder_items("alice", COAST, true, &[])),
+        [
+            "open-folder",
+            "download-folder",
+            "download-folder-to",
+            "play-folder",
+            "copy-path"
+        ]
     );
     assert_eq!(
-        ids(crate::menu::folder_items("alice", COAST, false)),
-        ["open-folder", "download-folder", "copy-path"],
+        ids(crate::menu::folder_items("alice", COAST, false, &[])),
+        [
+            "open-folder",
+            "download-folder",
+            "download-folder-to",
+            "copy-path"
+        ],
         "nothing to play: no Play folder"
     );
 }
@@ -2002,7 +2022,7 @@ fn user_tab_downloads_the_open_folder_and_settings_forget_the_account() {
     let mut rt = signed_in();
     rt.update(|s, _| s.open_folder_at("alice", FERRY, None));
     run(&mut rt, 0.6);
-    click(&mut rt, "download-folder");
+    click(&mut rt, "folder-download");
     assert_eq!(
         calls(&rt).last(),
         Some(&Call::DownloadFolder("alice".into(), FERRY.into()))
@@ -2182,7 +2202,7 @@ fn rows_the_player_cannot_decode_get_no_play_but_keep_download() {
         rt.find(&format!("row-{opus}/download")).is_some(),
         "↓ still offered"
     );
-    let ids: Vec<_> = crate::menu::file_items(&of, false)
+    let ids: Vec<_> = crate::menu::file_items(&of, false, &[])
         .iter()
         .map(|i| i.id)
         .collect();
@@ -2190,6 +2210,7 @@ fn rows_the_player_cannot_decode_get_no_play_but_keep_download() {
         ids,
         [
             "download",
+            "download-to",
             "download-folder",
             "open-folder",
             "browse-user",
@@ -2580,43 +2601,151 @@ fn searched_at(w: f32) -> Runtime<App> {
     rt
 }
 
-#[test]
-fn the_details_pane_appears_from_1500_points_and_the_table_is_capped() {
-    use crate::view::{PANE_MIN_WINDOW_W, TABLE_MAX_W};
-    let narrow = searched_at(PANE_MIN_WINDOW_W - 1.0);
-    assert!(
-        narrow.find("details").is_none(),
-        "no pane below the breakpoint"
+fn esc(rt: &mut Runtime<App>) {
+    press(
+        rt,
+        KeyEvent {
+            key: Key::Escape,
+            mods: Mods::default(),
+        },
     );
-    let ([_, _, w, _], _) = narrow.presented("row-0").unwrap();
+}
+
+fn rect_of(rt: &Runtime<App>, key: &str) -> [f32; 4] {
+    rt.elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some(key))
+        .unwrap_or_else(|| panic!("no {key}"))
+        .rect
+}
+
+#[test]
+fn the_inspector_opens_on_a_selection_and_closes_with_x_or_esc() {
+    use crate::view::{INSPECTOR_W, TABLE_MAX_W};
+    let mut rt = searched_at(1920.0);
     assert!(
-        w > TABLE_MAX_W + 300.0,
-        "below it rows still span the window ({w})"
+        rt.find("details").is_none(),
+        "nothing selected: no inspector"
+    );
+    assert_eq!(rect_of(&rt, "results")[2], 1920.0, "results get the window");
+    let row0 = rect_of(&rt, "row-0");
+    assert!(
+        row0[0] + row0[2] <= TABLE_MAX_W + 0.5,
+        "the table is capped"
     );
 
-    for width in [PANE_MIN_WINDOW_W, 1920.0, 2560.0] {
-        let rt = searched_at(width);
-        assert!(rt.find("details").is_some(), "pane at {width}");
-        assert!(
-            rt.find("details-empty").is_some(),
-            "nothing selected yet: one muted line"
-        );
-        let ([x, _, w, _], _) = rt.presented("row-0").unwrap();
-        assert!(x + w <= TABLE_MAX_W + 0.5, "{width}: row ends at {}", x + w);
-        // Length sits right after the names, not at the far edge.
-        let len_x = rt
-            .elements()
-            .into_iter()
-            .find(|e| e.path.ends_with("columns") || e.key.as_deref() == Some("columns"))
-            .map(|e| e.rect[0] + e.rect[2])
-            .unwrap();
-        assert!(len_x <= TABLE_MAX_W + 0.5);
-        let ([px, _, pw, _], _) = rt.presented("details").unwrap();
-        assert!(
-            px >= TABLE_MAX_W && px + pw <= width + 0.5,
-            "pane inside the window"
-        );
+    click(&mut rt, "folder-0-0");
+    let d = rect_of(&rt, "details");
+    assert_eq!((d[0], d[2]), (1920.0 - INSPECTOR_W, INSPECTOR_W));
+    assert_eq!(rect_of(&rt, "row-0"), row0, "the table doesn't move");
+
+    click(&mut rt, "details-close");
+    assert!(rt.find("details").is_none());
+    assert_eq!(rt.state.tab().group, None);
+    run(&mut rt, 0.5);
+    assert!(rt.find("details").is_none(), "stays closed");
+
+    click(&mut rt, "folder-0-1");
+    assert!(rt.find("details").is_some(), "the next selection opens it");
+    esc(&mut rt);
+    assert!(rt.find("details").is_none(), "Esc closes it");
+
+    // Narrower: beside the results down to 1100 pt, over them below.
+    for (w, overlay) in [
+        (1200.0, false),
+        (1280.0, false),
+        (1000.0, true),
+        (900.0, true),
+    ] {
+        let mut rt = searched_at(w);
+        click(&mut rt, "folder-0-0");
+        let d = rect_of(&rt, "details");
+        assert_eq!(d[0] + d[2], w, "{w}: at the right edge");
+        let results = rect_of(&rt, "results")[2];
+        if overlay {
+            assert_eq!(results, w, "{w}: over the results");
+        } else {
+            assert_eq!(results, w - INSPECTOR_W - 1.0, "{w}: beside the results");
+        }
+        assert_nothing_clipped(&rt, w);
     }
+}
+
+#[test]
+fn a_one_file_folder_gets_a_compact_card() {
+    let rt = jungle_at(1920.0);
+    assert!(rt.find("details-card").is_some());
+    assert_eq!(
+        text_of(&rt, "details-title").as_deref(),
+        Some("Put It On (Jungle Mix).mp3")
+    );
+    assert!(rt.find("track-0").is_none(), "no one-row track list");
+    for k in [
+        "details-play",
+        "details-download",
+        "details-download-to",
+        "details-browse",
+    ] {
+        assert!(rt.find(k).is_some(), "{k}");
+    }
+}
+
+#[test]
+fn the_card_downloads_the_lone_file_flat() {
+    let mut rt = jungle_at(1920.0);
+    click(&mut rt, "details-download");
+    let f = sv(&rt).hits[0].file.clone();
+    assert!(
+        calls(&rt).contains(&Call::Download(f)),
+        "a plain ↓, not an album file"
+    );
+}
+
+#[test]
+fn previously_downloaded_files_are_marked_in_rows_and_the_inspector() {
+    let mut rt = searched_at(1920.0);
+    // The demo's history has dj_ivo's "Low Tide Radio" mp3 only (exact user + path).
+    let marked: Vec<String> = rt
+        .elements()
+        .into_iter()
+        .filter(|e| e.key.as_deref() == Some("downloaded"))
+        .map(|e| e.path)
+        .collect();
+    let (i, _) = row_of(&rt, "dj_ivo", "Hollow Lights - Low Tide Radio.mp3");
+    assert_eq!(marked.len(), 1, "{marked:?}");
+    assert!(marked[0].contains(&format!("row-{i}/")), "{marked:?}");
+    click(&mut rt, &format!("row-{i}"));
+    let in_pane = rt
+        .elements()
+        .into_iter()
+        .filter(|e| e.key.as_deref() == Some("downloaded") && e.path.contains("/details/"))
+        .count();
+    assert_eq!(in_pane, 1);
+}
+
+#[test]
+fn the_inspector_shows_what_plays_and_keeps_the_album_folder_on_download() {
+    let mut rt = searched_at(1920.0);
+    click(&mut rt, "folder-0-0");
+    let (_, f) = row_of(&rt, "alice", "01 Northern Glass.flac");
+    rt.update(|s, _| {
+        let q = s.folder_files("alice", COAST);
+        s.play_in(&f, &q);
+    });
+    run(&mut rt, 1.0);
+    let eq = rt.elements().into_iter().any(|e| {
+        e.path.contains("/details/")
+            && e.path.contains("track-0/")
+            && e.key.as_deref() == Some("eq")
+    });
+    assert!(eq, "the playing track shows the equalizer");
+    let (_, g) = row_of(&rt, "alice", "03 Low Tide Radio.flac");
+    click(&mut rt, "track-2/download");
+    assert!(
+        calls(&rt).contains(&Call::DownloadAlbumFile(g, None)),
+        "{:?}",
+        calls(&rt)
+    );
 }
 
 #[test]
@@ -2670,7 +2799,7 @@ fn clicking_a_row_or_folder_selects_its_group_per_tab_without_playing() {
     rt.update(|s, _| s.search_for("hollow lights"));
     run(&mut rt, 1.6);
     assert_eq!(rt.state.tab().group, None);
-    assert!(rt.find("details-empty").is_some());
+    assert!(rt.find("details").is_none());
     let (j, _) = row_of(&rt, "dj_ivo", "Hollow Lights - Salt Roads.mp3");
     click(&mut rt, &format!("row-{j}"));
     assert_eq!(rt.state.tab().group.as_ref().unwrap().0, "dj_ivo");
@@ -2967,7 +3096,7 @@ fn the_details_pane_drops_a_folder_the_filter_hides() {
     );
     type_find(&mut rt, "ferry");
     assert_eq!(rt.state.tab().group, None, "filtered out: cleared");
-    assert!(rt.find("details-empty").is_some());
+    assert!(rt.find("details").is_none());
     // Chips can hide it too.
     type_find(&mut rt, "");
     click(&mut rt, "folder-0-0");
@@ -3119,4 +3248,435 @@ fn filtering_5000_results_takes_under_16_ms_per_keystroke() {
         worst < budget,
         "slowest keystroke {worst:?}, budget {budget:?}"
     );
+}
+
+// ---- icons, Download to…, album folders -------------------------------------------------------
+
+#[test]
+fn every_icon_draws_at_menu_and_row_sizes() {
+    for i in crate::view::icons::ALL {
+        for px in [12, 14, 28] {
+            let cov = rune::text::icon_coverage(i, px);
+            let inked = cov.iter().filter(|&&c| c > 0).count();
+            assert!(inked > 0, "{} draws nothing at {px} px", i.name);
+            assert!(inked < cov.len(), "{} fills its box at {px} px", i.name);
+        }
+    }
+}
+
+#[test]
+fn every_menu_item_has_an_icon() {
+    let mut rt = searched();
+    let (_, f) = row_of(&rt, "alice", "02 Salt Roads.flac");
+    let recent = [std::path::PathBuf::from("/music/vinyl")];
+    let mut items = crate::menu::file_items(&f, false, &recent);
+    items.extend(crate::menu::folder_items("alice", COAST, true, &recent));
+    rt.update(|s, _| s.download(&f));
+    run(&mut rt, 30.0);
+    let id = rt.state.transfers.iter().find(|t| t.file == f).unwrap().id;
+    items.extend(rt.state.transfer_items(id));
+    for it in &items {
+        assert!(it.icon.is_some(), "{} has no icon", it.id);
+    }
+    // And the open menu draws them (an icon element before each label).
+    rt.update(|s, _| s.open_menu(crate::menu::MenuAnchor::Point(100.0, 100.0), items.clone()));
+    run(&mut rt, 0.05);
+    let all = rt.elements();
+    let menu = all
+        .iter()
+        .find(|e| e.key.as_deref() == Some("menu"))
+        .expect("menu open")
+        .path
+        .clone();
+    let icons = all
+        .iter()
+        .filter(|e| e.path.starts_with(&menu) && e.role == "icon")
+        .count();
+    assert_eq!(icons, items.len());
+}
+
+fn demo_settings(rt: &Runtime<App>) -> wholeseek_core::Settings {
+    rt.state.backend.settings().clone()
+}
+
+#[test]
+fn download_to_a_recent_folder_saves_there_and_remembers_it() {
+    let mut rt = searched();
+    let (_, f) = row_of(&rt, "alice", "02 Salt Roads.flac");
+    let (vinyl, usb) = (
+        std::path::PathBuf::from("/music/vinyl"),
+        std::path::PathBuf::from("/usb"),
+    );
+    rt.update(|s, _| {
+        s.run_menu(MenuAction::DownloadTo {
+            target: crate::menu::DlTarget::Folder {
+                username: "alice".into(),
+                folder: COAST.into(),
+            },
+            dir: Some(usb.clone()),
+        });
+        s.download_to(&crate::menu::DlTarget::File(f.clone()), &vinyl);
+    });
+    run(&mut rt, 0.05);
+    assert!(calls(&rt).contains(&Call::DownloadTo(f.clone(), vinyl.clone())));
+    assert!(calls(&rt).contains(&Call::DownloadFolderTo(
+        "alice".into(),
+        COAST.into(),
+        usb.clone()
+    )));
+    // Most recent first, and saved right away.
+    assert_eq!(
+        demo_settings(&rt).recent_download_dirs,
+        [vinyl.clone(), usb.clone()]
+    );
+    assert!(store_calls(&rt).iter().any(|c| matches!(c,
+        StoreCall::SaveSettings(s) if s.recent_download_dirs == [vinyl.clone(), usb.clone()])));
+    // A single song goes flat by default; the folder keeps its name.
+    let dest = |name: &str| {
+        rt.state
+            .transfers
+            .iter()
+            .find(|t| t.file.basename() == name && t.file.username == "alice")
+            .and_then(|t| t.dest.clone())
+    };
+    assert_eq!(dest("02 Salt Roads.flac"), Some(vinyl.clone()));
+    assert_eq!(
+        dest("01 Northern Glass.flac"),
+        Some(usb.join("Coastline (2019)"))
+    );
+    // The menus now offer them, under a line, by path, newest first.
+    let items = crate::menu::file_items(&f, false, &demo_settings(&rt).recent_download_dirs);
+    let to: Vec<&str> = items
+        .iter()
+        .filter(|i| i.id.starts_with("download-to"))
+        .map(|i| i.label.as_str())
+        .collect();
+    assert_eq!(to, ["Download to…", "/music/vinyl", "/usb"]);
+    let first = items.iter().find(|i| i.id == "download-to-0").unwrap();
+    assert!(first.sep);
+    assert_eq!(first.help.as_deref(), Some("/music/vinyl"));
+    let after = items.iter().find(|i| i.id == "download-folder").unwrap();
+    assert!(after.sep);
+    // At most five.
+    rt.update(|s, _| {
+        for i in 0..7 {
+            s.download_to(
+                &crate::menu::DlTarget::Folder {
+                    username: "alice".into(),
+                    folder: COAST.into(),
+                },
+                std::path::Path::new(&format!("/d{i}")),
+            );
+        }
+    });
+    assert_eq!(
+        demo_settings(&rt).recent_download_dirs.len(),
+        wholeseek_core::Settings::RECENT_DOWNLOAD_DIRS
+    );
+    assert_eq!(
+        demo_settings(&rt).recent_download_dirs[0],
+        std::path::PathBuf::from("/d6")
+    );
+}
+
+#[test]
+fn keep_while_an_album_plays_keeps_the_album_folder_with_the_setting_off() {
+    let mut rt = searched();
+    assert!(
+        !demo_settings(&rt).single_file_subfolder,
+        "default: single songs flat"
+    );
+    let files = rt.state.folder_files("alice", COAST);
+    let second = files[1].clone();
+    rt.update(|s, _| s.play_in(&second, &files));
+    run(&mut rt, 1.0);
+    click(&mut rt, "keep");
+    let root = demo_settings(&rt).download_dir;
+    assert!(
+        calls(&rt).contains(&Call::DownloadAlbumFile(second.clone(), None)),
+        "{:?}",
+        calls(&rt)
+    );
+    assert!(!calls(&rt).iter().any(|c| matches!(c, Call::Download(_))));
+    let kept = rt.state.download_of(&second).unwrap();
+    assert_eq!(kept.dest, Some(root.join("Coastline (2019)")));
+    // A lone track is a plain ↓: flat.
+    let (_, lone) = row_of(&rt, "nightbus", "hollow_lights_salt_roads_live.mp3");
+    rt.update(|s, _| s.play(&lone));
+    run(&mut rt, 1.0);
+    click(&mut rt, "keep");
+    assert!(calls(&rt).contains(&Call::Download(lone.clone())));
+    assert_eq!(rt.state.download_of(&lone).unwrap().dest, Some(root));
+}
+
+#[test]
+fn recent_folder_labels_shorten_home_and_elide_the_middle() {
+    use crate::menu::dir_label;
+    use std::path::Path;
+    let home = Some(Path::new("/home/nadia"));
+    let short = |p: &str| dir_label(Path::new(p), home);
+    assert_eq!(short("/home/nadia/Music/Vinyl"), "~/Music/Vinyl");
+    assert_eq!(short("/home/nadia"), "~");
+    assert_eq!(short("/home/nadiab/x"), "/home/nadiab/x");
+    assert_eq!(short("/media/usb/Music"), "/media/usb/Music");
+    let long = short("/home/nadia/Music/Archive/Electronic/Drum and Bass/1995 Dubplates");
+    assert_eq!(long.chars().count(), crate::menu::DIR_LABEL_MAX);
+    assert!(long.starts_with("~/Music/Arch"), "{long}");
+    assert!(long.ends_with("1995 Dubplates"), "{long}");
+    assert!(long.contains('…'));
+}
+
+#[test]
+fn the_players_download_item_keeps_an_album_track_in_its_folder() {
+    let mut rt = searched();
+    let files = rt.state.folder_files("alice", COAST);
+    let third = files[2].clone();
+    rt.update(|s, _| s.play_in(&third, &files));
+    run(&mut rt, 1.0);
+    let items = rt.state.player_items();
+    let dl = items.iter().find(|i| i.id == "download").unwrap();
+    assert_eq!(dl.action, crate::menu::MenuAction::Keep(third.clone()));
+    rt.update(|s, _| {
+        s.run_menu(crate::menu::MenuAction::Keep(third.clone()));
+    });
+    assert!(calls(&rt).contains(&Call::DownloadAlbumFile(third.clone(), None)));
+    let root = demo_settings(&rt).download_dir;
+    assert_eq!(
+        rt.state.download_of(&third).unwrap().dest,
+        Some(root.join("Coastline (2019)"))
+    );
+}
+
+#[test]
+fn the_album_folder_setting_is_a_switch_that_saves_and_moves_single_songs() {
+    let mut rt = searched();
+    click(&mut rt, "settings");
+    let switch = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some("set-single-subfolder"))
+        .expect("switch");
+    assert_eq!(switch.role, "switch");
+    assert_eq!(
+        switch.label.as_deref(),
+        Some("Put single songs in their album folder")
+    );
+    click(&mut rt, "set-single-subfolder");
+    assert!(demo_settings(&rt).single_file_subfolder);
+    assert!(
+        store_calls(&rt)
+            .iter()
+            .any(|c| matches!(c, StoreCall::SaveSettings(s) if s.single_file_subfolder))
+    );
+    let (_, f) = row_of(&rt, "alice", "02 Salt Roads.flac");
+    rt.update(|s, _| s.download(&f));
+    let root = demo_settings(&rt).download_dir;
+    assert_eq!(
+        rt.state.download_of(&f).unwrap().dest,
+        Some(root.join("Coastline (2019)"))
+    );
+    click(&mut rt, "set-single-subfolder");
+    assert!(!demo_settings(&rt).single_file_subfolder);
+}
+
+#[test]
+fn the_details_pane_offers_download_to_with_recent_folders() {
+    let mut rt = searched_at(1920.0);
+    click(&mut rt, "folder-0-0");
+    assert!(rt.find("details-download-to").is_some());
+    rt.update(|s, _| {
+        s.download_to(
+            &crate::menu::DlTarget::Folder {
+                username: "kassi".into(),
+                folder: "x".into(),
+            },
+            std::path::Path::new("/music/vinyl"),
+        );
+    });
+    click(&mut rt, "details-download-to");
+    let m = rt.state.menu.as_ref().expect("menu of folders");
+    assert_eq!(m.ids(), ["download-folder-to", "download-folder-to-0"]);
+    click(&mut rt, "menu-download-folder-to-0");
+    assert!(calls(&rt).contains(&Call::DownloadFolderTo(
+        "alice".into(),
+        COAST.into(),
+        "/music/vinyl".into()
+    )));
+}
+
+/// A search like the user's "put it on jungle": long scene-release folder names, a 1-file
+/// folder, many users.
+fn jungle_at(w: f32) -> Runtime<App> {
+    let mut rt = searched_at(w);
+    let paths = [
+        ("K1RZA", r"@@xkzqp\Music\Singles\Put It On (Jungle Mix).mp3"),
+        (
+            "divided1980",
+            r"Music\VA_-_Liondub_and_Deekline_Present_Welcome_To_The_Jungle-(JC175ALBUM)-WEB-FLAC-2023\01-deekline_and_ed_solo-put_it_on_(jungle_mix).flac",
+        ),
+        (
+            "divided1980",
+            r"Music\VA_-_Liondub_and_Deekline_Present_Welcome_To_The_Jungle-(JC175ALBUM)-WEB-FLAC-2023\02-liondub-babylon_burning_(feat_general_levy)_(original_mix)_extended_version_for_djs.flac",
+        ),
+        (
+            "a_user_with_a_rather_long_name_2024",
+            r"D:\Shared\Drum & Bass\Jungle\1994 - 1996\Classics Collection Vol. 3 (Remastered 2019) [FLAC 24-96]\CD2\07 - Put It On (Original 1995 Dubplate Version).flac",
+        ),
+    ];
+    rt.update(|s, _| {
+        s.new_search_tab();
+        let st = s.tab_mut().search_mut().unwrap();
+        let mut v = crate::tabs::SearchView {
+            id: wholeseek_core::SearchId(777),
+            query: "put it on jungle".into(),
+            hits: paths.iter().map(|(u, p)| hit_at(u, p)).collect(),
+            finished: true,
+            keys: Vec::new(),
+            matched: Default::default(),
+        };
+        v.reindex();
+        st.search = Some(v);
+        st.edit.replace_text("put it on jungle");
+        s.tab_mut().group = Some(("K1RZA".into(), r"@@xkzqp\Music\Singles".into()));
+    });
+    run(&mut rt, 0.1);
+    rt
+}
+
+/// Every element of the window lies inside it horizontally and starts at x ≥ 0 (text that
+/// doesn't fit truncates; nothing is pushed off the left edge).
+fn assert_nothing_clipped(rt: &Runtime<App>, w: f32) {
+    let bad: Vec<String> = rt
+        .elements()
+        .into_iter()
+        .filter(|e| e.opacity > 0.0 && e.rect[2] > 0.0)
+        .filter(|e| e.rect[0] < -0.5 || e.rect[0] + e.rect[2] > w + 0.5)
+        .map(|e| format!("{} {:?} {:?}", e.path, e.rect, e.text))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "outside the window at {w}:\n{}",
+        bad.join("\n")
+    );
+}
+
+#[test]
+fn long_paths_never_push_the_search_tab_off_screen() {
+    let mut fails = Vec::new();
+    for w in [1280.0, 1500.0, 1700.0, 1920.0, 2000.0] {
+        let mut rt = jungle_at(w);
+        let folders: Vec<(String, String)> = sv(&rt)
+            .hits
+            .iter()
+            .map(|h| (h.file.username.clone(), h.file.folder().to_string()))
+            .collect();
+        for g in folders {
+            rt.update(|s, _| s.tab_mut().group = Some(g.clone()));
+            run(&mut rt, 0.1);
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_nothing_clipped(&rt, w)
+            })) {
+                fails.push(format!(
+                    "{g:?}: {}",
+                    e.downcast_ref::<String>().cloned().unwrap_or_default()
+                ));
+            }
+        }
+    }
+    assert!(fails.is_empty(), "{}", fails.join("\n\n"));
+}
+
+#[test]
+fn shrinking_a_wide_window_keeps_the_search_tab_inside_it() {
+    let mut rt = jungle_at(2400.0);
+    for w in [1920.0, 1700.0, 1600.0, 1280.0] {
+        rt.set_viewport((w, 900.0), 1.0);
+        run(&mut rt, 0.2);
+        assert_nothing_clipped(&rt, w);
+    }
+}
+
+/// The index of `f`'s row (`file-{i}`) in the shown user tab's open folder.
+fn browse_row(rt: &Runtime<App>, f: &wholeseek_core::RemoteFile) -> usize {
+    rt.state
+        .tab()
+        .browse()
+        .and_then(|b| b.selected_dir())
+        .and_then(|d| d.files.iter().position(|x| x.path == f.path))
+        .expect("file listed in the user tab")
+}
+
+#[test]
+fn the_playing_row_shows_in_every_tab_listing_it_even_with_other_attributes() {
+    let mut rt = searched();
+    let (i, f) = row_of(&rt, "alice", "02 Salt Roads.flac");
+    // The same file as another listing reports it: other size and attributes.
+    let mut g = f.clone();
+    g.size += 1;
+    g.attrs.bitrate_kbps = Some(1);
+    rt.update(|s, _| s.play(&g));
+    run(&mut rt, 0.3);
+    assert!(rt.find(&format!("row-{i}/play/eq")).is_some(), "search row");
+    rt.update(|s, _| s.open_folder_of(&f));
+    run(&mut rt, 0.8);
+    let j = browse_row(&rt, &f);
+    assert!(
+        rt.find(&format!("file-{j}/play/eq")).is_some(),
+        "user tab row"
+    );
+}
+
+#[test]
+fn show_in_list_goes_back_to_the_tab_it_was_played_from() {
+    let mut rt = searched();
+    let (i, f) = row_of(&rt, "alice", "02 Salt Roads.flac");
+    let search_id = rt.state.tab().id;
+    rt.update(|s, _| s.play(&f));
+    rt.update(|s, _| s.open_folder_of(&f));
+    run(&mut rt, 0.8);
+    assert_ne!(rt.state.tab().id, search_id);
+    click(&mut rt, "now-title");
+    let tab = rt.state.tab();
+    assert_eq!(tab.id, search_id, "back to the search it was played from");
+    assert_eq!(tab.selected.as_deref(), Some(f.path.as_str()));
+    assert_eq!(
+        tab.group,
+        Some(("alice".to_string(), f.folder().to_string()))
+    );
+    assert!(!rt.state.reveal, "scrolled into view");
+    assert!(rt.find(&format!("row-{i}")).is_some());
+}
+
+#[test]
+fn show_in_list_with_its_tab_closed_uses_another_tab_or_opens_the_folder() {
+    let mut rt = searched();
+    let (_, f) = row_of(&rt, "alice", "02 Salt Roads.flac");
+    rt.update(|s, _| s.play(&f));
+    rt.update(|s, _| s.open_folder_of(&f));
+    run(&mut rt, 0.8);
+    let alice = rt.state.tab().id;
+    rt.update(|s, _| s.open_user("vinyl_rips"));
+    rt.update(|s, _| s.close_tab(0));
+    run(&mut rt, 0.8);
+    click(&mut rt, "now-title");
+    assert_eq!(rt.state.tab().id, alice, "another tab listing it");
+    let b = rt.state.active_browse().unwrap();
+    assert_eq!(b.selected.as_deref(), Some(f.folder()));
+    assert_eq!(b.highlight.as_deref(), Some(f.path.as_str()));
+    assert!(!rt.state.reveal, "scrolled into view");
+
+    // No tab lists it any more: its user's tab opens at its folder.
+    rt.update(|s, _| {
+        let i = s.tabs.iter().position(|t| t.id == alice).unwrap();
+        s.close_tab(i);
+    });
+    click(&mut rt, "now-title");
+    run(&mut rt, 0.8);
+    let b = rt.state.active_browse().unwrap();
+    assert_eq!(b.username, "alice");
+    assert_eq!(b.selected.as_deref(), Some(f.folder()));
+    assert_eq!(b.highlight.as_deref(), Some(f.path.as_str()));
+    assert!(!rt.state.reveal);
+    let j = browse_row(&rt, &f);
+    assert!(rt.find(&format!("file-{j}/play/eq")).is_some());
 }

@@ -533,6 +533,43 @@ file ("Show in folder"). Both put `dir` first in `Settings::recent_download_dirs
 `Settings::RECENT_DOWNLOAD_DIRS` = 5, serde default; `Settings::remember_download_dir`); the app
 persists with `config::save_settings(core.settings())`. `&mut self` because they update settings.
 
+### 3.12 Single files flat by default (additive)
+
+`Settings::single_file_subfolder: bool` (serde default **false**, as in Nicotine+). Single-file
+downloads — `Core::download`, `Core::download_to`, and keeping a ▶ from the cache (which goes
+through `download`) — go flat into the downloads folder / chosen dir when false, into
+`<remote folder name>/` when true. Folder downloads (`download_folder`, `download_folder_to`)
+always keep the folder name; an album the app fetches file by file ("play album → keep") uses
+`Core::download_album_file(&mut self, file, root: Option<&Path>) -> TransferId`, which always
+keeps it (`None` = downloads folder; `Some` updates `recent_download_dirs`). Collisions still get a
+unique name (`01 (2).flac`), never an overwrite. §3.11's layout description applies with this rule.
+
+### 3.13 Download history (additive)
+
+Every ↓ that ends — done, failed or cancelled — is recorded in
+`<Settings::data_dir>/history.jsonl` (`data_dir` defaults to `$XDG_DATA_HOME/wholeseek`, i.e.
+`~/.local/share/wholeseek`; read once at start). ▶ plays are not history; keeping one (a ↓ served
+from the cache) is. A refused duplicate ↓ is not recorded; a retried transfer replaces its earlier
+row. The row is written before the `Transfer*` event, so the UI sees it when handling the event.
+
+- `HistoryEntry { id, finished_at (unix s), username, remote_path, local_path: Option (done only),
+  size, format (extension), bitrate_kbps, sample_rate_hz, bit_depth, duration_secs (as advertised),
+  album (remote folder name), outcome: Outcome::{Done, Failed, Cancelled}, reason: Option }`;
+  `entry.exists_on_disk()` stats the file on each call (for "moved/deleted").
+- `Core::history(&self, &HistoryQuery { text, limit, offset }) -> Vec<HistoryEntry>`: newest first;
+  `text` = case-insensitive substring of remote path, user or local path; `limit 0` = all.
+- `Core::history_remove(&self, id) -> bool`, `Core::history_clear(&self) -> io::Result<()>`
+  (files on disk untouched).
+- `Core::was_downloaded(&self, user, remote_path) -> bool` and
+  `Core::downloaded_keys(&self) -> DownloadedKeys` (`Arc<HashSet<(user, remote_path)>>`, completed
+  only; a new set after each change — fetch once per frame, look up per row for the ✓ badge).
+
+Storage: append-only JSON lines (`add` / `remove` / `clear`), one write per line. Load skips lines
+it cannot parse (a crash mid-write), keeps the newest `HISTORY_CAP` = 50 000 entries and rewrites the
+file (temp + rename) if it held anything else; it is also compacted after 50 000 appends. If it
+cannot be loaded the history is kept in memory and one `Error { context: "history" }` is emitted.
+Only user names and paths are stored, never credentials. Nothing old is migrated.
+
 ### 3.7 Tests
 
 Offline: `cargo test -p wholeseek-core` — paths, ranking + `alternates` matching, cache

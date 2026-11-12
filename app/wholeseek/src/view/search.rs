@@ -28,7 +28,7 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
     )
     .grow(1.0)
     .max_w(560.0)
-    .child(icons::search(11.0, t.text_secondary));
+    .child(icons::search(icons::MD, t.text_secondary));
     let mut bar = row()
         .key("search-bar")
         .h(44.0)
@@ -50,7 +50,7 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
                     .key("empty")
                     .grow(1.0)
                     .center()
-                    .gap(6.0)
+                    .gap(8.0)
                     .help({
                         use crate::desktop::chord;
                         format!(
@@ -62,6 +62,11 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
                             chord("F")
                         )
                     })
+                    .child(icons::draw(
+                        &icons::SEARCH,
+                        24.0,
+                        t.text_secondary.alpha(0.6),
+                    ))
                     .child(
                         text("Search Soulseek")
                             .font(type_::TITLE)
@@ -104,12 +109,17 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
         );
     }
     bar = bar.child(summary);
+    let bar = match broadened(s, search, t) {
+        Some(line) => col().w_full().child(bar).child(line),
+        None => col().w_full().child(bar),
+    };
 
     // Nothing came back: no chips, filter or table, just what happened and what to do.
     if total == 0 {
         let mut body = col().key("no-results").grow(1.0).w_full().center().gap(6.0);
         if !searching {
             body = body
+                .child(icons::draw(&icons::SEARCH, 20.0, t.text_secondary.alpha(0.6)).mb(4.0))
                 .child(
                     text(format!("No results for “{}”", search.query))
                         .key("no-results-title")
@@ -127,7 +137,7 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
                     action(
                         "search-again",
                         "Search again",
-                        icons::retry(10.0, t.text),
+                        icons::retry(icons::MD, t.text),
                         t,
                     )
                     .mt(8.0)
@@ -185,14 +195,12 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
         .map(|i| format!("row-{i}"));
     // Chips left, the filter right. Built right-to-left so the filter comes first in Tab
     // order (query → filter → chips → results) while it sits at the right end.
-    // In the wide layout the filter ends where the table it narrows ends, not over the pane.
-    let tools = row().key("tools").h(36.0);
-    let tools = if super::details::wide(s) {
-        tools.w(super::details::TABLE_MAX_W)
-    } else {
-        tools.w_full()
-    };
-    let tools = tools
+    // The filter ends where the table it narrows ends.
+    let tools = row()
+        .key("tools")
+        .h(36.0)
+        .w_full()
+        .max_w(super::details::TABLE_MAX_W)
         .px(12.0)
         .gap(12.0)
         .center_y()
@@ -250,11 +258,9 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
                 &g.username,
                 folder,
                 s,
-                super::details::wide(s)
-                    && tab
-                        .group
-                        .as_ref()
-                        .is_some_and(|(u, d)| u == &g.username && d == folder),
+                tab.group
+                    .as_ref()
+                    .is_some_and(|(u, d)| u == &g.username && d == folder),
                 find.as_deref(),
                 t,
             ));
@@ -290,13 +296,10 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
         list = list.child(nothing_matches(st, t));
     }
     let saved = tab.scroll.clone();
-    let wide = super::details::wide(s);
-    let mut results = col().key("results").min_h(0.0);
-    results = if wide {
-        results.w(super::details::TABLE_MAX_W).h_full()
-    } else {
-        results.w_full().grow(1.0)
-    };
+    // The results take what the inspector leaves; their rows cap at TABLE_MAX_W, left-aligned
+    // so nothing moves when the inspector opens. Never wider than the window: no fixed
+    // widths from the measured window here (a stale width pushed the page off-screen).
+    let results = col().key("results").h_full().grow(1.0).shrink().min_h(0.0);
     let results = if shown > 0 {
         results.child(columns(s, FILE_INDENT, t)).child(hairline(t))
     } else {
@@ -311,19 +314,26 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
             .shrink()
             .min_h(0.0),
     );
-    let body = if wide {
-        // Wide window: the table at its natural width, the selected folder beside it.
-        row()
-            .key("results-split")
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .child(results)
-            .child(vline(t))
-            .child(super::details::pane(s, tab, st, t))
-    } else {
-        results
-    };
+    let inspector = super::details::inspector(s, tab, st, t);
+    let mut body = row()
+        .key("results-split")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(results);
+    if let Some(pane) = inspector {
+        let pane = row().h_full().child(vline(t)).child(pane);
+        body = if super::details::overlays(s) {
+            // Narrow window: over the results from the right, which keep their layout.
+            body.child(pane.pin(None, Some(0.0), Some(0.0), Some(0.0)).shadow(
+                0.0,
+                16.0,
+                rune::Color::BLACK.alpha(0.35),
+            ))
+        } else {
+            body.child(pane)
+        };
+    }
     col()
         .w_full()
         .grow(1.0)
@@ -332,6 +342,40 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
         .child(tools)
         .child(hairline(t))
         .child(body)
+}
+
+/// "Showing results for …": the typed words found nothing, so the core searched once more
+/// with broader ones (accents folded, one-letter words dropped).
+fn broadened(s: &App, search: &crate::tabs::SearchView, t: &Theme) -> Option<El> {
+    let info = s.backend.search_info(search.id)?;
+    let to = info.broadened_to?;
+    Some(
+        row()
+            .key("broadened")
+            .h(22.0)
+            .w_full()
+            .px(14.0)
+            .pb(4.0)
+            .gap(4.0)
+            .center_y()
+            .help(format!(
+                "Nothing matched “{}”, so these are for a broader search",
+                info.typed
+            ))
+            .child(
+                text("Showing results for")
+                    .font(META)
+                    .color(t.text_secondary),
+            )
+            .child(
+                text(to)
+                    .key("broadened-to")
+                    .font(META)
+                    .color(t.text)
+                    .truncate()
+                    .shrink(),
+            ),
+    )
 }
 
 /// "Nothing matches …" when the filter box or chips hide every result.
@@ -363,6 +407,11 @@ fn nothing_matches(st: &SearchTab, t: &Theme) -> El {
         .pt(64.0)
         .items_center()
         .gap(10.0)
+        .child(icons::draw(
+            &icons::FUNNEL,
+            20.0,
+            t.text_secondary.alpha(0.6),
+        ))
         .child(
             text(title)
                 .key("nothing-matches-title")
@@ -372,7 +421,7 @@ fn nothing_matches(st: &SearchTab, t: &Theme) -> El {
                 .truncate(),
         )
         .child(
-            action("clear-filter", button, icons::close(8.0, t.text), t).on_press_tx(
+            action("clear-filter", button, icons::close(icons::MD, t.text), t).on_press_tx(
                 move |s: &mut App, tx| {
                     clear(s);
                     tx.focus("filter", false);
@@ -426,11 +475,11 @@ fn find_box(
         .fill(t.card)
         .border(1.0, t.card_border)
         .help("Narrow these results: words match the start of words in the path or user; -word excludes")
-        .child(icons::filter(10.0, t.text_secondary.alpha(0.8)))
+        .child(icons::filter(icons::SM, t.text_secondary.alpha(0.8)))
         .child(field.grow(1.0).shrink().min_w(0.0));
     if active {
         b = b.child(
-            super::icon_button("filter-clear", icons::close(7.0, t.text_secondary), t)
+            super::icon_button("filter-clear", icons::close(icons::SM, t.text_secondary), t)
                 .size(18.0, 18.0)
                 .label("Clear filter")
                 .on_press_tx(|s: &mut App, tx| {
@@ -559,7 +608,7 @@ fn folder_line(
     find: Option<&crate::tabs::TextQuery>,
     t: &Theme,
 ) -> El {
-    let (tab, max_w) = (s.tab().id, super::details::table_max_w(s));
+    let (tab, max_w) = (s.tab().id, super::details::TABLE_MAX_W);
     let parts: Vec<&str> = folder.split('\\').collect();
     let shown: Vec<Option<usize>> = if parts.len() > MAX_SEGMENTS {
         let n = parts.len();
@@ -589,7 +638,7 @@ fn folder_line(
             let items = s.folder_menu(&u, &d);
             super::menu::at_point(s, p, items);
         })
-        .child(icons::folder(11.0, t.text_secondary));
+        .child(icons::folder(icons::SM, t.text_secondary));
     for (k, seg) in shown.into_iter().enumerate() {
         if k > 0 {
             r = r.child(text("/").font(META).color(t.text_secondary.alpha(0.6)));
@@ -623,7 +672,7 @@ fn folder_line(
         r = r.fill(t.hover);
     }
     r.child(el().grow(1.0)).child(
-        super::icon_button(&more, icons::more(12.0, t.text_secondary), t)
+        super::icon_button(&more, icons::more(icons::MD, t.text_secondary), t)
             .size(24.0, 20.0)
             .label("Folder actions")
             .group_opacity(0.0, 1.0)

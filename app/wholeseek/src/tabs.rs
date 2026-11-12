@@ -20,8 +20,11 @@ pub struct Tab {
     pub tree_scroll: Rc<Cell<f32>>,
     /// The selected file row (remote path): Enter plays it, its ⋯ stays visible.
     pub selected: Option<String>,
-    /// A search tab's selected folder group (user, folder): what the details pane shows.
+    /// A search tab's selected folder group (user, folder): what the inspector shows. `None`:
+    /// no inspector (closed with × or Esc until the next selection).
     pub group: Option<(String, String)>,
+    /// Restored from the last run and not fetched yet: searches or browses when shown.
+    pub restore: bool,
 }
 
 pub enum TabKind {
@@ -651,7 +654,18 @@ impl Tab {
             tree_scroll: Rc::default(),
             selected: None,
             group: None,
+            restore: false,
         }
+    }
+
+    /// × / Esc on the search inspector: close it (the selection goes with it). False when
+    /// there is none.
+    pub fn close_inspector(&mut self) -> bool {
+        if self.search().is_none() || self.group.is_none() {
+            return false;
+        }
+        self.group = None;
+        true
     }
 
     pub fn search(&self) -> Option<&SearchTab> {
@@ -692,7 +706,9 @@ impl Tab {
             TabKind::Search(s) => s
                 .search
                 .as_ref()
-                .map_or_else(|| "New search".into(), |v| v.query.clone()),
+                .map(|v| v.query.clone())
+                .or_else(|| self.restore.then(|| s.edit.text.clone()))
+                .unwrap_or_else(|| "New search".into()),
             TabKind::User(u) => u.browse.username.clone(),
         }
     }
@@ -705,6 +721,12 @@ impl Tab {
     pub fn tree_key(&self) -> String {
         format!("tree-{}", self.id)
     }
+}
+
+/// The same remote file: user and path. Listings of one file differ in size or attributes
+/// between a search result and a browse, so whole-struct equality is not enough.
+pub fn same_file(a: &RemoteFile, b: &RemoteFile) -> bool {
+    a.username == b.username && a.path == b.path
 }
 
 /// Audio by extension (rows of anything else are dimmed).

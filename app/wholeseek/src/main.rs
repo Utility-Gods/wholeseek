@@ -19,11 +19,14 @@ mod menu;
 mod playback;
 mod profile;
 mod queue;
+mod session;
 mod store;
 mod tabs;
 mod transfers;
 mod view;
 
+#[cfg(test)]
+mod session_tests;
 #[cfg(test)]
 mod tests;
 
@@ -47,7 +50,8 @@ fn init() -> App {
     if *DEMO.get().unwrap_or(&false) {
         return App::demo();
     }
-    let (app, tx) = App::real();
+    let (mut app, tx) = App::real();
+    app.enable_session(session::default_path());
     if let Ok(mut slot) = BOOT_TX.lock() {
         *slot = Some(tx);
     }
@@ -127,6 +131,9 @@ pub fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         s.menu = None;
         return true;
     }
+    if ev.key == Key::Escape && matches!(s.panel, Panel::None) && s.tab_mut().close_inspector() {
+        return true;
+    }
     let plain = !(ev.mods.ctrl || ev.mods.cmd || ev.mods.alt);
     match &ev.key {
         Key::Text(t) if t == " " && plain => s.toggle_pause(),
@@ -193,6 +200,56 @@ fn scene_results(s: &mut App) {
     s.download(&demo_file("vinyl_rips", "A1 Northern Glass.flac"));
 }
 
+/// A search like a real one: long scene-release folder names, a 1-file folder selected.
+fn scene_jungle(s: &mut App) {
+    s.demo_login();
+    let hit = |u: &str, p: &str, size: u64| wholeseek_core::SearchHit {
+        file: wholeseek_core::RemoteFile {
+            username: u.into(),
+            path: p.into(),
+            size,
+            attrs: Default::default(),
+        },
+        free_slot: true,
+        speed: 1_200_000,
+    };
+    let hits = vec![
+        hit(
+            "K1RZA",
+            r"@@xkzqp\Music\Singles\Put It On (Jungle Mix).mp3",
+            9_400_000,
+        ),
+        hit(
+            "divided1980",
+            r"Music\VA_-_Liondub_and_Deekline_Present_Welcome_To_The_Jungle-(JC175ALBUM)-WEB-FLAC-2023\01-deekline_and_ed_solo-put_it_on_(jungle_mix).flac",
+            41_000_000,
+        ),
+        hit(
+            "divided1980",
+            r"Music\VA_-_Liondub_and_Deekline_Present_Welcome_To_The_Jungle-(JC175ALBUM)-WEB-FLAC-2023\02-liondub-babylon_burning_(feat_general_levy)_(original_mix)_extended_version_for_djs.flac",
+            52_000_000,
+        ),
+        hit(
+            "a_user_with_a_rather_long_name_2024",
+            r"D:\Shared\Drum & Bass\Jungle\1994 - 1996\Classics Collection Vol. 3 (Remastered 2019) [FLAC 24-96]\CD2\07 - Put It On (Original 1995 Dubplate Version).flac",
+            88_000_000,
+        ),
+    ];
+    let st = s.tab_mut().search_mut().expect("search tab");
+    let mut v = crate::tabs::SearchView {
+        id: wholeseek_core::SearchId(777),
+        query: "put it on jungle".into(),
+        hits,
+        finished: true,
+        keys: Vec::new(),
+        matched: Default::default(),
+    };
+    v.reindex();
+    st.search = Some(v);
+    st.edit.replace_text("put it on jungle");
+    s.tab_mut().group = Some(("K1RZA".into(), r"@@xkzqp\Music\Singles".into()));
+}
+
 /// A search that finds nothing ("Wazn't Me").
 fn scene_no_results(s: &mut App) {
     s.demo_login();
@@ -222,6 +279,58 @@ fn scene_wide(s: &mut App) {
     let tab = s.tab_mut();
     tab.selected = Some(f.path.clone());
     tab.group = Some((f.username.clone(), f.folder().to_string()));
+}
+
+/// Two folders used with "Download to…" before, as the menus then list them.
+fn demo_recent_dirs(s: &mut App) {
+    s.commit_settings(|c| {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        c.recent_download_dirs = vec![
+            home.join("Music/Vinyl"),
+            "/media/usb/Music".into(),
+            home.join("Music/Archive/Electronic/Drum and Bass/1995 Dubplates"),
+        ];
+    });
+    s.settings_form.saved_at = None;
+}
+
+/// A file's ⋯ menu open in the results.
+fn scene_file_menu(s: &mut App) {
+    scene_results(s);
+    demo_recent_dirs(s);
+    let f = demo_file("alice", "03 Low Tide Radio.flac");
+    let items = crate::menu::file_items(&f, false, &s.backend.settings().recent_download_dirs);
+    let key = crate::view::files_more_key(s.tab().id, &f.path);
+    s.open_menu(crate::menu::MenuAnchor::Key(key), items);
+}
+
+/// A folder line's ⋯ menu open in the results.
+fn scene_folder_menu(s: &mut App) {
+    scene_results(s);
+    demo_recent_dirs(s);
+    let folder = demo_file("alice", "02 Salt Roads.flac")
+        .folder()
+        .to_string();
+    // Results stream in after setup, so say "playable" as the live menu would.
+    let recent = s.backend.settings().recent_download_dirs.clone();
+    let items = crate::menu::folder_items("alice", &folder, true, &recent);
+    let key = crate::view::files_more_key(s.tab().id, &folder);
+    s.open_menu(crate::menu::MenuAnchor::Key(key), items);
+}
+
+/// The details pane's "Download to…" menu.
+fn scene_pane_download_to(s: &mut App) {
+    scene_wide(s);
+    demo_recent_dirs(s);
+    let target = crate::menu::DlTarget::Folder {
+        username: "alice".into(),
+        folder: demo_file("alice", "02 Salt Roads.flac").folder().into(),
+    };
+    let items = crate::menu::download_to_items(&target, &s.backend.settings().recent_download_dirs);
+    s.open_menu(
+        crate::menu::MenuAnchor::Key("details-download-to".into()),
+        items,
+    );
 }
 
 fn scene_browse(s: &mut App) {
@@ -334,10 +443,15 @@ fn main() {
     {
         eprintln!("wholeseek: app icon not set ({e})");
     }
-    rune::run(AppSpec::<App> {
+    // Quit (window closed, ⌘Q, logout/shutdown): save the open tabs first.
+    rune::App::new(AppSpec::<App> {
         scenes: &[
             ("search-tab", scene_results),
             ("wide", scene_wide),
+            ("jungle", scene_jungle),
+            ("file-menu", scene_file_menu),
+            ("folder-menu", scene_folder_menu),
+            ("pane-download-to", scene_pane_download_to),
             ("no-results", scene_no_results),
             ("filtered", scene_filtered),
             ("nothing-matches", scene_nothing_matches),
@@ -360,5 +474,7 @@ fn main() {
         poll: Some(poll),
         on_key: Some(on_key),
         ..AppSpec::new("wholeseek", (W, H), init, view::view)
-    });
+    })
+    .on_quit(|s, _| s.flush_session())
+    .run();
 }

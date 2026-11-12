@@ -8,13 +8,38 @@ use std::rc::Rc;
 
 use wholeseek_core::RemoteFile;
 
-use super::files::{RowCtx, action, columns, file_row, more_key};
-use super::{META, field_box, hairline, icons, input, red, tnum, vline};
+use super::album_header::{self, Actions, AlbumHeader, UserStatus};
+use super::files::{RowCtx, columns, file_row, more_key};
+use super::{field_box, hairline, icons, input, red, vline};
 use crate::app::App;
-use crate::fmt;
 use crate::tabs::{BrowseView, Tab};
 
 const TREE_W: f32 = 240.0;
+/// Left edge of the file names in [`file_row`] (12 pt padding, 24 pt ▶, 10 pt gap): the
+/// folder header's text starts there.
+const NAME_X: f32 = 46.0;
+
+/// The owner's slot and speed: from a search result when there is one (fresher), else from
+/// the profile.
+fn user_status(s: &App, username: &str) -> UserStatus {
+    let hit = s
+        .tabs
+        .iter()
+        .filter_map(|t| t.search()?.search.as_ref())
+        .flat_map(|v| v.hits.iter())
+        .find(|h| h.file.username == username);
+    if let Some(h) = hit {
+        return UserStatus {
+            free_slot: Some(h.free_slot),
+            speed: Some(h.speed),
+        };
+    }
+    let p = s.profiles.get(username).map(|e| &e.profile);
+    UserStatus {
+        free_slot: p.and_then(|p| p.free_slot),
+        speed: p.and_then(|p| p.avg_speed),
+    }
+}
 
 pub fn page(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
     let mut page = col().w_full().grow(1.0).min_h(0.0);
@@ -78,7 +103,7 @@ fn tree(tab: &Tab, b: &BrowseView, t: &Theme) -> El {
         let selected = b.selected.as_deref() == Some(path.as_str());
         let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
         let chevron: El = if has_children {
-            icons::chevron(9.0, open, t.text_secondary)
+            icons::chevron(icons::SM, open, t.text_secondary)
         } else {
             el().size(9.0, 9.0)
         };
@@ -146,49 +171,23 @@ fn folder(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
                 .color(t.text_secondary),
         );
     };
-    let user = b.username.clone();
-    let path = dir.path.clone();
-    let total: u64 = dir.files.iter().map(|f| f.size).sum();
-    let head = row()
-        .key("folder-head")
-        .h(36.0)
-        .w_full()
-        .px(12.0)
-        .gap(10.0)
-        .center_y()
-        .child(
-            text(fmt::crumbs(&dir.path))
-                .key("crumb-path")
-                .font(type_::TITLE)
-                .color(t.text)
-                .truncate()
-                .shrink(),
-        )
-        .child(
-            text(format!(
-                "{} {} · {}",
-                dir.files.len(),
-                if dir.files.len() == 1 {
-                    "file"
-                } else {
-                    "files"
-                },
-                fmt::size(total)
-            ))
-            .key("folder-stats")
-            .font(tnum(META))
-            .color(t.text_secondary),
-        )
-        .child(el().grow(1.0))
-        .child(
-            action(
-                "download-folder",
-                "Download folder",
-                icons::down(11.0, t.text),
-                t,
-            )
-            .on_press(move |s: &mut App| s.download_folder(&user, &path)),
-        );
+    let head = album_header::view(
+        &AlbumHeader {
+            prefix: "folder-",
+            username: &b.username,
+            folder: &dir.path,
+            files: &dir.files,
+            status: user_status(s, &b.username),
+            actions: Actions {
+                play: true,
+                download_to: true,
+                browse_user: false,
+            },
+            inset: super::art::GAP,
+        },
+        t,
+    );
+    let head = super::art::beside(s, &b.username, &dir.path, NAME_X, head, t);
     let mut list = col().w_full().pb(8.0);
     let files: Rc<[RemoteFile]> = dir.files.clone().into();
     for (i, f) in dir.files.iter().enumerate() {

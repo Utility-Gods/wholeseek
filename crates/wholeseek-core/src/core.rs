@@ -13,6 +13,7 @@
 //! backoff) are documented in docs/core-api.md.
 
 use crate::event::CoreEvent;
+use crate::history::{DownloadedKeys, History, HistoryEntry, HistoryQuery};
 use crate::model::{Credentials, PlayTicket, RemoteFile, SearchId, Settings, TransferId};
 use crate::net::{Connector, RealConnector};
 use crate::status::{CoreStatus, SearchInfo};
@@ -80,6 +81,13 @@ pub enum Command {
     ClearCache,
     /// Additive: replace the wishlist (`Settings::wishlist`).
     SetWishlist(Vec<String>),
+    /// Additive: fetch the cover image of a remote folder (see [`crate::cover`]).
+    FetchCover {
+        store: crate::cover::Covers,
+        username: String,
+        folder: String,
+        listing: Option<Vec<(String, u64)>>,
+    },
     Shutdown,
 }
 
@@ -91,8 +99,13 @@ pub struct Core {
     settings: Settings,
     status: Arc<Mutex<CoreStatus>>,
     infos: SearchInfos,
+    history: SharedHistory,
     worker: Option<JoinHandle<()>>,
+    covers: crate::cover::Covers,
 }
+
+/// Shared with the worker, which records finished downloads.
+pub(crate) type SharedHistory = Arc<Mutex<History>>;
 
 /// Shared with the worker: what happened to recent searches.
 pub(crate) type SearchInfos = Arc<Mutex<std::collections::BTreeMap<SearchId, SearchInfo>>>;
@@ -122,6 +135,17 @@ impl Core {
         let ids = Arc::new(AtomicU64::new(first));
         let status = Arc::new(Mutex::new(CoreStatus::default()));
         let infos = SearchInfos::default();
+        // Unreadable history must not stop the app: keep it in memory and
+        // let the worker report the error once it runs.
+        let (history, history_error) = match History::open(&settings.data_dir) {
+            Ok(h) => (h, None),
+            Err(e) => (
+                History::in_memory(),
+                Some(format!("{}: {e}", settings.data_dir.display())),
+            ),
+        };
+        let history = Arc::new(Mutex::new(history));
+        let settings_cache_dir = settings.cache_dir.clone();
         let worker = Worker::new(
             ev_tx,
             tx.clone(),
@@ -132,6 +156,8 @@ impl Core {
                 ids: ids.clone(),
                 status: status.clone(),
                 infos: infos.clone(),
+                history: history.clone(),
+                history_error,
             },
         );
         let handle = std::thread::Builder::new()
@@ -144,7 +170,11 @@ impl Core {
                 settings,
                 status,
                 infos,
+                history,
                 worker: Some(handle),
+                covers: crate::cover::Covers::open(
+                    settings_cache_dir.join(crate::cover::COVERS_DIR_NAME),
+                ),
             },
             ev_rx,
         ))
@@ -221,12 +251,24 @@ impl Core {
         ticket
     }
 
-    /// ↓ Save `file` under `downloads/<remote folder>/`. If the same file is
-    /// fully cached from playing, the worker moves it instead of fetching.
+    /// Where a single-file download into `root` goes: `root` itself, or
+    /// `root/<remote folder name>` with `Settings::single_file_subfolder`.
+    fn single_dir(&self, root: &Path, file: &RemoteFile) -> PathBuf {
+        if self.settings.single_file_subfolder {
+            paths::download_dir_for(root, &file.path)
+        } else {
+            root.to_path_buf()
+        }
+    }
+
+    /// ↓ Save `file` in the downloads folder: flat, or under
+    /// `<remote folder name>/` with `Settings::single_file_subfolder`. If the
+    /// same file is fully cached from playing, the worker moves it instead of
+    /// fetching (same destination rule).
     #[must_use]
     pub fn download(&self, file: &RemoteFile) -> TransferId {
         let id = TransferId(self.next());
-        let dir = paths::download_dir_for(&self.settings.download_dir, &file.path);
+        let dir = self.single_dir(&self.settings.download_dir, file);
         self.send(Command::Fetch {
             id,
             file: file.clone(),
@@ -236,8 +278,9 @@ impl Core {
         id
     }
 
-    /// Additive: ↓ `file` into `<dir>/<remote folder name>/` instead of the
-    /// downloads folder ("Download to…"). Staging, `.part` handling and
+    /// Additive: ↓ `file` into `dir` instead of the downloads folder
+    /// ("Download to…"); flat or in `<remote folder name>/` as for
+    /// [`Core::download`] (`Settings::single_file_subfolder`). Staging, `.part` handling and
     /// name-collision rules are those of [`Core::download`]: the file streams
     /// in `<download_dir>/.wholeseek-partial/t<id>/` and is moved (rename, or
     /// copy + delete across filesystems) when complete; `TransferDone { path }`
@@ -249,7 +292,30 @@ impl Core {
         self.send(Command::Fetch {
             id,
             file: file.clone(),
-            dir: paths::download_dir_for(dir, &file.path),
+            dir: self.single_dir(dir, file),
+            kind: crate::model::TransferKind::Download,
+        });
+        id
+    }
+
+    /// Additive: ↓ one track of an album the app downloads file by file (e.g.
+    /// "play album → keep"): always into `<root>/<remote folder name>/`
+    /// regardless of `Settings::single_file_subfolder`, so tracks of different
+    /// albums cannot collide. `root`: `None` = the downloads folder; `Some`
+    /// also updates `Settings::recent_download_dirs`.
+    pub fn download_album_file(&mut self, file: &RemoteFile, root: Option<&Path>) -> TransferId {
+        let root = match root {
+            Some(d) => {
+                self.settings.remember_download_dir(d);
+                d.to_path_buf()
+            }
+            None => self.settings.download_dir.clone(),
+        };
+        let id = TransferId(self.next());
+        self.send(Command::Fetch {
+            id,
+            file: file.clone(),
+            dir: paths::download_dir_for(&root, &file.path),
             kind: crate::model::TransferKind::Download,
         });
         id
@@ -326,6 +392,30 @@ impl Core {
 
     /// Additive: delete cached plays (`cache/t*`), keeping the current play
     /// and plays still being fetched. `status().cache` shows the result.
+    /// Additive: the album cover cache (`<cache_dir>/covers`). `cached` is memory-only and safe
+    /// for list rows; set a notify to repaint when a cover lands.
+    #[must_use]
+    pub fn covers(&self) -> &crate::cover::Covers {
+        &self.covers
+    }
+
+    /// Additive: fetch the cover image of `folder` on `username`'s share, unless it is cached,
+    /// pending or a recent miss. `listing`: the folder's files (remote paths or basenames, with
+    /// sizes) if known; else the worker uses a cached browse or asks the peer for the folder.
+    /// One fetch per peer at a time; not a transfer (no events, history or downloads folder).
+    /// Only for a folder the user selected or is playing — never from list rendering.
+    pub fn fetch_cover(&self, username: &str, folder: &str, listing: Option<Vec<(String, u64)>>) {
+        if self.covers.state(username, folder) != crate::cover::CoverState::Unknown {
+            return;
+        }
+        self.send(Command::FetchCover {
+            store: self.covers.clone(),
+            username: username.to_string(),
+            folder: folder.to_string(),
+            listing,
+        });
+    }
+
     pub fn clear_cache(&self) {
         self.send(Command::ClearCache);
     }
@@ -337,6 +427,56 @@ impl Core {
     #[must_use]
     pub fn search_info(&self, id: SearchId) -> Option<SearchInfo> {
         self.infos.lock().ok()?.get(&id).cloned()
+    }
+
+    /// Additive: download history, newest first (↓ done, failed, cancelled;
+    /// ▶ plays only when kept). See [`crate::history`].
+    #[must_use]
+    pub fn history(&self, query: &HistoryQuery) -> Vec<HistoryEntry> {
+        self.history
+            .lock()
+            .map(|h| h.query(query))
+            .unwrap_or_default()
+    }
+
+    /// Additive: delete one history entry. Returns whether it existed.
+    pub fn history_remove(&self, id: u64) -> bool {
+        self.history
+            .lock()
+            .ok()
+            .and_then(|mut h| h.remove(id).ok())
+            .unwrap_or(false)
+    }
+
+    /// Additive: forget the whole history (files on disk are untouched).
+    ///
+    /// # Errors
+    /// I/O errors rewriting the history file (memory is cleared anyway).
+    pub fn history_clear(&self) -> std::io::Result<()> {
+        self.history
+            .lock()
+            .map_err(|_| std::io::Error::other("history lock poisoned"))?
+            .clear()
+    }
+
+    /// Additive: whether this exact remote file was downloaded (completed)
+    /// before — for an "already downloaded" ✓ on search results.
+    #[must_use]
+    pub fn was_downloaded(&self, username: &str, remote_path: &str) -> bool {
+        self.history
+            .lock()
+            .is_ok_and(|h| h.was_downloaded(username, remote_path))
+    }
+
+    /// Additive: every `(username, remote_path)` downloaded before, as a
+    /// shared set (cheap to clone; a new set after each change). Fetch once per
+    /// frame/batch and look up per row.
+    #[must_use]
+    pub fn downloaded_keys(&self) -> DownloadedKeys {
+        self.history
+            .lock()
+            .map(|h| h.downloaded_keys())
+            .unwrap_or_default()
     }
 
     /// Additive: the wishlist (`Settings::wishlist`).
@@ -410,10 +550,12 @@ mod tests {
         }
     }
 
-    fn settings() -> Settings {
+    /// Never touches the real data dir: history goes to `tmp`.
+    fn settings(tmp: &tempfile::TempDir) -> Settings {
         Settings {
             download_dir: "/dl".into(),
             cache_dir: "/cache".into(),
+            data_dir: tmp.path().join("data"),
             ..Settings::default()
         }
     }
@@ -427,7 +569,8 @@ mod tests {
 
     #[test]
     fn play_fetch_targets_cache_never_downloads() {
-        let (core, _ev) = Core::start(settings()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, _ev) = Core::start(settings(&tmp)).unwrap();
         let t = core.play_fetch(&file(r"Music\Album\01 a.flac"));
         assert!(t.part_path.starts_with("/cache"));
         assert!(!t.part_path.starts_with("/dl"));
@@ -442,7 +585,8 @@ mod tests {
 
     #[test]
     fn ids_are_unique_across_kinds() {
-        let (core, _ev) = Core::start(settings()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, _ev) = Core::start(settings(&tmp)).unwrap();
         let a = core.search("x");
         let b = core.download(&file("a.flac"));
         let c = core.search("y");
@@ -455,6 +599,7 @@ mod tests {
         let (core, ev) = Core::start(Settings {
             download_dir: tmp.path().join("dl"),
             cache_dir: tmp.path().join("cache"),
+            data_dir: tmp.path().join("data"),
             ..Settings::default()
         })
         .unwrap();

@@ -209,6 +209,14 @@ pub struct Settings {
     /// `download_folder_to`), most recent first, at most
     /// [`Settings::RECENT_DOWNLOAD_DIRS`].
     pub recent_download_dirs: Vec<PathBuf>,
+    /// Single-file downloads (`Core::download`, `download_to`, keeping a ▶
+    /// from the cache) go into `<dir>/<remote folder name>/` when true, flat
+    /// into `<dir>/` when false (default, as in Nicotine+). Folder downloads
+    /// always keep the folder name.
+    pub single_file_subfolder: bool,
+    /// Where persistent app data lives (download history,
+    /// `history::HISTORY_FILE`). Read once at `Core::start`.
+    pub data_dir: PathBuf,
 }
 
 impl Settings {
@@ -226,8 +234,9 @@ impl Settings {
 }
 
 impl Default for Settings {
-    /// XDG locations: `$XDG_DOWNLOAD_DIR/<APP_NAME>` (else `~/Downloads/<APP_NAME>`)
-    /// and `$XDG_CACHE_HOME/<APP_NAME>` (else `~/.cache/<APP_NAME>`), with
+    /// XDG locations: `$XDG_DOWNLOAD_DIR/<APP_NAME>` (else `~/Downloads/<APP_NAME>`),
+    /// `$XDG_CACHE_HOME/<APP_NAME>` (else `~/.cache/<APP_NAME>`) and
+    /// `$XDG_DATA_HOME/<APP_NAME>` (else `~/.local/share/<APP_NAME>`), with
     /// [`crate::config::APP_NAME`].
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -246,6 +255,10 @@ impl Default for Settings {
             play_start_timeout_secs: 8,
             wishlist: Vec::new(),
             recent_download_dirs: Vec::new(),
+            single_file_subfolder: false,
+            data_dir: dirs::data_dir()
+                .unwrap_or_else(|| home.join(".local").join("share"))
+                .join(crate::config::APP_NAME),
         }
     }
 }

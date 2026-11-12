@@ -497,6 +497,8 @@ pub(crate) mod tests {
             play_start_timeout_secs: 5,
             wishlist: vec!["wasn't me".into()],
             recent_download_dirs: vec!["/elsewhere".into()],
+            single_file_subfolder: true,
+            data_dir: "/data".into(),
         }
     }
 
@@ -597,6 +599,10 @@ pub(crate) mod tests {
         assert_eq!(l.settings.listen_port, 2240);
         assert!(l.settings.wishlist.is_empty());
         assert!(l.settings.recent_download_dirs.is_empty());
+        assert!(
+            !l.settings.single_file_subfolder,
+            "old configs: flat single files"
+        );
         // And they round-trip once set.
         let mut s = l.settings.clone();
         s.wishlist.push("wasn't me".into());

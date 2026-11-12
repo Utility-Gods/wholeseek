@@ -1,11 +1,12 @@
 //! What the UI talks to: the real [`wholeseek_core::Core`], or the demo's fake event source.
 //! Both are driven the same way: commands return at once, events are drained each frame.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use wholeseek_core::{
-    Core, CoreEvent, Credentials, PlayTicket, RemoteFile, SearchId, Settings, TransferId,
+    Core, CoreEvent, Credentials, DownloadedKeys, PlayTicket, RemoteFile, SearchId, Settings,
+    TransferId,
 };
 
 use crate::demo::Call;
@@ -41,6 +42,13 @@ impl Backend for IdleBackend {
         TransferId(0)
     }
     fn download_folder(&mut self, _: &str, _: &str) {}
+    fn download_to(&mut self, _: &RemoteFile, _: &Path) -> TransferId {
+        TransferId(0)
+    }
+    fn download_folder_to(&mut self, _: &str, _: &str, _: &Path) {}
+    fn download_album_file(&mut self, _: &RemoteFile, _: Option<&Path>) -> TransferId {
+        TransferId(0)
+    }
     fn cancel(&mut self, _: TransferId) {}
     fn retry(&mut self, _: TransferId) {}
     fn set_shares(&mut self, _: Vec<PathBuf>) {}
@@ -69,6 +77,15 @@ pub trait Backend {
     fn play_fetch(&mut self, file: &RemoteFile) -> PlayTicket;
     fn download(&mut self, file: &RemoteFile) -> TransferId;
     fn download_folder(&mut self, username: &str, folder: &str);
+    /// "Download to…": one file into `dir` (flat, or in its album folder with
+    /// `Settings::single_file_subfolder`); `dir` heads `Settings::recent_download_dirs`.
+    fn download_to(&mut self, file: &RemoteFile, dir: &Path) -> TransferId;
+    /// "Download folder to…": `<dir>/<remote folder name>/`; updates the recent folders.
+    fn download_folder_to(&mut self, username: &str, folder: &str, dir: &Path);
+    /// One track of an album, always in `<root>/<remote folder name>/` whatever the setting
+    /// (Keep while an album plays). `root`: `None` the downloads folder; `Some` updates the
+    /// recent folders.
+    fn download_album_file(&mut self, file: &RemoteFile, root: Option<&Path>) -> TransferId;
     fn cancel(&mut self, id: TransferId);
     fn retry(&mut self, id: TransferId);
     fn set_shares(&mut self, dirs: Vec<PathBuf>);
@@ -84,12 +101,43 @@ pub trait Backend {
     fn status(&self) -> CoreStatus;
     /// Delete cached plays except the current and in-flight ones.
     fn clear_cache(&mut self);
+    /// Every `(username, remote path)` downloaded before (this run or earlier): the
+    /// "Downloaded" mark. A shared set; fetch once per frame.
+    fn downloaded_keys(&self) -> DownloadedKeys {
+        DownloadedKeys::default()
+    }
+    /// What happened to a recent search: what was typed, whether it was broadened (and to
+    /// what).
+    fn search_info(&self, _id: SearchId) -> Option<wholeseek_core::status::SearchInfo> {
+        None
+    }
+    /// Add a wishlist query (`Settings::wishlist`); false if empty or already there.
+    /// Persist the settings afterwards.
+    fn wishlist_add(&mut self, _query: &str) -> bool {
+        false
+    }
+    /// Remove a wishlist query; whether it was there. Persist the settings afterwards.
+    fn wishlist_remove(&mut self, _query: &str) -> bool {
+        false
+    }
     /// Seconds until `drain` has more to say without an outside wake (demo timers).
     fn next_tick(&self) -> Option<f64> {
         None
     }
     /// Called once with the window's waker: events arriving later wake the UI.
     fn set_waker(&mut self, _wake: rune::Waker) {}
+    /// The album cover cache (`wholeseek_core::cover`), if this backend has one.
+    fn covers(&self) -> Option<&wholeseek_core::Covers> {
+        None
+    }
+    /// Fetch a folder's cover: only for the selected or playing folder (`view::art`).
+    fn fetch_cover(
+        &mut self,
+        _username: &str,
+        _folder: &str,
+        _listing: Option<Vec<(String, u64)>>,
+    ) {
+    }
     /// Commands received so far (demo only; tests read it).
     fn calls(&self) -> &[Call] {
         &[]
@@ -140,6 +188,15 @@ impl Backend for RealBackend {
     fn download_folder(&mut self, username: &str, folder: &str) {
         self.core.download_folder(username, folder);
     }
+    fn download_to(&mut self, file: &RemoteFile, dir: &Path) -> TransferId {
+        self.core.download_to(file, dir)
+    }
+    fn download_folder_to(&mut self, username: &str, folder: &str, dir: &Path) {
+        self.core.download_folder_to(username, folder, dir);
+    }
+    fn download_album_file(&mut self, file: &RemoteFile, root: Option<&Path>) -> TransferId {
+        self.core.download_album_file(file, root)
+    }
     fn cancel(&mut self, id: TransferId) {
         self.core.cancel(id);
     }
@@ -169,6 +226,24 @@ impl Backend for RealBackend {
     }
     fn clear_cache(&mut self) {
         self.core.clear_cache();
+    }
+    fn covers(&self) -> Option<&wholeseek_core::Covers> {
+        Some(self.core.covers())
+    }
+    fn fetch_cover(&mut self, username: &str, folder: &str, listing: Option<Vec<(String, u64)>>) {
+        self.core.fetch_cover(username, folder, listing);
+    }
+    fn downloaded_keys(&self) -> DownloadedKeys {
+        self.core.downloaded_keys()
+    }
+    fn search_info(&self, id: SearchId) -> Option<wholeseek_core::status::SearchInfo> {
+        self.core.search_info(id)
+    }
+    fn wishlist_add(&mut self, query: &str) -> bool {
+        self.core.wishlist_add(query)
+    }
+    fn wishlist_remove(&mut self, query: &str) -> bool {
+        self.core.wishlist_remove(query)
     }
     fn drain(&mut self, _now: f64) -> Vec<CoreEvent> {
         let mut out = Vec::new();

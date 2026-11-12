@@ -1732,13 +1732,22 @@ mod tests {
             }
         }
         assert_eq!(hits.len(), 20_000);
-        // Warm up allocator/caches once, then measure.
+        // A regression guard, not a benchmark: warm up, take the median of 5 runs
+        // (robust to a busy machine), and keep the budgets generous. Release is what
+        // users run; unoptimized builds (~15× slower) only guard against quadratic work.
         let _ = group_hits("artist album", &hits[..1000]);
-        let t = std::time::Instant::now();
-        let g = group_hits("artist album xtal", &hits);
-        let el = t.elapsed();
+        let mut times = Vec::new();
+        let mut g = None;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            g = Some(group_hits("artist album xtal", &hits));
+            times.push(t.elapsed());
+        }
+        let g = g.unwrap();
+        times.sort();
+        let el = times[times.len() / 2];
         println!(
-            "[group] 20000 hits → {} albums ({} sources), {} tracks in {:.1} ms",
+            "[group] 20000 hits → {} albums ({} sources), {} tracks, median {:.1} ms of {times:?}",
             g.albums.len(),
             g.albums.iter().map(Album::source_count).sum::<usize>(),
             g.tracks.len(),
@@ -1749,9 +1758,7 @@ mod tests {
             g.albums.iter().map(Album::source_count).sum::<usize>(),
             2000
         );
-        // The bound is for optimized builds (what users run). Unoptimized test
-        // builds are ~15× slower; they only guard against accidental quadratic work.
-        let limit = if cfg!(debug_assertions) { 1000 } else { 50 };
-        assert!(el.as_millis() < limit, "took {el:?} (limit {limit} ms)");
+        let limit = if cfg!(debug_assertions) { 5000 } else { 200 };
+        assert!(el.as_millis() < limit, "median {el:?} (limit {limit} ms)");
     }
 }

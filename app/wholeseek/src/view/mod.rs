@@ -4,9 +4,11 @@
 //! track, primary buttons, focus). Motion: none on entry or exit — the whole window lands
 //! changes at once (`instant_changes`); only hover/press colours move, in 60 ms.
 
+pub(crate) mod album_header;
+pub(crate) mod art;
 mod details;
 mod files;
-mod icons;
+pub mod icons;
 mod menu;
 mod onboarding;
 mod panels;
@@ -16,8 +18,7 @@ mod search;
 mod strip;
 mod user;
 #[cfg(test)]
-pub use details::{PANE_MIN_WINDOW_W, TABLE_MAX_W};
-#[cfg(test)]
+pub use details::{INSPECTOR_W, TABLE_MAX_W};
 pub use files::more_key as files_more_key;
 pub use search::MAX_FORMAT_CHIPS;
 #[cfg(test)]
@@ -194,7 +195,7 @@ fn banner(s: &App, t: &Theme) -> Option<El> {
     if s.conn == Conn::Displaced {
         return Some(
             line("displaced", "Signed in elsewhere".into(), pal::muted()).child(
-                button("reconnect", "Reconnect", false, t)
+                button_icon("reconnect", &icons::REFRESH_CW, "Reconnect", false, t)
                     .h(24.0)
                     .on_press(|s: &mut App| s.reconnect()),
             ),
@@ -203,7 +204,7 @@ fn banner(s: &App, t: &Theme) -> Option<El> {
     let e = s.error.as_ref()?;
     Some(
         line("error", e.clone(), red()).child(
-            icon_button("dismiss", icons::close(9.0, t.text_secondary), t)
+            icon_button("dismiss", icons::close(icons::SM, t.text_secondary), t)
                 .size(22.0, 22.0)
                 .label("Dismiss")
                 .on_press(|s: &mut App| s.error = None),
@@ -279,6 +280,62 @@ pub fn button(key: &str, label: &str, primary: bool, t: &Theme) -> El {
             .hover(t.control_track)
             .press(t.control_track)
     }
+}
+
+/// [`button`] with an icon before its label.
+pub fn button_icon(
+    key: &str,
+    icon: &'static rune::Icon,
+    label: &str,
+    primary: bool,
+    t: &Theme,
+) -> El {
+    let ink = if primary { pal::bg() } else { t.text };
+    let b = row()
+        .key(key.to_string())
+        .h(28.0)
+        .px(12.0)
+        .gap(6.0)
+        .center()
+        .radius(4.0)
+        .cursor(Cursor::Pointer)
+        .role("button")
+        .label(label.to_string())
+        .child(icons::draw(icon, icons::MD, ink))
+        .child(text(label.to_string()).font(type_::LABEL).color(ink));
+    if primary {
+        b.fill(accent()).hover(hex(0xfdba74)).press(hex(0xf97316))
+    } else {
+        b.fill(t.hover)
+            .hover(t.control_track)
+            .press(t.control_track)
+    }
+}
+
+/// An on/off switch (flat, no motion): the knob sits right and the track is the accent when on.
+pub fn switch(key: &str, on: bool, label: &str, t: &Theme) -> El {
+    let knob =
+        el().size(12.0, 12.0)
+            .radius(6.0)
+            .fill(if on { pal::bg() } else { t.text_secondary });
+    let mut track = row()
+        .key(key.to_string())
+        .w(28.0)
+        .h(16.0)
+        .px(2.0)
+        .radius(8.0)
+        .center_y()
+        .fill(if on { accent() } else { t.control_track })
+        .cursor(Cursor::Pointer)
+        .role("switch")
+        .checked(on)
+        .label(label.to_string())
+        .focusable(true)
+        .focus_ring(1.0, 1.0, accent().alpha(0.6));
+    if on {
+        track = track.child(el().grow(1.0));
+    }
+    track.child(knob)
 }
 
 /// A boxed single-line text field. `input` is the `text_input(..).on_edit(..)` element.

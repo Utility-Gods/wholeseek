@@ -7,8 +7,9 @@
 
 use crate::cache;
 use crate::core::Command;
-use crate::core::SearchInfos;
+use crate::core::{SearchInfos, SharedHistory};
 use crate::event::{CoreEvent, DisconnectReason, PortMapOutcome};
+use crate::history::Outcome;
 use crate::model::{
     AudioAttrs, BrowseDir, Credentials, RemoteFile, SearchId, Settings, TransferId, TransferKind,
     UploadRow, UploadState, UserProfile,
@@ -241,6 +242,10 @@ pub(crate) struct Worker {
     /// Next wishlist search; `None` while offline.
     wish_due: Option<Instant>,
     wish_next: usize,
+    history: SharedHistory,
+    history_error: Option<String>,
+    /// Album cover fetches (crate::cover), one per peer.
+    covers: crate::cover::Fetcher,
 }
 
 const BROWSE_CACHE_USERS: usize = 16;
@@ -251,6 +256,9 @@ pub(crate) struct Shared {
     pub ids: Arc<AtomicU64>,
     pub status: Arc<Mutex<CoreStatus>>,
     pub infos: SearchInfos,
+    pub history: SharedHistory,
+    /// History could not be loaded; reported as an `Error` at start.
+    pub history_error: Option<String>,
 }
 
 impl Worker {
@@ -262,7 +270,13 @@ impl Worker {
         settings: Settings,
         shared: Shared,
     ) -> Self {
-        let Shared { ids, status, infos } = shared;
+        let Shared {
+            ids,
+            status,
+            infos,
+            history,
+            history_error,
+        } = shared;
         Self {
             events,
             me,
@@ -301,10 +315,19 @@ impl Worker {
             infos,
             wish_due: None,
             wish_next: 0,
+            history,
+            history_error,
+            covers: crate::cover::Fetcher::default(),
         }
     }
 
     pub(crate) fn run(mut self, rx: &Receiver<Msg>) {
+        if let Some(e) = self.history_error.take() {
+            self.error(
+                "history",
+                format!("download history not loaded ({e}); keeping it in memory"),
+            );
+        }
         self.cache_index = cache::index(&self.settings.cache_dir);
         self.evict();
         if !self.settings.share_dirs.is_empty() {
@@ -402,6 +425,16 @@ impl Worker {
                 self.poll_uploads();
             }
             Command::ClearCache => self.clear_cache(),
+            Command::FetchCover {
+                store,
+                username,
+                folder,
+                listing,
+            } => {
+                let browse = self.cached_listing(&username).cloned();
+                self.covers
+                    .request(store, username, folder, listing, browse.as_deref());
+            }
             Command::Shutdown => {}
         }
     }
@@ -431,6 +464,8 @@ impl Worker {
                         (s.folders, s.files, s.scanning) = (folders, files, false);
                     }
                 }
+                // Snapshot first, so status().shares is current for ShareCounts.
+                self.publish();
                 match result {
                     Ok((folders, files)) => self.emit(CoreEvent::ShareCounts { folders, files }),
                     Err(e) => self.error("shares", e),
@@ -472,6 +507,8 @@ impl Worker {
         self.poll_transfers();
         self.poll_uploads();
         self.poll_wishlist();
+        let session = self.session();
+        self.covers.poll(session.as_deref());
         self.publish();
     }
 
@@ -695,6 +732,7 @@ impl Worker {
             self.fail_fetch(&k, why);
         }
         self.last_uploads = None;
+        self.covers.session_ended();
         self.conn = Conn::Offline;
     }
 
@@ -1439,17 +1477,47 @@ impl Worker {
         if let Some(t) = self.transfers.get_mut(&id) {
             t.state = TState::Done;
         }
+        self.record_history(id, Outcome::Done, Some(path.clone()), None);
         self.emit(CoreEvent::TransferDone { id, path });
     }
 
     fn fail(&mut self, id: TransferId, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.record_history(id, Outcome::Failed, None, Some(reason.clone()));
+        self.fail_unrecorded(id, reason);
+    }
+
+    fn fail_unrecorded(&mut self, id: TransferId, reason: String) {
         if let Some(t) = self.transfers.get_mut(&id) {
             t.state = TState::Failed;
         }
-        self.emit(CoreEvent::TransferFailed {
-            id,
-            reason: reason.into(),
-        });
+        self.emit(CoreEvent::TransferFailed { id, reason });
+    }
+
+    /// Downloads only: ▶ plays are not history (a kept ▶ is its own ↓).
+    /// Recorded before the event, so `Core::history` / `was_downloaded`
+    /// already include it when the UI handles the event.
+    fn record_history(
+        &mut self,
+        id: TransferId,
+        outcome: Outcome,
+        local: Option<PathBuf>,
+        reason: Option<String>,
+    ) {
+        let Some(t) = self.transfers.get(&id) else {
+            return;
+        };
+        if t.kind != TransferKind::Download {
+            return;
+        }
+        let file = t.file.clone();
+        let res = match self.history.lock() {
+            Ok(mut h) => h.record(id, &file, outcome, local, reason),
+            Err(_) => return,
+        };
+        if let Err(e) = res {
+            self.error("history", format!("could not save download history: {e}"));
+        }
     }
 
     /// Start (or restart, for retry) transfer `id`: attach to an in-flight
@@ -1475,7 +1543,8 @@ impl Worker {
             if dup_download {
                 let owner = f.owner;
                 self.queued(id);
-                self.fail(
+                // A refusal, not a download that ended: no history row.
+                self.fail_unrecorded(
                     id,
                     format!("already being downloaded (transfer {})", owner.0),
                 );
@@ -1819,6 +1888,7 @@ impl Worker {
                 if let Some(t) = self.transfers.get_mut(&id) {
                     t.state = TState::Cancelled;
                 }
+                self.record_history(id, Outcome::Cancelled, None, None);
                 self.emit(CoreEvent::TransferCancelled { id });
                 return;
             }
@@ -1846,6 +1916,7 @@ impl Worker {
         if self.current_play == Some(id) {
             self.current_play = None;
         }
+        self.record_history(id, Outcome::Cancelled, None, None);
         self.emit(CoreEvent::TransferCancelled { id });
     }
 

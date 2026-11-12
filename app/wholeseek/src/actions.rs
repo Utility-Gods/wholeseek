@@ -49,9 +49,16 @@ impl App {
                 self.find_changed();
             }
             MenuAction::Download(f) => self.download(&f),
+            MenuAction::Keep(f) => self.keep(&f),
             MenuAction::DownloadFolder { username, folder } => {
                 self.download_folder(&username, &folder)
             }
+            MenuAction::DownloadTo {
+                target,
+                dir: Some(dir),
+            } => self.download_to(&target, &dir),
+            // The view asks for a folder first (it has the dialog); see `choose_download_dir`.
+            MenuAction::DownloadTo { dir: None, .. } => {}
             MenuAction::OpenFolder {
                 username,
                 folder,
@@ -88,12 +95,66 @@ impl App {
         self.reveal = true;
     }
 
+    /// "Show in list" (the player's title): the playing file's row, selected and scrolled
+    /// into view, in the tab it was started from; else any open tab listing it; else its
+    /// user's tab at its folder.
+    pub fn reveal_playing(&mut self) {
+        let Some(file) = self.playing.as_ref().map(|p| p.file.clone()) else {
+            return;
+        };
+        let lists = |t: &crate::tabs::Tab| match &t.kind {
+            crate::tabs::TabKind::Search(st) => st.search.as_ref().is_some_and(|v| {
+                v.hits
+                    .iter()
+                    .any(|h| crate::tabs::same_file(&h.file, &file))
+            }),
+            crate::tabs::TabKind::User(u) => {
+                u.browse.username == file.username
+                    && u.browse.dirs.as_ref().is_some_and(|d| {
+                        d.iter()
+                            .any(|d| d.files.iter().any(|f| f.path == file.path))
+                    })
+            }
+        };
+        let from = self
+            .play_from
+            .and_then(|id| self.tabs.iter().position(|t| t.id == id))
+            .filter(|&i| lists(&self.tabs[i]));
+        let Some(i) = from.or_else(|| self.tabs.iter().position(lists)) else {
+            self.open_folder_at(&file.username, file.folder(), Some(&file.path));
+            self.tab_mut().selected = Some(file.path.clone());
+            return;
+        };
+        self.active = i;
+        let tab = self.tab_mut();
+        tab.selected = Some(file.path.clone());
+        if let Some(b) = tab.browse_mut() {
+            b.select(file.folder());
+            b.highlight = Some(file.path.clone());
+        } else {
+            tab.group = Some((file.username.clone(), file.folder().to_string()));
+        }
+        self.reveal = true;
+    }
+
     /// The scroll target for a highlighted file, once its folder is listed: (list key, row key).
+    /// In a search tab, its selected row.
     pub fn take_reveal(&mut self) -> Option<(String, String)> {
         if !self.reveal {
             return None;
         }
         let tab = self.tabs.get(self.active)?;
+        if let Some(st) = tab.search() {
+            self.reveal = false;
+            let (sel, (user, _)) = (tab.selected.as_deref()?, tab.group.as_ref()?);
+            let i = st
+                .search
+                .as_ref()?
+                .hits
+                .iter()
+                .position(|h| &h.file.username == user && h.file.path == sel)?;
+            return Some((tab.list_key(), format!("row-{i}")));
+        }
         let b = tab.browse()?;
         if b.error.is_some() {
             self.reveal = false;
@@ -109,6 +170,8 @@ impl App {
     /// ↓ a folder: the core expands it and skips system files (`wholeseek_core::DOWNLOAD_SKIP`).
     pub fn download_folder(&mut self, username: &str, folder: &str) {
         self.backend.download_folder(username, folder);
+        let root = self.backend.settings().download_dir.clone();
+        self.remember_folder_dest(username, folder, &root);
     }
 
     // ---- finished downloads --------------------------------------------------------------
@@ -339,4 +402,26 @@ pub fn picked(s: &mut App, result: rune::FileDialogResult, apply: fn(&mut App, P
             s.settings_form.manual = Some(e.to_string());
         }
     }
+}
+
+/// "Download to…": the folder picker, starting at the most recent such folder (else the
+/// downloads folder); the pick saves `target` there. With no dialog on this desktop, a note
+/// points at Settings.
+pub fn choose_download_dir(s: &App, tx: &mut rune::Tx, target: crate::menu::DlTarget) {
+    let settings = s.backend.settings();
+    let start = settings
+        .recent_download_dirs
+        .first()
+        .unwrap_or(&settings.download_dir)
+        .clone();
+    let options = rune::FileDialogOptions {
+        title: "Download to".into(),
+        directory: Some(start),
+        ..Default::default()
+    };
+    tx.open_folder(options, move |s: &mut App, result, _| match result {
+        Ok(Some(dir)) => s.download_to(&target, &dir),
+        Ok(None) => {}
+        Err(_) => s.show_notice("No folder dialog on this desktop".into()),
+    });
 }

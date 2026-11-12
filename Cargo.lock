@@ -4734,16 +4734,19 @@ dependencies = [
 
 [[package]]
 name = "wholeseek"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
+ "dirs",
  "rune",
+ "serde",
+ "serde_json",
  "wholeseek-audio",
  "wholeseek-core",
 ]
 
 [[package]]
 name = "wholeseek-audio"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cpal",
  "symphonia 0.6.1",
@@ -4753,12 +4756,14 @@ dependencies = [
 
 [[package]]
 name = "wholeseek-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dirs",
  "igd-next",
+ "image",
  "keyring",
  "serde",
+ "serde_json",
  "soulseek-rs-lib",
  "tempfile",
  "toml",

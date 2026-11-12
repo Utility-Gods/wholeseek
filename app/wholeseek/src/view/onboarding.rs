@@ -3,7 +3,7 @@
 use rune::tok::{TextStyle, Theme, type_};
 use rune::{El, col, el, row, text};
 
-use super::{button, field_box, icon_button, icons, input, red, section};
+use super::{button_icon, field_box, icon_button, icons, input, red, section};
 use crate::app::App;
 
 pub fn view(s: &App, t: &Theme) -> El {
@@ -33,7 +33,7 @@ pub fn view(s: &App, t: &Theme) -> El {
                 .center_y()
                 .radius(6.0)
                 .fill(t.control_track)
-                .child(icons::folder(13.0, t.text_secondary))
+                .child(icons::folder(icons::MD, t.text_secondary))
                 .child(
                     text(dir.display().to_string())
                         .font(type_::BODY)
@@ -43,7 +43,7 @@ pub fn view(s: &App, t: &Theme) -> El {
                         .shrink(),
                 )
                 .child(
-                    icon_button("remove", icons::close(10.0, t.text_secondary), t)
+                    icon_button("remove", icons::close(icons::SM, t.text_secondary), t)
                         .label("Remove share")
                         .on_press(move |s: &mut App| {
                             if i < s.onboarding.shares.len() {
@@ -65,13 +65,16 @@ pub fn view(s: &App, t: &Theme) -> El {
             )
             .grow(1.0),
         )
-        .child(button("ob-add", "Add", false, t).on_press(|s: &mut App| s.add_onboarding_share()));
+        .child(
+            button_icon("ob-add", &icons::FOLDER_PLUS, "Add", false, t)
+                .on_press(|s: &mut App| s.add_onboarding_share()),
+        );
     let connect_label = if ob.connecting {
         "Connecting…"
     } else {
         "Connect"
     };
-    let connect = button("connect", connect_label, true, t)
+    let connect = button_icon("connect", &icons::LOG_IN, connect_label, true, t)
         .w_full()
         .h(34.0)
         .on_press(|s: &mut App| s.connect());

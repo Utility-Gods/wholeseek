@@ -69,6 +69,7 @@ fn live_core_end_to_end() {
     let settings = Settings {
         download_dir: downloads.clone(),
         cache_dir: tmp.path().join("cache"),
+        data_dir: tmp.path().join("data"),
         listen_port: port,
         ..Settings::default()
     };
@@ -306,6 +307,7 @@ fn live_share_upload_between_two_accounts() {
     let mk = |name: &str, port: u16, shares: Vec<std::path::PathBuf>| Settings {
         download_dir: tmp.path().join(name).join("downloads"),
         cache_dir: tmp.path().join(name).join("cache"),
+        data_dir: tmp.path().join(name).join("data"),
         share_dirs: shares,
         listen_port: port,
         ..Settings::default()
@@ -488,6 +490,7 @@ fn live_query_variants() {
     let settings = Settings {
         download_dir: tmp.path().join("downloads"),
         cache_dir: tmp.path().join("cache"),
+        data_dir: tmp.path().join("data"),
         listen_port: port,
         ..Settings::default()
     };

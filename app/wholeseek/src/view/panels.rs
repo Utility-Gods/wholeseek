@@ -17,7 +17,7 @@ use crate::transfers::{self, TFilter, TGroup};
 use super::DRAWER_W as W;
 
 fn panel(key: &str, title: &str, extra: El, body: El, t: &Theme) -> El {
-    let close = icon_button("panel-close", icons::close(10.0, t.text_secondary), t)
+    let close = icon_button("panel-close", icons::close(icons::MD, t.text_secondary), t)
         .label("Close")
         .on_press(|s: &mut App| s.panel = Panel::None);
     col()
@@ -65,6 +65,47 @@ fn link(key: &str, label: &str, t: &Theme) -> El {
         .child(text(label.to_string()).font(META).color(t.text_secondary))
 }
 
+/// [`link`] with an icon before its text.
+fn link_icon(key: &str, icon: &'static rune::Icon, label: &str, t: &Theme) -> El {
+    row()
+        .key(key.to_string())
+        .h(22.0)
+        .px(6.0)
+        .gap(4.0)
+        .center_y()
+        .radius(4.0)
+        .hover(t.hover)
+        .press(t.press)
+        .cursor(Cursor::Pointer)
+        .role("button")
+        .label(label.to_string())
+        .child(icons::draw(icon, icons::SM, t.text_secondary))
+        .child(text(label.to_string()).font(META).color(t.text_secondary))
+}
+
+/// What a transfer state looks like at a glance: its icon and colour.
+fn state_icon(state: &TState, t: &Theme) -> El {
+    let (i, c): (&'static rune::Icon, _) = match state {
+        TState::Queued | TState::RemoteQueued(_) => (&icons::CLOCK, t.text_secondary),
+        TState::Active => (&icons::ARROW_DOWN_TO_LINE, accent()),
+        TState::Done(_) => (&icons::CIRCLE_CHECK, green()),
+        TState::Failed(_) => (&icons::CIRCLE_ALERT, red()),
+        TState::Cancelled => (&icons::CIRCLE_X, t.text_secondary),
+    };
+    icons::draw(i, icons::SM, c).key("state-icon")
+}
+
+/// "Saving to ~/Music/Vinyl/Coastline (2019)" until it is done; then where it is.
+fn dest_line(d: &Transfer) -> Option<String> {
+    match &d.state {
+        TState::Done(p) => Some(p.display().to_string()),
+        _ => d
+            .dest
+            .as_ref()
+            .map(|p| format!("Saving to {}", fmt::home_short(&p.display().to_string()))),
+    }
+}
+
 fn small(key: &str, icon: El, label: &str, t: &Theme) -> El {
     icon_button(key, icon, t)
         .size(22.0, 22.0)
@@ -77,7 +118,7 @@ fn small(key: &str, icon: El, label: &str, t: &Theme) -> El {
 pub fn transfers(s: &App, t: &Theme) -> El {
     let open = small(
         "open-downloads",
-        icons::folder(12.0, t.text_secondary),
+        icons::draw(&icons::FOLDER_OPEN, icons::MD, t.text_secondary),
         "Open downloads folder",
         t,
     )
@@ -115,16 +156,20 @@ pub fn transfers(s: &App, t: &Theme) -> El {
             );
     } else {
         if live > 0 {
-            bar = bar
-                .child(link("cancel-all", "Cancel all", t).on_press(|s: &mut App| s.cancel_all()));
+            bar = bar.child(
+                link_icon("cancel-all", &icons::X, "Cancel all", t)
+                    .on_press(|s: &mut App| s.cancel_all()),
+            );
         }
         if counts[4] > 0 {
-            bar = bar
-                .child(link("retry-all", "Retry failed", t).on_press(|s: &mut App| s.retry_all()));
+            bar = bar.child(
+                link_icon("retry-all", &icons::REFRESH_CW, "Retry failed", t)
+                    .on_press(|s: &mut App| s.retry_all()),
+            );
         }
         if counts[3] + counts[4] > 0 {
             bar = bar.child(
-                link("clear-finished", "Clear finished", t)
+                link_icon("clear-finished", &icons::TRASH_2, "Clear finished", t)
                     .help("Files stay on disk")
                     .on_press(|s: &mut App| s.clear_finished()),
             );
@@ -231,8 +276,13 @@ fn group(s: &App, gi: usize, g: &TGroup, t: &Theme) -> El {
     if retryable {
         let (u, d) = (u.clone(), d.clone());
         actions = actions.child(
-            small("retry-group", icons::retry(11.0, t.text), "Retry failed", t)
-                .on_press(move |s: &mut App| s.retry_group(&u, &d)),
+            small(
+                "retry-group",
+                icons::retry(icons::MD, t.text),
+                "Retry failed",
+                t,
+            )
+            .on_press(move |s: &mut App| s.retry_group(&u, &d)),
         );
     }
     if live {
@@ -240,7 +290,7 @@ fn group(s: &App, gi: usize, g: &TGroup, t: &Theme) -> El {
         actions = actions.child(
             small(
                 "cancel-group",
-                icons::close(9.0, t.text_secondary),
+                icons::close(icons::SM, t.text_secondary),
                 "Cancel",
                 t,
             )
@@ -257,12 +307,16 @@ fn group(s: &App, gi: usize, g: &TGroup, t: &Theme) -> El {
     if !menu_items.is_empty() {
         let (u, d, k) = (u.clone(), d.clone(), more_key.clone());
         actions = actions.child(
-            small(&more_key, icons::more(12.0, t.text_secondary), "More", t).on_press(
-                move |s: &mut App| {
-                    let items = s.group_items(&u, &d);
-                    s.open_menu(MenuAnchor::Key(k.clone()), items);
-                },
-            ),
+            small(
+                &more_key,
+                icons::more(icons::MD, t.text_secondary),
+                "More",
+                t,
+            )
+            .on_press(move |s: &mut App| {
+                let items = s.group_items(&u, &d);
+                s.open_menu(MenuAnchor::Key(k.clone()), items);
+            }),
         );
     }
     let (tu, td) = (u.clone(), d.clone());
@@ -288,7 +342,7 @@ fn group(s: &App, gi: usize, g: &TGroup, t: &Theme) -> El {
             row()
                 .gap(6.0)
                 .center_y()
-                .child(icons::chevron(9.0, !collapsed, t.text_secondary))
+                .child(icons::chevron(icons::SM, !collapsed, t.text_secondary))
                 .child(
                     text(name)
                         .key("group-name")
@@ -296,7 +350,14 @@ fn group(s: &App, gi: usize, g: &TGroup, t: &Theme) -> El {
                         .color(t.text)
                         .truncate()
                         .shrink()
-                        .help(fmt::crumbs(&d)),
+                        .help(match rows.iter().find_map(|r| r.dest.as_ref()) {
+                            Some(dest) if live => format!(
+                                "{}\nSaving to {}",
+                                fmt::crumbs(&d),
+                                fmt::home_short(&dest.display().to_string())
+                            ),
+                            _ => fmt::crumbs(&d),
+                        }),
                 )
                 .child(user_link(&u, t))
                 .child(el().grow(1.0))
@@ -344,40 +405,50 @@ fn download_row(s: &App, i: usize, d: &Transfer, nested: bool, t: &Theme) -> El 
         TState::Done(path) => {
             if crate::tabs::is_playable(&d.file) {
                 actions = actions.child(
-                    small("play", icons::play(9.0, t.text), "Play", t)
+                    small("play", icons::play(icons::MD, t.text), "Play", t)
                         .on_press(move |s: &mut App| s.play_local(id)),
                 );
             }
             let (p1, p2, p3) = (path.clone(), path.clone(), path.display().to_string());
             actions = actions
                 .child(
-                    small("show", icons::folder(11.0, t.text), "Show in folder", t)
-                        .on_press(move |s: &mut App| s.desktop.show_item(&p1)),
+                    small(
+                        "show",
+                        icons::draw(&icons::FOLDER_OPEN, icons::MD, t.text),
+                        "Show in folder",
+                        t,
+                    )
+                    .on_press(move |s: &mut App| s.desktop.show_item(&p1)),
                 )
                 .child(
                     small(
                         "open",
-                        icons::open(10.0, t.text),
+                        icons::open(icons::MD, t.text),
                         "Open with default app",
                         t,
                     )
                     .on_press(move |s: &mut App| s.desktop.open(&p2)),
                 )
                 .child(
-                    small("copy", icons::copy(10.0, t.text), "Copy path", t)
+                    small("copy", icons::copy(icons::MD, t.text), "Copy path", t)
                         .on_press_tx(move |_: &mut App, tx| tx.copy(p3.clone())),
                 );
         }
         TState::Failed(_) | TState::Cancelled => {
             actions = actions.child(
-                small("retry", icons::retry(11.0, t.text), "Retry", t)
+                small("retry", icons::retry(icons::MD, t.text), "Retry", t)
                     .on_press(move |s: &mut App| s.retry(id)),
             );
         }
         _ => {
             actions = actions.child(
-                small("cancel", icons::close(9.0, t.text_secondary), "Cancel", t)
-                    .on_press(move |s: &mut App| s.cancel(id)),
+                small(
+                    "cancel",
+                    icons::close(icons::MD, t.text_secondary),
+                    "Cancel",
+                    t,
+                )
+                .on_press(move |s: &mut App| s.cancel(id)),
             );
         }
     }
@@ -396,6 +467,7 @@ fn download_row(s: &App, i: usize, d: &Transfer, nested: bool, t: &Theme) -> El 
                 .color(t.text_secondary),
         )
         .child(el().grow(1.0))
+        .child(state_icon(&d.state, t))
         .child(status_el);
     let mut r = col()
         .key(format!("dl-{i}"))
@@ -414,14 +486,19 @@ fn download_row(s: &App, i: usize, d: &Transfer, nested: bool, t: &Theme) -> El 
             row()
                 .gap(6.0)
                 .center_y()
-                .child(
-                    text(d.file.basename().to_string())
+                .child({
+                    let name = text(d.file.basename().to_string())
+                        .key("dl-name")
                         .font(type_::BODY)
                         .color(t.text)
                         .truncate()
                         .grow(1.0)
-                        .shrink(),
-                )
+                        .shrink();
+                    match dest_line(d) {
+                        Some(h) => name.help(h),
+                        None => name,
+                    }
+                })
                 .child(actions),
         )
         .child(meta);
@@ -452,6 +529,14 @@ fn upload_row(i: usize, u: &wholeseek_core::UploadRow, t: &Theme) -> El {
         UploadState::Cancelled => ("cancelled".into(), t.text_secondary),
         UploadState::Failed(_) => ("failed".into(), red()),
     };
+    let (icon, icon_color): (&'static rune::Icon, _) = match &u.state {
+        UploadState::Queued { .. } => (&icons::CLOCK, t.text_secondary),
+        UploadState::InProgress => (&icons::UPLOAD, accent()),
+        UploadState::Completed => (&icons::CIRCLE_CHECK, green()),
+        UploadState::Cancelled => (&icons::CIRCLE_X, t.text_secondary),
+        UploadState::Failed(_) => (&icons::CIRCLE_ALERT, red()),
+    };
+    let state_el = icons::draw(icon, icons::SM, icon_color).key("state-icon");
     let mut status_el = text(status).font(tnum(META)).color(color);
     if let UploadState::Failed(e) = &u.state {
         status_el = status_el.help(e.clone());
@@ -463,7 +548,7 @@ fn upload_row(i: usize, u: &wholeseek_core::UploadRow, t: &Theme) -> El {
         let (user, path) = (u.username.clone(), u.path.clone());
         small(
             "cancel",
-            icons::close(9.0, t.text_secondary),
+            icons::close(icons::SM, t.text_secondary),
             "Cancel upload",
             t,
         )
@@ -501,6 +586,7 @@ fn upload_row(i: usize, u: &wholeseek_core::UploadRow, t: &Theme) -> El {
                 .child(text("to").font(META).color(t.text_secondary))
                 .child(user_link(&u.username, t))
                 .child(el().grow(1.0))
+                .child(state_el)
                 .child(status_el),
         );
     if matches!(
@@ -527,13 +613,25 @@ fn user_link(username: &str, t: &Theme) -> El {
 
 // ---- settings ------------------------------------------------------------------------------
 
-fn block(title: &str, t: &Theme) -> El {
-    col()
-        .w_full()
-        .px(14.0)
-        .pt(14.0)
-        .gap(6.0)
-        .child(section(title, t))
+/// A settings section: its icon and title, then its lines.
+fn block(title: &str, icon: &'static rune::Icon, t: &Theme) -> El {
+    col().w_full().px(14.0).pt(14.0).gap(6.0).child(
+        row()
+            .gap(6.0)
+            .center_y()
+            .child(icons::draw(icon, icons::SM, t.text_secondary))
+            .child(section(title, t)),
+    )
+}
+
+/// A small button with an icon before its label.
+fn mini_icon(key: &str, icon: &'static rune::Icon, label: &str, t: &Theme) -> El {
+    super::files::action(
+        key,
+        label,
+        icons::draw(icon, icons::MD, t.text_secondary),
+        t,
+    )
 }
 
 /// A label on the left, controls on the right.
@@ -620,7 +718,7 @@ pub fn settings(s: &App, t: &Theme) -> El {
             .key("saved")
             .gap(4.0)
             .center_y()
-            .child(icons::check(10.0, green()))
+            .child(icons::check(icons::MD, green()))
             .child(text("Saved").font(META).color(t.text_secondary))
     });
     let mut body = col().w_full().pb(16.0);
@@ -639,9 +737,12 @@ pub fn settings(s: &App, t: &Theme) -> El {
         who_el = who_el.help("No system keyring: sign in each launch");
     }
     body = body.child(
-        block("Account", t).child(
+        block("Account", &icons::USER, t).child(
             line("account", who_el)
-                .child(mini("logout", "Log out", t).on_press(|s: &mut App| s.logout(false)))
+                .child(
+                    mini_icon("logout", &icons::LOG_OUT, "Log out", t)
+                        .on_press(|s: &mut App| s.logout(false)),
+                )
                 .child(
                     mini("forget", "Forget account", t)
                         .help("Remove the saved password")
@@ -652,7 +753,7 @@ pub fn settings(s: &App, t: &Theme) -> El {
 
     // Downloads
     let dl = cfg.download_dir.display().to_string();
-    let mut downloads = block("Downloads", t);
+    let mut downloads = block("Downloads", &icons::DOWNLOAD, t);
     if f.manual.is_some() {
         downloads = downloads.child(
             field_box(
@@ -674,21 +775,42 @@ pub fn settings(s: &App, t: &Theme) -> El {
                     .help(dl.clone()),
             )
             .child(
-                mini("choose-download", "Choose…", t)
+                mini_icon("choose-download", &icons::FOLDER, "Choose…", t)
                     .on_press_tx(choose_folder("Download folder", App::set_download_dir)),
             )
             .child(
-                mini("open-download", "Open", t).on_press(move |s: &mut App| s.desktop.open(&open)),
+                mini_icon("open-download", &icons::FOLDER_OPEN, "Open", t)
+                    .on_press(move |s: &mut App| s.desktop.open(&open)),
             ),
         );
     }
+    let single = cfg.single_file_subfolder;
+    downloads = downloads.child(
+        line(
+            "single-subfolder",
+            label("Put single songs in their album folder", t)
+                .help("Albums always keep their folder"),
+        )
+        .help("Albums always keep their folder")
+        .child(
+            super::switch(
+                "set-single-subfolder",
+                single,
+                "Put single songs in their album folder",
+                t,
+            )
+            .on_press(|s: &mut App| {
+                s.commit_settings(|c| c.single_file_subfolder = !c.single_file_subfolder);
+            }),
+        ),
+    );
     body = body.child(downloads);
 
     // Shares
     let totals = s
         .share_counts
         .map_or_else(String::new, |(d, n)| format!("{d} folders · {n} files"));
-    let mut shares = block("Shares", t).child(
+    let mut shares = block("Shares", &icons::SHARE_2, t).child(
         row()
             .w_full()
             .center_y()
@@ -715,7 +837,7 @@ pub fn settings(s: &App, t: &Theme) -> El {
                 row()
                     .gap(6.0)
                     .center_y()
-                    .child(icons::folder(11.0, t.text_secondary))
+                    .child(icons::folder(icons::MD, t.text_secondary))
                     .child(label(fmt::home_short(&path), t).shrink().help(path.clone()))
                     .child(
                         text(count)
@@ -726,12 +848,12 @@ pub fn settings(s: &App, t: &Theme) -> El {
             )
             .hover_group()
             .child(
-                mini("open", "Open", t)
+                mini_icon("open", &icons::FOLDER_OPEN, "Open", t)
                     .group_opacity(0.0, 1.0)
                     .on_press(move |s: &mut App| s.desktop.open(&open)),
             )
             .child(
-                mini("remove", "Remove", t)
+                mini_icon("remove", &icons::X, "Remove", t)
                     .group_opacity(0.0, 1.0)
                     .on_press(move |s: &mut App| s.remove_share(&remove)),
             ),
@@ -751,7 +873,7 @@ pub fn settings(s: &App, t: &Theme) -> El {
     } else {
         shares = shares.child(
             row().child(
-                mini("add-share", "+ Add folder…", t)
+                mini_icon("add-share", &icons::PLUS, "Add folder…", t)
                     .on_press_tx(choose_folder("Share a folder", App::add_share)),
             ),
         );
@@ -768,15 +890,15 @@ pub fn settings(s: &App, t: &Theme) -> El {
     body = body.child(shares);
 
     // Uploads + playback
-    body = body.child(
-        block("Uploads", t).child(line("slots", label("Upload slots", t)).child(stepper(
+    body = body.child(block("Uploads", &icons::UPLOAD, t).child(
+        line("slots", label("Upload slots", t)).child(stepper(
             "set-slots",
             cfg.upload_slots.to_string(),
             App::step_upload_slots,
             t,
-        ))),
-    );
-    body = body.child(block("Playback", t).child(
+        )),
+    ));
+    body = body.child(block("Playback", &icons::VOLUME_2, t).child(
         line("timeout", label("Skip silent sources after", t)).child(stepper(
             "set-timeout",
             format!("{} s", cfg.play_start_timeout_secs),
@@ -792,14 +914,14 @@ pub fn settings(s: &App, t: &Theme) -> El {
     } else {
         c.cap_bytes
     };
-    let mut clear = mini("clear-cache", "Clear cache", t);
+    let mut clear = mini_icon("clear-cache", &icons::TRASH_2, "Clear cache", t);
     clear = if s.cache_in_use() {
         disabled(clear, "In use by the playing track", t)
     } else {
         clear.on_press(|s: &mut App| s.clear_cache())
     };
     body = body.child(
-        block("Cache", t).child(
+        block("Cache", &icons::HARD_DRIVE, t).child(
             line(
                 "cache",
                 label(
@@ -814,7 +936,7 @@ pub fn settings(s: &App, t: &Theme) -> El {
     );
 
     // Connection
-    body = body.child(block("Connection", t).child(port_line(s, t)));
+    body = body.child(block("Connection", &icons::GLOBE, t).child(port_line(s, t)));
     if let Some(p) = f.port_confirm {
         body = body.child(
             row()

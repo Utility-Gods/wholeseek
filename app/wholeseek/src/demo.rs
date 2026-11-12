@@ -37,6 +37,9 @@ pub enum Call {
     PlayFetch(RemoteFile),
     Download(RemoteFile),
     DownloadFolder(String, String),
+    DownloadTo(RemoteFile, PathBuf),
+    DownloadFolderTo(String, String, PathBuf),
+    DownloadAlbumFile(RemoteFile, Option<PathBuf>),
     Cancel(TransferId),
     Retry(TransferId),
     SetShares(Vec<PathBuf>),
@@ -46,6 +49,8 @@ pub enum Call {
     UserProfile(String),
     SetAudioOnly(bool),
     ClearCache,
+    WishlistAdd(String),
+    WishlistRemove(String),
 }
 
 struct Peer {
@@ -400,6 +405,11 @@ pub struct DemoBackend {
     reconnect: Option<(u32, f64, f64)>,
     /// Cached plays from earlier runs, until "Clear cache".
     cache_base: u64,
+    /// Download history: dj_ivo's "Low Tide Radio" mp3 from an earlier run, plus every
+    /// download finished since.
+    downloaded: wholeseek_core::DownloadedKeys,
+    /// What each search was: typed, and what it was broadened to when nothing matched.
+    infos: HashMap<SearchId, wholeseek_core::status::SearchInfo>,
 }
 
 /// A port the demo pretends another program holds: the session falls back to 45543.
@@ -433,6 +443,15 @@ impl DemoBackend {
             connected: false,
             reconnect: None,
             cache_base: 412 * 1024 * 1024,
+            infos: HashMap::new(),
+            downloaded: std::sync::Arc::new(
+                [(
+                    "dj_ivo".to_string(),
+                    r"mp3\H\Hollow Lights\Hollow Lights - Low Tide Radio.mp3".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
         }
     }
 
@@ -454,6 +473,33 @@ impl DemoBackend {
         let due = self.now + delay;
         let i = self.queue.partition_point(|(t, _)| *t <= due);
         self.queue.insert(i, (due, e));
+    }
+
+    /// One file into `root`, flat or in its album folder, as `Core::download` decides
+    /// (`Settings::single_file_subfolder`).
+    fn fetch_single(&mut self, f: &RemoteFile, root: &Path) -> TransferId {
+        let id = TransferId(self.id());
+        let dir = if self.settings.single_file_subfolder {
+            paths::download_dir_for(root, &f.path)
+        } else {
+            root.to_path_buf()
+        };
+        self.start_transfer(id, f, &dir, TransferKind::Download);
+        id
+    }
+
+    /// A folder's files into `<root>/<remote folder name>/`.
+    fn fetch_folder(&mut self, username: &str, folder: &str, root: &Path) {
+        let files: Vec<RemoteFile> = catalog()
+            .into_iter()
+            .filter(|f| f.username == username && f.folder() == folder)
+            .filter(|f| !wholeseek_core::is_download_junk(&f.path))
+            .collect();
+        for f in files {
+            let id = TransferId(self.id());
+            let dir = paths::download_dir_for(root, &f.path);
+            self.start_transfer(id, &f, &dir, TransferKind::Download);
+        }
     }
 
     fn start_transfer(
@@ -561,6 +607,10 @@ impl DemoBackend {
                     w.buffers.insert(t.final_path.clone(), b);
                 }
                 drop(w);
+                if t.kind == TransferKind::Download {
+                    std::sync::Arc::make_mut(&mut self.downloaded)
+                        .insert((t.file.username.clone(), t.file.path.clone()));
+                }
                 out.push(CoreEvent::TransferDone {
                     id: t.id,
                     path: t.final_path.clone(),
@@ -713,19 +763,48 @@ impl Backend for DemoBackend {
         let query = query.trim().to_string();
         self.calls.push(Call::Search(query.clone()));
         let id = SearchId(self.id());
-        let words: Vec<String> = query
-            .to_lowercase()
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
-        let hits: Vec<SearchHit> = catalog()
-            .iter()
-            .filter(|f| {
-                let p = f.path.to_lowercase().replace(['_', '-'], " ");
-                !words.is_empty() && words.iter().all(|w| p.contains(w.as_str()))
-            })
-            .map(hit)
-            .collect();
+        let find = |q: &str| -> Vec<SearchHit> {
+            let words: Vec<String> = q
+                .to_lowercase()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            catalog()
+                .iter()
+                .filter(|f| {
+                    let p = f.path.to_lowercase().replace(['_', '-'], " ");
+                    !words.is_empty() && words.iter().all(|w| p.contains(w.as_str()))
+                })
+                .map(hit)
+                .collect()
+        };
+        let sent = wholeseek_core::query::normalize_query(&query);
+        let mut hits = find(&query);
+        // As the core does: nothing found, so once more with a broader query.
+        let mut broadened_to = None;
+        if hits.is_empty()
+            && let Some(b) = wholeseek_core::query::broaden_query(&sent)
+        {
+            hits = find(&b);
+            broadened_to = Some(b);
+        }
+        self.infos.insert(
+            id,
+            wholeseek_core::status::SearchInfo {
+                id,
+                typed: query.clone(),
+                sent,
+                broadened_to,
+                wishlist: false,
+                files: hits.len(),
+                users: hits
+                    .iter()
+                    .map(|h| h.file.username.as_str())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                finished: false,
+            },
+        );
         let total = hits.len();
         // Arrival order is peers answering, not rank order: the UI merges and re-sorts.
         let mut batches: [Vec<SearchHit>; 3] = Default::default();
@@ -794,8 +873,31 @@ impl Backend for DemoBackend {
 
     fn download(&mut self, f: &RemoteFile) -> TransferId {
         self.calls.push(Call::Download(f.clone()));
+        let root = self.settings.download_dir.clone();
+        self.fetch_single(f, &root)
+    }
+
+    fn download_to(&mut self, f: &RemoteFile, dir: &Path) -> TransferId {
+        self.calls
+            .push(Call::DownloadTo(f.clone(), dir.to_path_buf()));
+        self.settings.remember_download_dir(dir);
+        self.fetch_single(f, dir)
+    }
+
+    fn download_album_file(&mut self, f: &RemoteFile, root: Option<&Path>) -> TransferId {
+        self.calls.push(Call::DownloadAlbumFile(
+            f.clone(),
+            root.map(Path::to_path_buf),
+        ));
+        let root = match root {
+            Some(d) => {
+                self.settings.remember_download_dir(d);
+                d.to_path_buf()
+            }
+            None => self.settings.download_dir.clone(),
+        };
         let id = TransferId(self.id());
-        let dir = paths::download_dir_for(&self.settings.download_dir, &f.path);
+        let dir = paths::download_dir_for(&root, &f.path);
         self.start_transfer(id, f, &dir, TransferKind::Download);
         id
     }
@@ -803,16 +905,18 @@ impl Backend for DemoBackend {
     fn download_folder(&mut self, username: &str, folder: &str) {
         self.calls
             .push(Call::DownloadFolder(username.into(), folder.into()));
-        let files: Vec<RemoteFile> = catalog()
-            .into_iter()
-            .filter(|f| f.username == username && f.folder() == folder)
-            .filter(|f| !wholeseek_core::is_download_junk(&f.path))
-            .collect();
-        for f in files {
-            let id = TransferId(self.id());
-            let dir = paths::download_dir_for(&self.settings.download_dir, &f.path);
-            self.start_transfer(id, &f, &dir, TransferKind::Download);
-        }
+        let root = self.settings.download_dir.clone();
+        self.fetch_folder(username, folder, &root);
+    }
+
+    fn download_folder_to(&mut self, username: &str, folder: &str, dir: &Path) {
+        self.calls.push(Call::DownloadFolderTo(
+            username.into(),
+            folder.into(),
+            dir.to_path_buf(),
+        ));
+        self.settings.remember_download_dir(dir);
+        self.fetch_folder(username, folder, dir);
     }
 
     fn cancel(&mut self, id: TransferId) {
@@ -980,6 +1084,42 @@ impl Backend for DemoBackend {
                 })
                 .collect(),
         }
+    }
+
+    fn downloaded_keys(&self) -> wholeseek_core::DownloadedKeys {
+        self.downloaded.clone()
+    }
+
+    fn search_info(&self, id: SearchId) -> Option<wholeseek_core::status::SearchInfo> {
+        self.infos.get(&id).cloned()
+    }
+
+    fn wishlist_add(&mut self, query: &str) -> bool {
+        let q = query.split_whitespace().collect::<Vec<_>>().join(" ");
+        let have = self
+            .settings
+            .wishlist
+            .iter()
+            .any(|w| w.eq_ignore_ascii_case(&q));
+        if q.is_empty() || have {
+            return false;
+        }
+        self.calls.push(Call::WishlistAdd(q.clone()));
+        self.settings.wishlist.push(q);
+        true
+    }
+
+    fn wishlist_remove(&mut self, query: &str) -> bool {
+        let q = query.split_whitespace().collect::<Vec<_>>().join(" ");
+        let before = self.settings.wishlist.len();
+        self.settings
+            .wishlist
+            .retain(|w| !w.eq_ignore_ascii_case(&q));
+        let removed = self.settings.wishlist.len() != before;
+        if removed {
+            self.calls.push(Call::WishlistRemove(q));
+        }
+        removed
     }
 
     fn clear_cache(&mut self) {

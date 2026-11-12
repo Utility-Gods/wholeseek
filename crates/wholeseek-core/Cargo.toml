@@ -11,7 +11,11 @@ igd-next = "0.17"
 # Config persistence (~/.config/wholeseek/config.toml).
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
+# Download history (append-only JSONL in the data dir).
+serde_json = "1"
 dirs = "6"
+# Album covers (cover.rs): decode + downscale. Same version/features rune already pulls in.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Password storage. Linux uses the pure-Rust zbus Secret Service backend so the
 # build does not need libdbus-1-dev (same feature set soulseek-rs ships).
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
