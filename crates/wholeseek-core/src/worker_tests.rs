@@ -47,6 +47,10 @@ struct FakeState {
     /// `listen_port()` answer; `None` = the requested 2234.
     bound: Option<Option<u16>>,
     search_linger: Duration,
+    /// Wishlist searches sent (code 103), in order.
+    wishes: Vec<String>,
+    /// `wishlist_interval()` answer; zero = use the core's minimum.
+    wish_interval: Duration,
     share_delay: Duration,
     user_infos: HashMap<String, UserInfo>,
     peer_infos: HashMap<String, PeerInfo>,
@@ -106,6 +110,13 @@ impl Session for FakeSession {
         // Like the real helper, it may hold the session a while after cancel.
         let linger = self.st().search_linger;
         std::thread::sleep(linger);
+    }
+    fn wishlist_search_blocking(&self, query: &str, window: Duration, cancel: Arc<AtomicBool>) {
+        self.st().wishes.push(query.to_string());
+        self.search_blocking(query, window, cancel);
+    }
+    fn wishlist_interval(&self) -> Duration {
+        self.st().wish_interval
     }
     fn search_count(&self, q: &str) -> usize {
         self.st().searches.get(q).map_or(0, Vec::len)
@@ -250,6 +261,8 @@ fn tunables() -> Tunables {
         profile_timeout: Duration::from_millis(300),
         release_wait: Duration::from_secs(2),
         cache_rescan: Duration::from_millis(50),
+        wishlist_first: Duration::from_millis(50),
+        wishlist_min: Duration::from_millis(250),
         backoff: |_| Duration::from_millis(30),
     }
 }
@@ -1753,4 +1766,375 @@ fn share_status_is_filled_at_startup_without_login() {
             .is_some_and(|s| s.files == 2 && !s.scanning)
     });
     assert!(conn.params.lock().unwrap().is_empty(), "no network");
+}
+
+// ------------------------------------------- query normalization, broaden, wishlist
+
+#[test]
+fn search_sends_the_normalized_query_and_keeps_what_was_typed() {
+    let h = harness();
+    let s = h.online();
+    let id = h.core.search("  AC/DC  back in black ");
+    wait_until("sent", || {
+        s.st().searches.contains_key("AC DC back in black")
+    });
+    let p = h.core.status().searches;
+    assert_eq!(
+        p[0].query, "AC/DC  back in black",
+        "status shows what was typed"
+    );
+    let info = h.core.search_info(id).unwrap();
+    assert_eq!(
+        (info.typed.as_str(), info.sent.as_str(), info.wishlist),
+        ("AC/DC  back in black", "AC DC back in black", false)
+    );
+    s.st()
+        .searches
+        .get_mut("AC DC back in black")
+        .unwrap()
+        .push(result("u1", &[r"AC-DC\Back In Black\01 Hells Bells.flac"]));
+    h.want(
+        "results",
+        |e| matches!(e, CoreEvent::SearchResults { search, .. } if *search == id),
+    );
+    h.want(
+        "finished",
+        |e| matches!(e, CoreEvent::SearchFinished { search, total_files: 1 } if *search == id),
+    );
+    let info = h.core.search_info(id).unwrap();
+    assert!(info.finished && info.broadened_to.is_none(), "{info:?}");
+    assert_eq!((info.files, info.users), (1, 1));
+}
+
+#[test]
+fn zero_audio_broadens_once_under_the_same_id() {
+    let h = harness();
+    let s = h.online();
+    let id = h.core.search("wasn't me shaggý");
+    wait_until("first", || s.st().searches.contains_key("wasn t me shaggý"));
+    // Only a non-audio hit: still "no audio", so it broadens.
+    s.st()
+        .searches
+        .get_mut("wasn t me shaggý")
+        .unwrap()
+        .push(result("u0", &[r"x\cover.jpg"]));
+    wait_until("broadened", || {
+        s.st().searches.contains_key("wasn me shaggy")
+    });
+    let info = h.core.search_info(id).unwrap();
+    assert_eq!(info.broadened_to.as_deref(), Some("wasn me shaggy"));
+    assert!(!info.finished);
+    assert!(s.st().forgotten.contains(&"wasn t me shaggý".to_string()));
+    let p = h.core.status().searches;
+    assert_eq!((p.len(), p[0].id), (1, id), "still one search, same id");
+    s.st()
+        .searches
+        .get_mut("wasn me shaggy")
+        .unwrap()
+        .push(result("u1", &[r"Shaggy\Hot Shot\Wasn't Me.mp3"]));
+    let e = h.want("results", |e| matches!(e, CoreEvent::SearchResults { .. }));
+    assert!(matches!(e, CoreEvent::SearchResults { search, .. } if search == id));
+    let e = h.want("finished", |e| {
+        matches!(e, CoreEvent::SearchFinished { .. })
+    });
+    assert_eq!(
+        e,
+        CoreEvent::SearchFinished {
+            search: id,
+            total_files: 1
+        }
+    );
+    // Exactly one SearchFinished, and no third query.
+    h.none_within(Duration::from_millis(500), |e| {
+        matches!(e, CoreEvent::SearchFinished { .. })
+    });
+    let sent: Vec<String> = s.st().forgotten.clone();
+    assert_eq!(sent, ["wasn t me shaggý", "wasn me shaggy"]);
+}
+
+#[test]
+fn broadened_search_that_still_finds_nothing_finishes_once() {
+    let h = harness();
+    let s = h.online();
+    let id = h.core.search("sigur rós");
+    wait_until("broadened", || s.st().searches.contains_key("sigur ros"));
+    let e = h.want("finished", |e| {
+        matches!(e, CoreEvent::SearchFinished { .. })
+    });
+    assert_eq!(
+        e,
+        CoreEvent::SearchFinished {
+            search: id,
+            total_files: 0
+        }
+    );
+    h.none_within(Duration::from_millis(500), |e| {
+        matches!(e, CoreEvent::SearchFinished { .. })
+    });
+    let info = h.core.search_info(id).unwrap();
+    assert_eq!(info.broadened_to.as_deref(), Some("sigur ros"));
+    assert!(info.finished);
+}
+
+#[test]
+fn operators_and_unbroadenable_queries_are_never_broadened() {
+    let h = harness();
+    let s = h.online();
+    for q in [
+        "wasn't me -remix",
+        "*aggy wasn't",
+        "\"don't stop\" me",
+        "aphex twin",
+    ] {
+        let id = h.core.search(q);
+        let e = h.want("finished", |e| {
+            matches!(e, CoreEvent::SearchFinished { .. })
+        });
+        assert_eq!(
+            e,
+            CoreEvent::SearchFinished {
+                search: id,
+                total_files: 0
+            },
+            "{q}"
+        );
+        assert_eq!(h.core.search_info(id).unwrap().broadened_to, None, "{q}");
+    }
+    let forgotten = s.st().forgotten.clone();
+    assert_eq!(
+        forgotten,
+        [
+            "wasn t me -remix",
+            "*aggy wasn t",
+            "don t stop me",
+            "aphex twin"
+        ]
+    );
+}
+
+#[test]
+fn audio_results_are_not_broadened() {
+    let h = harness();
+    let s = h.online();
+    let id = h.core.search("don't stop me now");
+    wait_until("sent", || s.st().searches.contains_key("don t stop me now"));
+    s.st()
+        .searches
+        .get_mut("don t stop me now")
+        .unwrap()
+        .push(result("u1", &[r"Queen\Jazz\Don't Stop Me Now.flac"]));
+    h.want(
+        "finished",
+        |e| matches!(e, CoreEvent::SearchFinished { search, .. } if *search == id),
+    );
+    assert_eq!(h.core.search_info(id).unwrap().broadened_to, None);
+}
+
+#[test]
+fn wishlist_runs_one_wish_per_interval_round_robin_while_online() {
+    let mut h = harness();
+    assert!(h.core.wishlist_add("Wasn't  Me"));
+    assert!(
+        !h.core.wishlist_add("wasn't me"),
+        "duplicate (case-insensitive)"
+    );
+    assert!(!h.core.wishlist_add("   "));
+    assert!(h.core.wishlist_add("sigur rós"));
+    assert_eq!(h.core.wishlist(), ["Wasn't Me", "sigur rós"]);
+    assert_eq!(h.core.settings().wishlist, ["Wasn't Me", "sigur rós"]);
+    // Offline: nothing is sent.
+    std::thread::sleep(Duration::from_millis(400));
+    let s = h.online();
+    let t0 = Instant::now();
+    wait_until("first wish", || s.st().wishes.len() == 1);
+    assert!(
+        t0.elapsed() < Duration::from_millis(250),
+        "first wish soon after login"
+    );
+    assert_eq!(
+        s.st().wishes[0],
+        "Wasn t Me",
+        "normalized, sent as a wishlist search (103)"
+    );
+    // Results come as ordinary SearchResults under an id tagged as a wish.
+    s.st()
+        .searches
+        .get_mut("Wasn t Me")
+        .unwrap()
+        .push(result("u1", &[r"Shaggy\Wasn't Me.flac"]));
+    let CoreEvent::SearchResults { search, .. } = h.want("wish results", |e| {
+        matches!(e, CoreEvent::SearchResults { .. })
+    }) else {
+        unreachable!()
+    };
+    let info = h.core.search_info(search).unwrap();
+    assert!(info.wishlist && info.typed == "Wasn't Me", "{info:?}");
+    h.want(
+        "wish finished",
+        |e| matches!(e, CoreEvent::SearchFinished { search: s, .. } if *s == search),
+    );
+    // Next wish only after the interval (min 250 ms in these tunables).
+    let first = Instant::now();
+    wait_until("second wish", || s.st().wishes.len() == 2);
+    assert!(
+        t0.elapsed() >= Duration::from_millis(250),
+        "{:?}",
+        first.elapsed()
+    );
+    assert_eq!(
+        s.st().wishes[1],
+        "sigur rós",
+        "round-robin; wishes are never broadened"
+    );
+    wait_until("third wish wraps", || s.st().wishes.len() == 3);
+    assert_eq!(s.st().wishes[2], "Wasn t Me");
+    // Removing stops it.
+    assert!(h.core.wishlist_remove("WASN'T ME"));
+    assert!(!h.core.wishlist_remove("nope"));
+    let n = s.st().wishes.len();
+    wait_until("next after removal", || s.st().wishes.len() > n);
+    assert!(s.st().wishes[n..].iter().all(|w| w == "sigur rós"));
+}
+
+#[test]
+fn wishlist_respects_a_longer_server_interval() {
+    let mut h = harness();
+    h.core.wishlist_add("a b c");
+    let s = h.online();
+    s.st().wish_interval = Duration::from_millis(900);
+    wait_until("first wish", || s.st().wishes.len() == 1);
+    let t1 = Instant::now();
+    wait_until("second wish", || s.st().wishes.len() == 2);
+    assert!(
+        t1.elapsed() >= Duration::from_millis(700),
+        "{:?}",
+        t1.elapsed()
+    );
+}
+
+// ------------------------------------------------------------- download to…
+
+#[test]
+fn download_to_another_folder_keeps_layout_staging_and_collision_rules() {
+    let mut h = harness();
+    let s = h.online();
+    let elsewhere = h.tmp.path().join("other disk");
+    // An existing file with the same name: the new one gets a unique name, as
+    // in the downloads folder.
+    std::fs::create_dir_all(elsewhere.join("Album")).unwrap();
+    std::fs::write(elsewhere.join("Album").join("01.flac"), b"old").unwrap();
+    let id = h
+        .core
+        .download_to(&rfile(r"Music\Album\01.flac", 4), &elsewhere);
+    let e = h.want(
+        "queued",
+        |e| matches!(e, CoreEvent::TransferQueued { id: i, .. } if *i == id),
+    );
+    let CoreEvent::TransferQueued { part_path, .. } = e else {
+        unreachable!()
+    };
+    let staging = h.downloads_dir().join(crate::paths::STAGING_DIR_NAME);
+    assert!(
+        part_path.starts_with(&staging),
+        "streams in the usual staging dir: {part_path:?}"
+    );
+    wait_until("lib download", || s.st().downloads.len() == 1);
+    assert!(s.st().downloads[0].dir.starts_with(&staging));
+    s.progress(0, b"abcd", 4);
+    s.complete(0);
+    let p = done_path(h.want("done", is_done(id)));
+    assert_eq!(p.parent().unwrap(), elsewhere.join("Album"));
+    assert_ne!(
+        p,
+        elsewhere.join("Album").join("01.flac"),
+        "never overwrites"
+    );
+    assert_eq!(std::fs::read(&p).unwrap(), b"abcd");
+    assert_eq!(
+        std::fs::read(elsewhere.join("Album").join("01.flac")).unwrap(),
+        b"old"
+    );
+    assert!(
+        !h.downloads_dir().join("Album").exists(),
+        "nothing in the default dir"
+    );
+    assert!(
+        std::fs::read_dir(&staging).map_or(true, |mut d| d.next().is_none()),
+        "staging cleaned"
+    );
+    assert_eq!(h.core.settings().recent_download_dirs, [elsewhere]);
+}
+
+#[test]
+fn download_folder_to_puts_the_album_folder_under_the_chosen_dir() {
+    let mut h = harness();
+    let s = h.online();
+    let elsewhere = h.tmp.path().join("usb");
+    s.st().folders.insert(
+        ("alice".into(), r"Music\Album (2019)".into()),
+        vec![dir(
+            r"Music\Album (2019)",
+            &["01.flac", "02.flac", "Thumbs.db"],
+        )],
+    );
+    h.core
+        .download_folder_to("alice", r"Music\Album (2019)\", &elsewhere);
+    wait_until("2 downloads", || s.st().downloads.len() == 2);
+    let ids: Vec<TransferId> = (0..2)
+        .map(
+            |_| match h.want("queued", |e| matches!(e, CoreEvent::TransferQueued { .. })) {
+                CoreEvent::TransferQueued { id, .. } => id,
+                _ => unreachable!(),
+            },
+        )
+        .collect();
+    for i in 0..2 {
+        s.progress(i, b"xy", 2);
+        s.complete(i);
+    }
+    let mut got: Vec<PathBuf> = (0..2)
+        .map(|_| {
+            done_path(h.want(
+                "done",
+                |e| matches!(e, CoreEvent::TransferDone { id, .. } if ids.contains(id)),
+            ))
+        })
+        .collect();
+    got.sort();
+    let album = elsewhere.join("Album (2019)");
+    assert_eq!(got, [album.join("01.flac"), album.join("02.flac")]);
+    assert!(!h.downloads_dir().join("Album (2019)").exists());
+    assert_eq!(h.core.settings().recent_download_dirs, [elsewhere]);
+    // The plain download_folder still uses the downloads folder.
+    s.st().folders.insert(
+        ("alice".into(), r"Music\B".into()),
+        vec![dir(r"Music\B", &["1.flac"])],
+    );
+    h.core.download_folder("alice", r"Music\B");
+    wait_until("3rd download", || s.st().downloads.len() == 3);
+    let id = match h.want("queued", |e| matches!(e, CoreEvent::TransferQueued { .. })) {
+        CoreEvent::TransferQueued { id, .. } => id,
+        _ => unreachable!(),
+    };
+    s.progress(2, b"z", 1);
+    s.complete(2);
+    assert_eq!(
+        done_path(h.want("done", is_done(id))),
+        h.downloads_dir().join("B").join("1.flac")
+    );
+}
+
+#[test]
+fn recent_download_dirs_are_mru_capped_at_five() {
+    let mut s = Settings::default();
+    for d in ["a", "b", "c", "d", "e", "f"] {
+        s.remember_download_dir(Path::new(d));
+    }
+    s.remember_download_dir(Path::new("c"));
+    let got: Vec<&str> = s
+        .recent_download_dirs
+        .iter()
+        .map(|p| p.to_str().unwrap())
+        .collect();
+    assert_eq!(got, ["c", "f", "e", "d", "b"]);
 }

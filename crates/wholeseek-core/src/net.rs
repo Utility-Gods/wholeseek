@@ -19,6 +19,10 @@ pub(crate) trait Session: Send + Sync {
     fn session_loss(&self) -> Option<SessionLoss>;
     /// Register and send `query`, then wait out `window` or `cancel`.
     fn search_blocking(&self, query: &str, window: Duration, cancel: Arc<AtomicBool>);
+    /// Like `search_blocking`, sent as a wishlist search (server code 103).
+    fn wishlist_search_blocking(&self, query: &str, window: Duration, cancel: Arc<AtomicBool>);
+    /// Server's wishlist interval (code 104), or the library default.
+    fn wishlist_interval(&self) -> Duration;
     fn search_count(&self, query: &str) -> usize;
     fn search_results(&self, query: &str) -> Vec<SearchResult>;
     fn forget_search(&self, query: &str);
@@ -103,6 +107,19 @@ impl Session for Client {
     }
     fn search_blocking(&self, query: &str, window: Duration, cancel: Arc<AtomicBool>) {
         let _ = self.search_with_cancel(query, window, Some(cancel));
+    }
+    fn wishlist_search_blocking(&self, query: &str, window: Duration, cancel: Arc<AtomicBool>) {
+        if self.start_wishlist_search(query).is_err() {
+            return;
+        }
+        let end = std::time::Instant::now() + window;
+        while std::time::Instant::now() < end && !cancel.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    fn wishlist_interval(&self) -> Duration {
+        Client::wishlist_interval(self)
     }
     fn search_count(&self, query: &str) -> usize {
         self.get_search_results_count(query)

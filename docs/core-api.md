@@ -175,7 +175,7 @@ No separate rescan call: rescan = `set_shared_directories(same dirs)`.
 | G1 | Out of MVP (TL) | Only `upload_slots` → `set_upload_slots`. |
 | G2 | **Done** | `src/port_mapping/` (MIT-attributed port), `CoreEvent::PortMapping { port, outcome }`; started after each login with the bound port when `port_mapping` is on, stopped on logout/reconnect/drop. |
 | G3 | **Done** | Worker tick `POLL_TICK` (150 ms) polls session loss, search counts, browse/folder answers, download status channels, uploads (1 s). |
-| G4 | **Done** | Search window 15 s on a helper thread (`search_with_cancel`); deltas `results[seen..]` ranked per batch; a repeat of a live query ends the old `SearchId` first; `forget_search` on finish/cancel (deferred until the helper returns). Offline/empty query → `Error` + `SearchFinished { total_files: 0 }`. |
+| G4 | **Done** | Search window 30 s (§3.10) on a helper thread (`search_with_cancel`); deltas `results[seen..]` ranked per batch; a repeat of a live query ends the old `SearchId` first; `forget_search` on finish/cancel (deferred until the helper returns). Offline/empty query → `Error` + `SearchFinished { total_files: 0 }`. |
 | G5 | **Done** | ▶ into `cache/t<id>/`. ↓ streams into `downloads/.wholeseek-partial/t<id>/` and is moved to `downloads/<folder>/` on completion; existing names get ` (1)`, ` (2)` … — never overwritten. `TransferQueued/Progress.part_path` is the real growing file. |
 | G6 | **Done** | `Disconnected{Network("… — reconnecting in N s (attempt k)"), will_retry:true}` → reconnect after 2, 5, 15, 30, then 60 s (reset on success); countdown in `status().reconnect` (§3.8). The new session re-announces shares and the bound port at login. `LoginRejected` / `Displaced` / `User` → no retry. Login while connected restarts the session. |
 | G7 | Accepted | `DisconnectReason::LoginRejected`. |
@@ -202,7 +202,7 @@ impl Core {
     pub fn start(settings: Settings) -> io::Result<(Core, Receiver<CoreEvent>)>;
     pub fn login(&self, Credentials);            // auto-reconnect until logout
     pub fn logout(&self);
-    pub fn search(&self, query: &str) -> SearchId;
+    pub fn search(&self, query: &str) -> SearchId;   // sends query::normalize_query(query); may broaden once (§3.10)
     pub fn cancel_search(&self, SearchId);
     pub fn browse(&self, username: &str);
     pub fn play_fetch(&self, &RemoteFile) -> PlayTicket { id, part_path, final_path }  // cache only
@@ -413,7 +413,7 @@ will_retry: true }` and sets `status().reconnect` until the attempt starts; dela
 `share_dirs` and the library sends SharedFoldersFiles + the bound port right after login, then
 `ShareCounts` is emitted again.
 
-**(b) Search progress.** Results stream as `SearchResults` deltas for the whole window (15 s), not
+**(b) Search progress.** Results stream as `SearchResults` deltas for the whole window (30 s), not
 only the first batch; `status().searches` has the running file and distinct-user counts and
 `ends_at` for "128 results from 34 users… still searching (9 s left)". The definite end is
 `SearchFinished { total_files }`, sent when the window closes (or on cancel / a repeat of the same
@@ -453,6 +453,86 @@ still list every file, so the UI can show "N system files skipped" with `is_down
 folder that holds only junk gives `Error { context: "download_folder", "… has only system files
 (Thumbs.db, …)" }`. Single-file `Core::download` is not filtered.
 
+### 3.10 Search quality — normalization, broadening, wishlist, window (additive)
+
+**What goes on the wire.** `Core::search(typed)` sends `query::normalize_query(typed)`: punctuation
+inside ordinary words becomes a space (`wasn't` → `wasn t`, `ac/dc` → `ac dc`, `p!nk` → `p nk`,
+typographic quotes/dashes too), whitespace collapsed, case and accents kept. `-word` (exclude) and
+`*part` (partial) are sent unchanged; `"phrase"` quotes are dropped. If nothing is left (`?!`) the
+trimmed original is sent, never an empty query. The tab title stays what was typed
+(`status().searches[].query`, `SearchInfo::typed`). This is exactly what Nicotine+ 3.3.11 sends
+(`pynicotine/search.py` `sanitize_search_term`, "SoulseekQt doesn't seem to send search results if
+such characters are included"), and it matches how clients index shares (file names split on
+punctuation, `TRANSLATE_PUNCTUATION`).
+
+Live measurement (throwaway account, all variants of a query searched at the same time, users/files,
+two rounds; `tests/live.rs::live_query_variants`, `proof/search/`):
+
+| query | as typed | apostrophe removed | punct → space (chosen) | + drop 1-char words | + accents folded |
+|---|---|---|---|---|---|
+| wasn't me shaggy | 273/625 · 9/26 | 94/197 · 2/2 | **456/1053 · 18/46** | 457/1062 · 17/45 | = punct |
+| don't stop me now | 477/1408 · 66/185 | 74/168 · 2/2 | 463/1409 · 68/187 | 464/1429 · 68/191 | = punct |
+| guns n' roses | 175/8073 · 174/8470 | 171/8011 · 185/8316 | 171/8011 · 185/8316 | 173/7964 · 184/8333 | = punct |
+| ac/dc back in black | 23/212 · 21/240 | = typed | **128/1480 · 118/1468** | = punct | = punct |
+| p!nk | 33/1349 · 21/1376 | = typed | 34/1488 · 19/1081 | 36/1329 · 22/1398 | = punct |
+| beyoncé halo | 0/0 · 0/0 | = | 0/0 · 0/0 | = | 0/0 · 0/0 |
+| sigur rós | 59/2337 · 7/756 | = | = typed | = | 51/2274 · 6/743 |
+
+Removing apostrophes (`wasnt`) is much worse; punctuation → space wins clearly where punctuation is
+inside a word and is neutral elsewhere; dropping 1-letter words and folding accents are neutral to
+slightly worse, so they are only used as the zero-result fallback. Round 2 counts are lower across
+the board (the server seems to throttle repeated searches), so compare within a round.
+`beyoncé halo` returns nothing in any form (likely a server-excluded phrase).
+
+**Broaden once on zero.** When the window closes with **no audio** results (non-audio hits do not
+count), the same `SearchId` is re-run once with `query::broaden_query(sent)` (accents folded,
+1-character words dropped: `wasn t me` → `wasn me`, `sigur rós` → `sigur ros`), if that differs.
+`SearchResults` keep coming under the same id; exactly one `SearchFinished` ends both. Never
+for queries with operators (`-x`, `*x`, `"…"`), never twice, never for wishlist searches.
+`Core::search_info(id) -> Option<SearchInfo { id, typed, sent, broadened_to, wishlist, files,
+users, finished }>` tells the UI "No results for X — showing results for Y"; kept for the newest
+256 searches, after they finish.
+
+**Wishlist.** `Settings::wishlist: Vec<String>` (serde default; persisted by
+`config::save_settings`), `Core::wishlist() -> &[String]`, `Core::wishlist_add(&mut self, q) ->
+bool` (false if empty or already there, case-insensitive), `Core::wishlist_remove(&mut self, q) ->
+bool`. While logged in, one wish is searched per interval, round-robin (as Nicotine+ does), first
+30 s after login: sent as a **wishlist search, server code 103** (soulseek-rs
+`Client::start_wishlist_search`, already in our pin), interval = the server's code 104 value
+(`Client::wishlist_interval`, library default 12 min until announced), never less than 10 min.
+Results arrive as ordinary `SearchResults` / `SearchFinished` under a fresh `SearchId`;
+`search_info(id).wishlist == true` and `.typed` is the wish. No new events.
+
+**Window and caps.** A search collects for **30 s** (was 15 s). The library keeps at most
+**500 responses / 10 000 files** per search (`MAX_SEARCH_RESPONSES` / `MAX_SEARCH_FILES`,
+whole responses), and each peer reply carries at most 300 files. Measured, 5 queries at once over
+60 s (`live_search_arrival_times`):
+
+| query | responses | files | % responses after 5/10/15/20/30 s | % files after | last |
+|---|---|---|---|---|---|
+| aphex twin | 135 | 10 397 | 100/0/0/0/0 | 100/0/0/0/0 | 8.8 s (file cap) |
+| daft punk discovery | 500 | 8 052 | 100/73/48/27/0 | 100/72/48/25/0 | 28.2 s (response cap) |
+| radiohead ok computer | 458 | 10 023 | 100/70/41/12/0 | 100/72/47/10/0 | 23.2 s (file cap) |
+| miles davis kind of blue | 500 | 6 229 | 100/86/73/57/37 | 100/90/65/50/32 | 45.2 s |
+| shaggy wasn t me | 403 | 945 | 100/88/77/67/50 | 100/91/81/70/50 | 60.1 s |
+| all | 1 996 | 35 646 | 100/74/55/37/19 | 100/55/37/19/7 | |
+
+A 15 s window dropped 55 % of responses (37 % of files); 30 s keeps all but 19 % (7 % of files) —
+mostly for rarer queries, where late answers matter most. Results stream throughout, so the UI is
+not slower; only "still searching" and the broaden fallback wait longer.
+
+### 3.11 Download to another folder (additive)
+
+`Core::download_to(&mut self, file, dir: &Path) -> TransferId` and
+`Core::download_folder_to(&mut self, username, folder, dir: &Path)`: like `download` /
+`download_folder`, into `<dir>/<remote folder name>/` (`paths::download_dir_for(dir, path)`).
+Staging, `.part` and collisions are unchanged: the file streams in
+`<download_dir>/.wholeseek-partial/t<id>/` and is moved (rename, or copy + delete across
+filesystems) on completion, never overwriting (unique name). `TransferDone { path }` is the final
+file ("Show in folder"). Both put `dir` first in `Settings::recent_download_dirs` (MRU, max
+`Settings::RECENT_DOWNLOAD_DIRS` = 5, serde default; `Settings::remember_download_dir`); the app
+persists with `config::save_settings(core.settings())`. `&mut self` because they update settings.
+
 ### 3.7 Tests
 
 Offline: `cargo test -p wholeseek-core` — paths, ranking + `alternates` matching, cache
@@ -462,7 +542,8 @@ deltas, browse timeout, folder fallback, cache-only play, promotion, cache reuse
 ▶ start deadline + retry, eviction, shares, uploads, user profile, displaced vs. network-drop
 reconnect with backoff status and share re-announce, port release before reconnect, bound-port note,
 search progress over several batches, cache usage + `clear_cache`, folder junk skip, per-share
-status at startup and across rescans).
+status at startup and across rescans, query normalization + broaden-once + operators, wishlist
+scheduling and interval, download-to layout/staging/MRU, old config loading).
 
 Live (`#[ignore]`, throwaway accounts only, never the user's own; `--nocapture`):
 - `live_core_end_to_end` (`WHOLESEEK_USER`/`WHOLESEEK_PASS`, `WHOLESEEK_LISTEN_PORT`): login, search

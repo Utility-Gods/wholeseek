@@ -15,10 +15,10 @@
 use crate::event::CoreEvent;
 use crate::model::{Credentials, PlayTicket, RemoteFile, SearchId, Settings, TransferId};
 use crate::net::{Connector, RealConnector};
-use crate::status::CoreStatus;
-use crate::worker::{Msg, Tunables, Worker};
+use crate::status::{CoreStatus, SearchInfo};
+use crate::worker::{Msg, Shared, Tunables, Worker};
 use crate::{cache, paths};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -56,6 +56,12 @@ pub enum Command {
         username: String,
         folder: String,
     },
+    /// Additive: like `DownloadFolder`, into `<dir>/<remote folder name>/`.
+    DownloadFolderTo {
+        username: String,
+        folder: String,
+        dir: PathBuf,
+    },
     Cancel(TransferId),
     Retry(TransferId),
     SetShares(Vec<PathBuf>),
@@ -72,6 +78,8 @@ pub enum Command {
     UserProfile(String),
     /// Additive: delete cached plays except those in use.
     ClearCache,
+    /// Additive: replace the wishlist (`Settings::wishlist`).
+    SetWishlist(Vec<String>),
     Shutdown,
 }
 
@@ -82,8 +90,12 @@ pub struct Core {
     next_id: Arc<AtomicU64>,
     settings: Settings,
     status: Arc<Mutex<CoreStatus>>,
+    infos: SearchInfos,
     worker: Option<JoinHandle<()>>,
 }
+
+/// Shared with the worker: what happened to recent searches.
+pub(crate) type SearchInfos = Arc<Mutex<std::collections::BTreeMap<SearchId, SearchInfo>>>;
 
 impl Core {
     /// Start the worker thread. Returns the handle and the event stream.
@@ -109,14 +121,18 @@ impl Core {
         let first = cache::max_transfer_id(&[&settings.cache_dir, &staging]) + 1;
         let ids = Arc::new(AtomicU64::new(first));
         let status = Arc::new(Mutex::new(CoreStatus::default()));
+        let infos = SearchInfos::default();
         let worker = Worker::new(
             ev_tx,
             tx.clone(),
             connector,
             tunables,
             settings.clone(),
-            ids.clone(),
-            status.clone(),
+            Shared {
+                ids: ids.clone(),
+                status: status.clone(),
+                infos: infos.clone(),
+            },
         );
         let handle = std::thread::Builder::new()
             .name("wholeseek-core".into())
@@ -127,6 +143,7 @@ impl Core {
                 next_id: ids,
                 settings,
                 status,
+                infos,
                 worker: Some(handle),
             },
             ev_rx,
@@ -158,6 +175,11 @@ impl Core {
 
     /// Start a network search; results arrive as `SearchResults` batches.
     #[must_use]
+    /// Search the network for `query`. What goes on the wire is
+    /// [`crate::query::normalize_query`]`(query)`; if that finds no audio, the
+    /// search is re-run once with [`crate::query::broaden_query`] under the
+    /// same id (see [`Core::search_info`]). Results: `SearchResults`, then one
+    /// `SearchFinished`.
     pub fn search(&self, query: &str) -> SearchId {
         let id = SearchId(self.next());
         self.send(Command::Search {
@@ -212,6 +234,36 @@ impl Core {
             kind: crate::model::TransferKind::Download,
         });
         id
+    }
+
+    /// Additive: ↓ `file` into `<dir>/<remote folder name>/` instead of the
+    /// downloads folder ("Download to…"). Staging, `.part` handling and
+    /// name-collision rules are those of [`Core::download`]: the file streams
+    /// in `<download_dir>/.wholeseek-partial/t<id>/` and is moved (rename, or
+    /// copy + delete across filesystems) when complete; `TransferDone { path }`
+    /// is the final file. `dir` becomes the first of
+    /// `Settings::recent_download_dirs` (persist with `config::save_settings`).
+    pub fn download_to(&mut self, file: &RemoteFile, dir: &Path) -> TransferId {
+        self.settings.remember_download_dir(dir);
+        let id = TransferId(self.next());
+        self.send(Command::Fetch {
+            id,
+            file: file.clone(),
+            dir: paths::download_dir_for(dir, &file.path),
+            kind: crate::model::TransferKind::Download,
+        });
+        id
+    }
+
+    /// Additive: [`Core::download_folder`] into `<dir>/<remote folder name>/`.
+    /// Updates `Settings::recent_download_dirs` like [`Core::download_to`].
+    pub fn download_folder_to(&mut self, username: &str, folder: &str, dir: &Path) {
+        self.settings.remember_download_dir(dir);
+        self.send(Command::DownloadFolderTo {
+            username: username.to_string(),
+            folder: folder.to_string(),
+            dir: dir.to_path_buf(),
+        });
     }
 
     /// ↓ a whole remote folder (non-recursive, as Soulseek folder listings are).
@@ -279,6 +331,56 @@ impl Core {
     }
 
     /// Apply new settings. A changed listen port reconnects the session.
+    /// Additive: what happened to a recent search — the query sent, whether it
+    /// was broadened (and to what), whether it is a wishlist search, counts.
+    /// Kept for the newest [`crate::status::SEARCH_INFO_KEEP`] searches.
+    #[must_use]
+    pub fn search_info(&self, id: SearchId) -> Option<SearchInfo> {
+        self.infos.lock().ok()?.get(&id).cloned()
+    }
+
+    /// Additive: the wishlist (`Settings::wishlist`).
+    #[must_use]
+    pub fn wishlist(&self) -> &[String] {
+        &self.settings.wishlist
+    }
+
+    /// Additive: add a wishlist query. Returns false for an empty query or one
+    /// already on the list (case-insensitive). Persist with
+    /// `config::save_settings(core.settings())`.
+    pub fn wishlist_add(&mut self, query: &str) -> bool {
+        let q = query.split_whitespace().collect::<Vec<_>>().join(" ");
+        if q.is_empty()
+            || self
+                .settings
+                .wishlist
+                .iter()
+                .any(|w| w.to_lowercase() == q.to_lowercase())
+        {
+            return false;
+        }
+        self.settings.wishlist.push(q);
+        self.send(Command::SetWishlist(self.settings.wishlist.clone()));
+        true
+    }
+
+    /// Additive: remove a wishlist query (case-insensitive). Returns whether it
+    /// was there. Persist with `config::save_settings(core.settings())`.
+    pub fn wishlist_remove(&mut self, query: &str) -> bool {
+        let q = query
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        let before = self.settings.wishlist.len();
+        self.settings.wishlist.retain(|w| w.to_lowercase() != q);
+        let removed = self.settings.wishlist.len() != before;
+        if removed {
+            self.send(Command::SetWishlist(self.settings.wishlist.clone()));
+        }
+        removed
+    }
+
     pub fn apply_settings(&mut self, settings: Settings) {
         self.settings = settings.clone();
         self.send(Command::ApplySettings(settings));

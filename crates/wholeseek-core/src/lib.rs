@@ -8,10 +8,12 @@ pub mod cache;
 pub mod config;
 mod core;
 mod event;
+pub mod group;
 mod model;
 mod net;
 pub mod paths;
 mod port_mapping;
+pub mod query;
 pub mod rank;
 pub mod status;
 mod worker;
@@ -24,8 +26,9 @@ pub use model::{
     TransferId, TransferKind, UploadRow, UploadState, UserProfile,
 };
 pub use paths::{DOWNLOAD_SKIP, is_download_junk};
+pub use query::{broaden_query, normalize_query};
 pub use status::{
-    CacheUsage, CoreStatus, ListenStatus, ReconnectStatus, SearchProgress, ShareStatus,
+    CacheUsage, CoreStatus, ListenStatus, ReconnectStatus, SearchInfo, SearchProgress, ShareStatus,
 };
 
 /// Client version wholeseek reports on login. Major 176 is reserved for

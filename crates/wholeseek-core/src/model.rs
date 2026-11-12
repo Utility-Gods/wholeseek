@@ -200,6 +200,29 @@ pub struct Settings {
     /// (`TransferFailed`, reason starts with [`crate::PLAY_STALLED`]) and is
     /// cancelled, so the app can try `rank::alternates`. ↓ is unaffected.
     pub play_start_timeout_secs: u64,
+    /// Wishlist queries (as typed), searched one at a time, round-robin, at
+    /// the server's wishlist interval (at least 10 min) while logged in.
+    /// Edited with `Core::wishlist_add` / `wishlist_remove`; saved with the
+    /// rest of the settings by `config::save_settings`.
+    pub wishlist: Vec<String>,
+    /// Folders recently chosen with "Download to…" (`Core::download_to` /
+    /// `download_folder_to`), most recent first, at most
+    /// [`Settings::RECENT_DOWNLOAD_DIRS`].
+    pub recent_download_dirs: Vec<PathBuf>,
+}
+
+impl Settings {
+    /// How many [`Settings::recent_download_dirs`] are kept.
+    pub const RECENT_DOWNLOAD_DIRS: usize = 5;
+
+    /// Move `dir` to the front of [`Settings::recent_download_dirs`]
+    /// (no duplicates, at most [`Settings::RECENT_DOWNLOAD_DIRS`]).
+    pub fn remember_download_dir(&mut self, dir: &std::path::Path) {
+        self.recent_download_dirs.retain(|d| d != dir);
+        self.recent_download_dirs.insert(0, dir.to_path_buf());
+        self.recent_download_dirs
+            .truncate(Self::RECENT_DOWNLOAD_DIRS);
+    }
 }
 
 impl Default for Settings {
@@ -221,6 +244,8 @@ impl Default for Settings {
             upload_slots: 10,
             port_mapping: true,
             play_start_timeout_secs: 8,
+            wishlist: Vec::new(),
+            recent_download_dirs: Vec::new(),
         }
     }
 }

@@ -495,6 +495,8 @@ pub(crate) mod tests {
             upload_slots: 3,
             port_mapping: false,
             play_start_timeout_secs: 5,
+            wishlist: vec!["wasn't me".into()],
+            recent_download_dirs: vec!["/elsewhere".into()],
         }
     }
 
@@ -577,6 +579,30 @@ pub(crate) mod tests {
         );
         std::fs::write(&path, "not = [toml").unwrap();
         assert!(load_in(tmp.path(), &mem()).is_err());
+    }
+
+    #[test]
+    fn config_from_before_wishlist_and_recent_dirs_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CONFIG_FILE);
+        // A complete config as written before these fields existed.
+        std::fs::write(
+            &path,
+            "username = \"alice\"\n[settings]\ndownload_dir = \"/dl\"\ncache_dir = \"/c\"\n\
+             cache_cap_bytes = 1\nshare_dirs = []\nlisten_port = 2240\nupload_slots = 2\n\
+             port_mapping = false\nplay_start_timeout_secs = 8\n",
+        )
+        .unwrap();
+        let l = load_in(tmp.path(), &mem()).unwrap();
+        assert_eq!(l.settings.listen_port, 2240);
+        assert!(l.settings.wishlist.is_empty());
+        assert!(l.settings.recent_download_dirs.is_empty());
+        // And they round-trip once set.
+        let mut s = l.settings.clone();
+        s.wishlist.push("wasn't me".into());
+        s.remember_download_dir(Path::new("/usb"));
+        save_settings_in(tmp.path(), &s).unwrap();
+        assert_eq!(load_in(tmp.path(), &mem()).unwrap().settings, s);
     }
 
     fn bases(root: &Path) -> BaseDirs {

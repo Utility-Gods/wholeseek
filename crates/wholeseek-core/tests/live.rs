@@ -447,3 +447,232 @@ fn live_share_upload_between_two_accounts() {
     a.logout();
     b.logout();
 }
+
+/// Result counts for query variants (punctuation / accent handling), all
+/// variants of one query searched at the same time, two rounds. Prints a table;
+/// no user names. Port WHOLESEEK_LISTEN_PORT (default 2243).
+#[test]
+#[ignore = "live Soulseek network; needs WHOLESEEK_USER/WHOLESEEK_PASS and permission"]
+fn live_query_variants() {
+    use std::collections::{HashMap, HashSet};
+    use wholeseek_core::query::{fold_accents, normalize_query};
+
+    let queries = [
+        "wasn't me shaggy",
+        "don't stop me now",
+        "guns n' roses",
+        "ac/dc back in black",
+        "p!nk",
+        "beyoncé halo",
+        "sigur rós",
+    ];
+    type Variant = (&'static str, fn(&str) -> String);
+    let variants: [Variant; 5] = [
+        ("typed", |q| q.trim().to_string()),
+        ("no_apostrophe", |q| q.replace(['\'', '’'], "")),
+        ("punct_space", normalize_query),
+        ("punct_space_drop1", |q| {
+            normalize_query(q)
+                .split(' ')
+                .filter(|w| w.chars().count() > 1)
+                .collect::<Vec<_>>()
+                .join(" ")
+        }),
+        ("fold_accents", |q| fold_accents(&normalize_query(q))),
+    ];
+    let port = std::env::var("WHOLESEEK_LISTEN_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(2243);
+    let tmp = tempfile::tempdir().unwrap();
+    let settings = Settings {
+        download_dir: tmp.path().join("downloads"),
+        cache_dir: tmp.path().join("cache"),
+        listen_port: port,
+        ..Settings::default()
+    };
+    let (core, ev) = Core::start(settings).expect("start");
+    core.login(creds());
+    let e = want(&ev, Duration::from_secs(60), "Connected", |e| {
+        matches!(
+            e,
+            CoreEvent::Connected { .. } | CoreEvent::Disconnected { .. }
+        )
+    })
+    .expect("login answer");
+    assert!(
+        matches!(e, CoreEvent::Connected { .. }),
+        "login failed: {e:?}"
+    );
+
+    // (query, variant) -> per round (users, files)
+    let mut table: HashMap<(usize, usize), Vec<(usize, usize)>> = HashMap::new();
+    for round in 0..2 {
+        for (qi, q) in queries.iter().enumerate() {
+            // Distinct strings only; rotate start order per round.
+            let mut sent: Vec<(String, Vec<usize>)> = Vec::new();
+            for k in 0..variants.len() {
+                let vi = (k + round) % variants.len();
+                let s = (variants[vi].1)(q);
+                match sent.iter_mut().find(|(t, _)| *t == s) {
+                    Some((_, vis)) => vis.push(vi),
+                    None => sent.push((s, vec![vi])),
+                }
+            }
+            let mut ids = HashMap::new();
+            for (s, vis) in &sent {
+                ids.insert(core.search(s), vis.clone());
+            }
+            let mut users: HashMap<_, HashSet<String>> = HashMap::new();
+            let mut files: HashMap<_, usize> = HashMap::new();
+            let mut open = ids.len();
+            let deadline = Instant::now() + Duration::from_secs(40);
+            while open > 0 {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                match ev.recv_timeout(left) {
+                    Ok(CoreEvent::SearchResults { search, hits }) if ids.contains_key(&search) => {
+                        *files.entry(search).or_default() += hits.len();
+                        let u = users.entry(search).or_default();
+                        u.extend(hits.into_iter().map(|h| h.file.username));
+                    }
+                    Ok(CoreEvent::SearchFinished { search, .. }) if ids.contains_key(&search) => {
+                        open -= 1;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            for (id, vis) in &ids {
+                let row = (
+                    users.get(id).map_or(0, HashSet::len),
+                    files.get(id).copied().unwrap_or(0),
+                );
+                for vi in vis {
+                    table.entry((qi, *vi)).or_default().push(row);
+                }
+            }
+            println!(
+                "round {} query {qi} done ({} distinct variants)",
+                round + 1,
+                sent.len()
+            );
+        }
+    }
+    println!("\nusers/files per round (r1 | r2); identical strings share one search");
+    println!(
+        "{:<22} {}",
+        "query",
+        variants.map(|v| format!("{:<26}", v.0)).join("")
+    );
+    for (qi, q) in queries.iter().enumerate() {
+        let mut line = format!("{q:<22} ");
+        for vi in 0..variants.len() {
+            let r = &table[&(qi, vi)];
+            let s = (variants[vi].1)(q);
+            let cell = r
+                .iter()
+                .map(|(u, f)| format!("{u}/{f}"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            line.push_str(&format!("{:<26}", format!("{cell} «{s}»")));
+        }
+        println!("{line}");
+    }
+}
+
+/// When do search responses arrive? Five queries at once over a 60 s window,
+/// straight on the library (no Core window), polled every 250 ms. Prints the
+/// share of responses / files that arrived after 5, 10, 15, 20, 30 s.
+#[test]
+#[ignore = "live Soulseek network; needs WHOLESEEK_USER/WHOLESEEK_PASS and permission"]
+fn live_search_arrival_times() {
+    use soulseek_rs::{Client, ClientSettings};
+    let queries = [
+        "aphex twin",
+        "daft punk discovery",
+        "radiohead ok computer",
+        "miles davis kind of blue",
+        "shaggy wasn t me",
+    ];
+    let port = std::env::var("WHOLESEEK_LISTEN_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(2243);
+    let c = creds();
+    let mut client = Client::with_settings(ClientSettings {
+        listen_port: port,
+        version: wholeseek_core::CLIENT_VERSION,
+        ..ClientSettings::new(c.username, c.password)
+    });
+    client.connect().expect("connect");
+    assert!(client.login().expect("login"), "login rejected");
+    let client = std::sync::Arc::new(client);
+    let window = Duration::from_secs(60);
+    let t0 = Instant::now();
+    let handles: Vec<_> = queries
+        .iter()
+        .map(|q| {
+            let (c, q) = (client.clone(), q.to_string());
+            std::thread::spawn(move || {
+                let _ = c.search(&q, window);
+            })
+        })
+        .collect();
+    // per query: (arrival secs, files) per response, in arrival order
+    let mut arrivals: Vec<Vec<(f32, usize)>> = vec![Vec::new(); queries.len()];
+    while t0.elapsed() < window {
+        std::thread::sleep(Duration::from_millis(250));
+        let at = t0.elapsed().as_secs_f32();
+        for (i, q) in queries.iter().enumerate() {
+            let r = client.get_search_results(q);
+            for res in r.iter().skip(arrivals[i].len()) {
+                arrivals[i].push((at, res.files.len()));
+            }
+        }
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let marks = [5.0f32, 10.0, 15.0, 20.0, 30.0];
+    println!(
+        "\nquery                      responses  files   % resp after {marks:?}   % files after"
+    );
+    let mut all: Vec<(f32, usize)> = Vec::new();
+    for (i, q) in queries.iter().enumerate() {
+        let a = &arrivals[i];
+        all.extend(a.iter().copied());
+        println!("{q:<26} {}", line(a, &marks));
+    }
+    println!("{:<26} {}", "ALL", line(&all, &marks));
+
+    fn line(a: &[(f32, usize)], marks: &[f32]) -> String {
+        let n = a.len().max(1) as f32;
+        let files: usize = a.iter().map(|x| x.1).sum();
+        let fl = files.max(1) as f32;
+        let pr: Vec<String> = marks
+            .iter()
+            .map(|m| {
+                format!(
+                    "{:.0}",
+                    100.0 * a.iter().filter(|x| x.0 > *m).count() as f32 / n
+                )
+            })
+            .collect();
+        let pf: Vec<String> = marks
+            .iter()
+            .map(|m| {
+                let late: usize = a.iter().filter(|x| x.0 > *m).map(|x| x.1).sum();
+                format!("{:.0}", 100.0 * late as f32 / fl)
+            })
+            .collect();
+        let last = a.iter().map(|x| x.0).fold(0.0, f32::max);
+        format!(
+            "{:>9} {files:>6}   {:<24} {:<20} last at {last:.1}s",
+            a.len(),
+            pr.join("/"),
+            pf.join("/")
+        )
+    }
+}

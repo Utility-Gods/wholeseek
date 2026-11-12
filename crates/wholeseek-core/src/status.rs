@@ -105,3 +105,29 @@ pub struct CacheUsage {
     /// keep: the current play and plays still being fetched.
     pub in_use_bytes: u64,
 }
+
+/// What happened to one search, kept after it finishes (the newest
+/// [`SEARCH_INFO_KEEP`] searches). Read with `Core::search_info(id)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchInfo {
+    pub id: SearchId,
+    /// What the user typed (trimmed) — the tab title. For a wishlist search,
+    /// the wish.
+    pub typed: String,
+    /// What went on the wire first: [`crate::query::normalize_query`] of `typed`.
+    pub sent: String,
+    /// Set when the first query found no audio and the search was re-run once
+    /// with this broader query; results after that point are for it.
+    pub broadened_to: Option<String>,
+    /// Started by the wishlist scheduler, not by `Core::search`.
+    pub wishlist: bool,
+    /// Files delivered in `SearchResults` so far (after the audio filter).
+    pub files: usize,
+    /// Distinct users among them.
+    pub users: usize,
+    /// `SearchFinished` has been sent.
+    pub finished: bool,
+}
+
+/// How many [`SearchInfo`]s are kept.
+pub const SEARCH_INFO_KEEP: usize = 256;

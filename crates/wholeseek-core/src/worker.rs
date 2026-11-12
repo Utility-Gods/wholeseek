@@ -7,6 +7,7 @@
 
 use crate::cache;
 use crate::core::Command;
+use crate::core::SearchInfos;
 use crate::event::{CoreEvent, DisconnectReason, PortMapOutcome};
 use crate::model::{
     AudioAttrs, BrowseDir, Credentials, RemoteFile, SearchId, Settings, TransferId, TransferKind,
@@ -15,9 +16,10 @@ use crate::model::{
 use crate::net::{self, ConnectParams, Connector, LoginError, Session};
 use crate::port_mapping::{self, PortMapper};
 use crate::status::{
-    CacheUsage, CoreStatus, ListenStatus, ReconnectStatus, SearchProgress, ShareStatus,
+    CacheUsage, CoreStatus, ListenStatus, ReconnectStatus, SEARCH_INFO_KEEP, SearchInfo,
+    SearchProgress, ShareStatus,
 };
-use crate::{paths, rank};
+use crate::{paths, query, rank};
 use soulseek_rs::message::peer::PeerInfo;
 use soulseek_rs::{
     DownloadStatus, SessionLoss, SharedDirectory, UploadStatus, UserInfo, UserStatus,
@@ -45,6 +47,10 @@ pub(crate) struct Tunables {
     /// listen port before connecting anyway.
     pub release_wait: Duration,
     pub cache_rescan: Duration,
+    /// First wishlist search this long after login.
+    pub wishlist_first: Duration,
+    /// Never run wishlist searches more often than this.
+    pub wishlist_min: Duration,
     pub backoff: fn(u32) -> Duration,
 }
 
@@ -52,7 +58,9 @@ impl Default for Tunables {
     fn default() -> Self {
         Self {
             tick: crate::core::POLL_TICK,
-            search_window: Duration::from_secs(15),
+            // Measured (docs §3.10): 55% of responses arrive after 15 s and
+            // they keep coming until ~60 s; at 30 s 19% (7% of files) remain.
+            search_window: Duration::from_secs(30),
             browse_timeout: Duration::from_secs(60),
             folder_timeout: Duration::from_secs(30),
             play_start_timeout: None,
@@ -61,6 +69,8 @@ impl Default for Tunables {
             profile_timeout: Duration::from_secs(10),
             release_wait: Duration::from_secs(5),
             cache_rescan: Duration::from_secs(2),
+            wishlist_first: Duration::from_secs(30),
+            wishlist_min: Duration::from_secs(10 * 60),
             backoff: net::backoff,
         }
     }
@@ -104,9 +114,16 @@ type Key = (String, String);
 
 struct LiveSearch {
     id: SearchId,
+    /// As typed (tab title / wish).
+    typed: String,
+    /// On the wire (library key).
     query: String,
+    /// May still be re-run once with a broader query.
+    broadenable: bool,
     seen: usize,
     delivered: usize,
+    /// Audio files among the results (before the audio-only filter).
+    audio: usize,
     users: HashSet<String>,
     ends_at: Instant,
     cancel: Arc<AtomicBool>,
@@ -132,6 +149,8 @@ enum FolderStage {
 struct FolderReq {
     username: String,
     folder: String,
+    /// Downloads go to `<root>/<remote folder name>/`.
+    root: PathBuf,
     deadline: Instant,
     stage: FolderStage,
 }
@@ -218,9 +237,21 @@ pub(crate) struct Worker {
     cache_in_use: u64,
     last_cache_scan: Instant,
     shares: Vec<ShareStatus>,
+    infos: SearchInfos,
+    /// Next wishlist search; `None` while offline.
+    wish_due: Option<Instant>,
+    wish_next: usize,
 }
 
 const BROWSE_CACHE_USERS: usize = 16;
+
+/// State the worker shares with [`crate::Core`]: the id counter and what
+/// `Core::status` / `Core::search_info` read.
+pub(crate) struct Shared {
+    pub ids: Arc<AtomicU64>,
+    pub status: Arc<Mutex<CoreStatus>>,
+    pub infos: SearchInfos,
+}
 
 impl Worker {
     pub(crate) fn new(
@@ -229,9 +260,9 @@ impl Worker {
         connector: Arc<dyn Connector>,
         t: Tunables,
         settings: Settings,
-        ids: Arc<AtomicU64>,
-        status: Arc<Mutex<CoreStatus>>,
+        shared: Shared,
     ) -> Self {
+        let Shared { ids, status, infos } = shared;
         Self {
             events,
             me,
@@ -267,6 +298,9 @@ impl Worker {
             cache_in_use: 0,
             last_cache_scan: Instant::now(),
             shares: Vec::new(),
+            infos,
+            wish_due: None,
+            wish_next: 0,
         }
     }
 
@@ -335,7 +369,15 @@ impl Worker {
                 dir,
                 kind,
             } => self.fetch(id, file, dir, kind),
-            Command::DownloadFolder { username, folder } => self.download_folder(username, folder),
+            Command::DownloadFolder { username, folder } => {
+                let root = self.settings.download_dir.clone();
+                self.download_folder(username, folder, root);
+            }
+            Command::DownloadFolderTo {
+                username,
+                folder,
+                dir,
+            } => self.download_folder(username, folder, dir),
             Command::Cancel(id) => self.cancel(id),
             Command::Retry(id) => self.retry(id),
             Command::SetShares(dirs) => {
@@ -345,6 +387,7 @@ impl Worker {
             Command::RescanShares => self.rescan(),
             Command::ApplySettings(s) => self.apply_settings(s),
             Command::SetAudioOnly(on) => self.audio_only = on,
+            Command::SetWishlist(list) => self.settings.wishlist = list,
             Command::UserProfile(username) => self.user_profile(username),
             Command::CancelUpload { username, path } => {
                 match self.session() {
@@ -368,7 +411,7 @@ impl Worker {
             Internal::LoginDone { generation, result } => self.on_login_done(generation, result),
             Internal::SearchWindowClosed(id) => {
                 if self.searches.iter().any(|s| s.id == id) {
-                    self.finish_search(id, false);
+                    self.search_window_closed(id);
                 } else if let Some((query, session)) = self.orphan_searches.remove(&id)
                     && !self.searches.iter().any(|s| s.query == query)
                 {
@@ -428,6 +471,7 @@ impl Worker {
         self.poll_folders();
         self.poll_transfers();
         self.poll_uploads();
+        self.poll_wishlist();
         self.publish();
     }
 
@@ -441,7 +485,7 @@ impl Worker {
                 .iter()
                 .map(|s| SearchProgress {
                     id: s.id,
-                    query: s.query.clone(),
+                    query: s.typed.clone(),
                     files: s.delivered,
                     users: s.users.len(),
                     ends_at: s.ends_at,
@@ -519,6 +563,7 @@ impl Worker {
         match result {
             Ok(s) => {
                 self.attempt = 0;
+                self.wish_due = Some(Instant::now() + self.t.wishlist_first);
                 s.set_upload_slots(self.settings.upload_slots);
                 let port = s.listen_port();
                 self.conn = Conn::Online(s.clone());
@@ -582,6 +627,8 @@ impl Worker {
             at,
         });
         let secs = delay.as_secs_f64().ceil();
+        // Snapshot first, so status().reconnect is set when the UI handles it.
+        self.publish();
         self.emit(CoreEvent::Disconnected {
             reason: DisconnectReason::Network(format!(
                 "{reason} — reconnecting in {secs} s (attempt {})",
@@ -589,7 +636,6 @@ impl Worker {
             )),
             will_retry: true,
         });
-        self.publish();
     }
 
     fn logout(&mut self) {
@@ -607,6 +653,7 @@ impl Worker {
     /// Tear down everything bound to the current session. The caller sets `conn`.
     fn end_session(&mut self, why: &str) {
         self.mapper = None;
+        self.wish_due = None;
         self.reconnect = None;
         if let Conn::Online(s) = &self.conn {
             self.retired.push(Arc::downgrade(s));
@@ -823,8 +870,20 @@ impl Worker {
 
     // ----------------------------------------------------------------- search
 
-    fn search(&mut self, id: SearchId, query: String) {
-        if query.is_empty() {
+    fn search(&mut self, id: SearchId, typed: String) {
+        let sent = query::normalize_query(&typed);
+        self.set_info(SearchInfo {
+            id,
+            typed: typed.clone(),
+            sent: sent.clone(),
+            broadened_to: None,
+            wishlist: false,
+            files: 0,
+            users: 0,
+            finished: false,
+        });
+        if sent.is_empty() {
+            self.end_info(id);
             self.emit(CoreEvent::SearchFinished {
                 search: id,
                 total_files: 0,
@@ -833,6 +892,7 @@ impl Worker {
         }
         let Some(session) = self.session() else {
             self.error("search", "not connected");
+            self.end_info(id);
             self.emit(CoreEvent::SearchFinished {
                 search: id,
                 total_files: 0,
@@ -840,18 +900,28 @@ impl Worker {
             return;
         };
         // One live search per query string (G4): the library files results by it.
-        if let Some(old) = self
-            .searches
-            .iter()
-            .find(|s| s.query == query)
-            .map(|s| s.id)
-        {
+        if let Some(old) = self.searches.iter().find(|s| s.query == sent).map(|s| s.id) {
             self.finish_search(old, true);
         }
+        let broadenable = !query::has_operators(&typed);
+        self.start_live(id, typed, sent, broadenable, false, &session);
+        self.publish();
+    }
+
+    /// Put `wire` on the network under `id` and track it until its window closes.
+    fn start_live(
+        &mut self,
+        id: SearchId,
+        typed: String,
+        wire: String,
+        broadenable: bool,
+        wishlist: bool,
+        session: &Arc<dyn Session>,
+    ) {
         let cancel = Arc::new(AtomicBool::new(false));
         let (s2, q2, c2, me, window) = (
             session.clone(),
-            query.clone(),
+            wire.clone(),
             cancel.clone(),
             self.me.clone(),
             self.t.search_window,
@@ -859,20 +929,109 @@ impl Worker {
         let _ = std::thread::Builder::new()
             .name("wholeseek-search".into())
             .spawn(move || {
-                s2.search_blocking(&q2, window, c2);
+                if wishlist {
+                    s2.wishlist_search_blocking(&q2, window, c2);
+                } else {
+                    s2.search_blocking(&q2, window, c2);
+                }
                 let _ = me.send(Msg::Internal(Internal::SearchWindowClosed(id)));
             });
         self.searches.push(LiveSearch {
             id,
-            query,
+            typed,
+            query: wire,
+            broadenable,
             seen: 0,
             delivered: 0,
+            audio: 0,
             users: HashSet::new(),
             ends_at: Instant::now() + self.t.search_window,
             cancel,
-            session,
+            session: session.clone(),
         });
+    }
+
+    /// The window of `id` closed. If it found no audio and may be broadened,
+    /// re-run it once with the broader query under the same id; else finish.
+    fn search_window_closed(&mut self, id: SearchId) {
+        self.poll_search(id);
+        let Some(pos) = self.searches.iter().position(|s| s.id == id) else {
+            return;
+        };
+        let s = &self.searches[pos];
+        let broader = (s.broadenable && s.audio == 0)
+            .then(|| query::broaden_query(&s.query))
+            .flatten()
+            .filter(|b| !self.searches.iter().any(|o| &o.query == b));
+        let Some(broader) = broader else {
+            self.finish_search(id, false);
+            return;
+        };
+        let old = self.searches.remove(pos);
+        old.session.forget_search(&old.query);
+        if let Ok(mut infos) = self.infos.lock()
+            && let Some(info) = infos.get_mut(&id)
+        {
+            info.broadened_to = Some(broader.clone());
+        }
+        let session = old.session.clone();
+        self.start_live(id, old.typed, broader, false, false, &session);
+        if let Some(s) = self.searches.last_mut() {
+            // Counts carry over (normally zero audio, maybe some non-audio).
+            s.delivered = old.delivered;
+            s.users = old.users;
+        }
         self.publish();
+    }
+
+    fn set_info(&self, info: SearchInfo) {
+        if let Ok(mut infos) = self.infos.lock() {
+            infos.insert(info.id, info);
+            while infos.len() > SEARCH_INFO_KEEP {
+                infos.pop_first();
+            }
+        }
+    }
+
+    fn end_info(&self, id: SearchId) {
+        if let Ok(mut infos) = self.infos.lock()
+            && let Some(info) = infos.get_mut(&id)
+        {
+            info.finished = true;
+        }
+    }
+
+    // --------------------------------------------------------------- wishlist
+
+    /// Run the next wish when due (one per interval, round-robin, like
+    /// Nicotine+). Interval: the server's (code 104), at least `wishlist_min`.
+    fn poll_wishlist(&mut self) {
+        let Some(due) = self.wish_due else { return };
+        if Instant::now() < due || self.settings.wishlist.is_empty() {
+            return;
+        }
+        let Some(session) = self.session() else {
+            return;
+        };
+        self.wish_due = Some(Instant::now() + session.wishlist_interval().max(self.t.wishlist_min));
+        let wish = self.settings.wishlist[self.wish_next % self.settings.wishlist.len()].clone();
+        self.wish_next = self.wish_next.wrapping_add(1);
+        let sent = query::normalize_query(&wish);
+        if sent.is_empty() || self.searches.iter().any(|s| s.query == sent) {
+            return; // the same query is already running
+        }
+        let id = SearchId(self.next_id());
+        self.set_info(SearchInfo {
+            id,
+            typed: wish.clone(),
+            sent: sent.clone(),
+            broadened_to: None,
+            wishlist: true,
+            files: 0,
+            users: 0,
+            finished: false,
+        });
+        self.start_live(id, wish, sent, false, true, &session);
     }
 
     fn poll_search(&mut self, id: SearchId) {
@@ -891,12 +1050,19 @@ impl Worker {
         let new = results.get(s.seen..).unwrap_or(&[]);
         s.seen = results.len();
         let mut hits = rank::hits_from_results(new);
+        s.audio += hits.iter().filter(|h| rank::is_audio(&h.file.path)).count();
         rank::rank(&mut hits, audio_only);
         if !hits.is_empty() {
             s.delivered += hits.len();
             s.users.extend(hits.iter().map(|h| h.file.username.clone()));
+            let (files, users) = (s.delivered, s.users.len());
             let ev = CoreEvent::SearchResults { search: id, hits };
             self.emit(ev);
+            if let Ok(mut infos) = self.infos.lock()
+                && let Some(info) = infos.get_mut(&id)
+            {
+                (info.files, info.users) = (files, users);
+            }
         }
     }
 
@@ -917,6 +1083,7 @@ impl Worker {
         } else {
             s.session.forget_search(&s.query);
         }
+        self.end_info(id);
         self.emit(CoreEvent::SearchFinished {
             search: id,
             total_files: s.delivered,
@@ -1065,10 +1232,10 @@ impl Worker {
 
     // --------------------------------------------------------- folder download
 
-    fn download_folder(&mut self, username: String, folder: String) {
+    fn download_folder(&mut self, username: String, folder: String, root: PathBuf) {
         let folder = trim_folder(&folder).to_string();
         if let Some(dirs) = self.cached_listing(&username).cloned()
-            && self.expand_folder(&username, &folder, &dirs, true)
+            && self.expand_folder(&username, &folder, &dirs, true, &root)
         {
             return;
         }
@@ -1083,6 +1250,7 @@ impl Worker {
         self.folders.push(FolderReq {
             username,
             folder,
+            root,
             deadline: Instant::now() + self.t.folder_timeout,
             stage: FolderStage::Contents,
         });
@@ -1098,14 +1266,14 @@ impl Worker {
             };
             if stage == FolderStage::Contents {
                 if let Some(listing) = s.take_folder(&u, &folder) {
-                    self.folders.remove(i);
+                    let root = self.folders.remove(i).root;
                     let dirs = to_browse_dirs(&u, listing);
                     self.emit(CoreEvent::FolderContents {
                         username: u.clone(),
                         folder: folder.clone(),
                         dirs: dirs.clone(),
                     });
-                    self.expand_folder(&u, &folder, &dirs, false);
+                    self.expand_folder(&u, &folder, &dirs, false, &root);
                     continue;
                 }
                 if Instant::now() >= deadline {
@@ -1133,7 +1301,7 @@ impl Worker {
             .partition(|f| f.username == username && f.stage == FolderStage::Browse);
         self.folders = rest;
         for f in ready {
-            if !self.expand_folder(username, &f.folder, dirs, true) {
+            if !self.expand_folder(username, &f.folder, dirs, true, &f.root) {
                 self.error(
                     "download_folder",
                     format!("{} is not in {username}'s shares", f.folder),
@@ -1165,6 +1333,7 @@ impl Worker {
         folder: &str,
         dirs: &[BrowseDir],
         exact_only: bool,
+        root: &Path,
     ) -> bool {
         let matched: Vec<&BrowseDir> = dirs
             .iter()
@@ -1199,7 +1368,7 @@ impl Worker {
         }
         for file in files {
             let id = TransferId(self.next_id());
-            let dir = paths::download_dir_for(&self.settings.download_dir, &file.path);
+            let dir = paths::download_dir_for(root, &file.path);
             self.fetch(id, file, dir, TransferKind::Download);
         }
         true
