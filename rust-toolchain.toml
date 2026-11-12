@@ -1,0 +1,4 @@
+[toolchain]
+# Matches Rune's pinned toolchain (rune @01349db requires it).
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]

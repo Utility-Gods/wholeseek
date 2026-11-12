@@ -1,0 +1,259 @@
+# goalseek-core — library survey & core API (CP0)
+
+Library: `soulseek-rs-lib` @ `434dcc0155ed87203cafcd1cf7b1a1073f88a63d` (lib crate `soulseek_rs`).
+File references are relative to `soulseek-rs-lib/src/` in that revision unless prefixed
+(`soulseek-rs/…` = the reference CLI/TUI binary crate in the same repo).
+Everything below was read from source; **nothing was exercised against the live network** (no
+credentials authorised at CP0).
+
+---
+
+## 1. Survey
+
+### 1.1 Public surface and threading model
+
+- Public modules: `client`, `error`, `message`, `shares`, `types`, `utils`; the actor system, peer
+  plumbing and download store are `pub(crate)` (`lib.rs:9-17`). Re-exports: `Client`,
+  `ClientSettings`, `CancelHandle`, `SearchResult`, `File`, `DownloadStatus`, `UploadInfo`,
+  `UploadStatus`, `SessionLoss`, `SharedDirectory`, `SharedFileEntry`, … (`lib.rs:34-44`).
+- Zero dependencies apart from `libc` on unix (`soulseek-rs-lib/Cargo.toml`). **No async**: plain
+  `std::thread` + `std::sync::mpsc`. Every actor (server connection, each peer) owns an OS thread
+  with a 256 KiB stack (`actor/mod.rs:60-73`); the listener runs on its own thread
+  (`client/connection.rs:137-147`); `connect()` starts an operations-dispatch thread
+  (`client/connection.rs:150-154`).
+- `Client` (`client/mod.rs:656-675`) is not `Clone`. `connect`/`disconnect` take `&mut self`
+  (`client/connection.rs:50,170`); everything else takes `&self` and goes through an
+  `Arc<RwLock<ClientContext>>`. `Client: Send` (asserted by our test
+  `core::tests::library_client_is_send`), so it can live on our worker thread.
+- **Event delivery is mostly polling.** Only per-download status is pushed (an
+  `mpsc::Receiver<DownloadStatus>` per download, `client/downloads.rs:112-182`). Search results,
+  browse listings, folder contents, uploads, session loss and share counts are read by calling
+  accessors (`get_search_results`, `take_browse_result`, `take_folder_contents`, `uploads`,
+  `take_upload_events`, `session_loss`, `shared_counts`). goalseek-core therefore polls on a tick.
+- Logging: a global logger to stderr (ANSI colours), configured by env `LOG_LEVEL`/`RUST_LOG`
+  and `LOG_FILE`; `Client::with_settings` calls `logger::init()` (`client/mod.rs:693`,
+  `utils/logger.rs:41-95`). Default level Warn. Login logs the username only
+  (`client/connection.rs:211`); no password logging found.
+
+### 1.2 Login / session
+
+| Need | API | Ref |
+|---|---|---|
+| Configure | `ClientSettings { username, password, server_address, enable_listen, listen_port, shared_directories, accept_children, version }` | `client/mod.rs:231-282` |
+| Connect | `Client::connect(&mut self) -> Result<()>`: scans shares **synchronously**, binds the listener, spawns server actor | `client/connection.rs:50-157` |
+| Log in | `Client::login(&self) -> Result<bool>`; blocks ≤45 s; `Ok(true)` or `Err(AuthenticationFailed)` / `Err(Timeout)` | `client/connection.rs:210-240`, `actor/server_actor/handlers.rs:481-508` |
+| Session lost? | `Client::session_loss() -> Option<SessionLoss>` (`Displaced` / `Disconnected`) — polled | `client/mod.rs:747-749`, `types.rs:554-560` |
+| Disconnect | `Client::disconnect(&mut self)`, also on `Drop` | `client/connection.rs:170-201`, `client/mod.rs:677-681` |
+| Reconnect | **none** — "Nothing reconnects it, so the session is over" | `actor/server_actor.rs:605-623` |
+| Client version | `ClientVersion { major: 176, minor }`; minor 1 = unidentified; projects should reserve a minor | `types.rs:13-56` |
+
+### 1.3 Network search (+ streaming)
+
+- `Client::search(query, timeout) -> Result<Vec<SearchResult>>` blocks for the whole window
+  (`client/search.rs:249-255`, `287-296`, `collect_for` `382-396`).
+- Results accumulate **keyed by the query string** in `ctx.searches` (`client/search.rs:350-363`),
+  so a non-blocking caller can stream them by polling `get_search_results_count(query)` /
+  `get_search_results(query)` / `search_file_counts()` (`client/search.rs:398-478`). There is no
+  public non-blocking "start search" for normal searches: `send_search` is private; the public
+  non-blocking variants are wishlist / user / room searches (`client/search.rs:270,325,339`). A
+  worker can run `search_with_cancel` on a helper thread while polling results from another — the
+  `Client` methods are `&self` + lock-based, so that is safe (`Client` must be in an `Arc`).
+- Results keep arriving after the window until `forget_search(query)` (`client/search.rs:437-441`).
+- Caps: 500 responses / 10 000 files per search (`types.rs:81-109`).
+- `SearchResult { token, files: Vec<File>, slots: u8, speed: u32, username }`,
+  `File { username, name (full virtual path), size, attribs: HashMap<u32,u32> }` (`types.rs:5-66`).
+  Queue length is not parsed (`types.rs:152-153` reads slots and speed only).
+- Attribute codes: 0 bitrate, 1 duration, 2 VBR, 4 sample rate, 5 bit depth
+  (`message/peer/shared_file_list.rs:19-28`).
+
+### 1.4 Browse user / folder contents
+
+| Need | API | Ref |
+|---|---|---|
+| Browse | `browse_user(username) -> Result<()>`; then poll `take_browse_result(username) -> Option<Vec<SharedDirectory>>` | `client/rooms.rs:237-242`, `287-295` |
+| One folder | `request_folder_contents(username, folder)`; poll `take_folder_contents(username, folder)` | `client/social.rs:207-231` |
+| Shape | `SharedDirectory { name (full virtual path), files: Vec<SharedFileEntry { name (basename), size, attributes: Vec<(u32,u32)> }> }` | `message/peer/shared_file_list.rs:10-36` |
+
+Requests to unconnected peers are queued and the peer's address looked up
+(`client/rooms.rs:249-282`); queued peer messages expire after 1 min (`client/mod.rs:65`). There is
+no failure/timeout signal for a browse that never answers.
+
+### 1.5 Download, progress, `.part`, cancel
+
+- `download(filename, username, size, download_directory) -> Result<(Download, Receiver<DownloadStatus>)>`
+  returns as soon as it is queued (`client/downloads.rs:96-110`, `112-182`). **`download_directory`
+  is per call**, so play→cache and download→downloads is supported per transfer.
+- Speed limit (downloads only, global): `set_download_speed_limit(bps)` (`client/downloads.rs:17-21`).
+- `DownloadStatus = Queued | InProgress{bytes_downloaded,total_bytes,speed_bytes_per_sec} |
+  Paused{..} | Completed | Cancelled | Failed(Option<String>) | TimedOut` (`types.rs:226-257`).
+- Paths: `final = expand_tilde(dir) / basename(remote)`; `part = final + ".part"`
+  (`peer/download_peer.rs:74-125`, `utils/path.rs:7-17`). `part_path_of` exists but is in a
+  `pub(crate)` module (`peer/download_peer.rs:85`, `lib.rs:15`) — we reproduce the rule in
+  `goalseek_core::paths` (unit-tested).
+- Write path: `PartFile::open` creates parent dirs, **resumes an existing smaller `.part`**
+  (appends, requests offset), restarts one ≥ size (`peer/download_peer.rs:137-165`); writes are
+  unbuffered `File::write_all` (`:169-178`), so bytes are visible to another reader immediately.
+- Progress: one `InProgress` right after the `.part` is opened, before payload
+  (`start_transfer`, `peer/download_peer.rs:306-318`), then every 128 KiB
+  (`PROGRESS_INTERVAL_BYTES`, `:24`, loop `:403-423`); reads are 64 KiB (`:18`). Stall deadline 30 s
+  (`:20`, `:429-436`).
+- Completion: `.part` renamed to final under the store lock, then `Completed` sent — **with no
+  path** (`peer/download_peer.rs:487-530`, `191-202`). Failure → `Failed(Some(reason))`, `.part`
+  kept for resume (`:189-202`, `:600-609`).
+- Cancel: `cancel_download(username, filename) -> bool` marks it cancelled and **deletes the
+  `.part`** (`client/downloads.rs:45-61`); keyed by (user, filename), not token. Also
+  `pause_download`/`resume_download`/`remove_download`/`remove_queued_download`
+  (`client/downloads.rs:23-94`). Snapshot: `get_all_downloads()` (`:9-15`).
+- Remote queue place: `request_place_in_queue` → `Download.queue_position` (`client/social.rs:243-250`).
+
+**Play-while-downloading verdict: feasible.** The `.part` path is deterministic before the call,
+exists by the first `InProgress` event, grows unbuffered in ≥128 KiB steps, and on Linux an open fd
+survives the rename to the final name.
+
+### 1.6 Shares
+
+| Need | API | Ref |
+|---|---|---|
+| Set before connect | `ClientSettings.shared_directories` (scanned in `connect`) | `client/mod.rs:240`, `client/connection.rs:70-93` |
+| Set / rescan at runtime | `set_shared_directories(dirs) -> Result<()>`: rescans **synchronously**, swaps index, announces counts; `Err(NotConnected)` if no server (index still swapped) | `client/mod.rs:848-878` |
+| Counts | `shared_counts() -> (folders, files)` | `client/mod.rs:778-782` |
+| Listing as peers see it | `shared_listing()` | `client/mod.rs:769-774` |
+| Index | `Shares::scan_many` (skips unreadable roots, de-dups root names, reads audio attrs) | `shares/mod.rs:61-91`, `shares/audio.rs:24` |
+
+No separate rescan call: rescan = `set_shared_directories(same dirs)`.
+
+### 1.7 Uploads
+
+| Need | API | Ref |
+|---|---|---|
+| Queue | handled by the library (privileged-first, then FIFO) | `client/upload_queue.rs:57-125` |
+| Slots | `set_upload_slots(n)` (min 1, default 10) | `client/uploads.rs:60-64`, `client/mod.rs:57` |
+| Snapshot | `uploads() -> Vec<UploadInfo>`; `take_upload_events()` for transitions between polls | `client/mod.rs:788-819`, `client/uploads.rs:51-56` |
+| Cancel | `cancel_upload(username, filename) -> bool` | `client/mod.rs:824-840` |
+| Speed limit | **none** | — |
+
+`UploadInfo { username, filename, size, bytes_sent, status, speed_bytes_per_sec }`,
+`UploadStatus = Queued(place) | InProgress | Completed | Cancelled | Failed(String)` (`types.rs:523-545`).
+
+### 1.8 Listen port / UPnP
+
+- `ClientSettings.listen_port` (default 2234), `enable_listen` (default true)
+  (`client/mod.rs:37,236-237`). Bound in `connect`; if taken, **silently falls back to an
+  ephemeral port** (`peer/listen.rs:419-430`); `listen_port()` reports the real one
+  (`client/mod.rs:738-740`). Changing the port needs disconnect + new `Client`.
+- **UPnP / NAT-PMP is not in the library.** It lives in the binary crate
+  (`soulseek-rs/src/port_mapping/mod.rs:1-80`: `PortMapper::spawn(port)`, UPnP via `igd-next`,
+  hand-rolled std-only NAT-PMP in `soulseek-rs/src/port_mapping/nat_pmp.rs`), with `igd-next`
+  as a dependency of the binary only (`soulseek-rs/Cargo.toml:38`).
+
+---
+
+## 2. Gaps
+
+| # | Gap | Impact | Proposed handling |
+|---|---|---|---|
+| G1 | No upload speed limit (only `set_download_speed_limit`). | Settings "speed limit" (MVP) can't be honoured. | **Decided (TL): deferred, out of MVP.** Upload slot cap only; the library is not patched. `Settings` has no upload-limit field. |
+| G2 | No UPnP/NAT-PMP in the lib; MVP doc credits the lib with it. | Firewalled users unreachable without manual forwarding. | **Decided (TL): goalseek-core owns port mapping — CP1 item.** Port `soulseek-rs/src/port_mapping/{mod,nat_pmp}.rs` (MIT) into goalseek-core, keeping the soulseek-rs copyright/MIT attribution notice in the ported file; UPnP via `igd-next`, NAT-PMP std-only. See §3.1. |
+| G3 | Events are polled, not pushed (except per-download status). | Need a worker with a tick (~150 ms). | `Core` worker polls; emits deltas. |
+| G4 | No public non-blocking network search; results keyed by query string (same query twice shares/replaces one entry). | Streaming needs a helper thread; duplicate queries collide. | Run `search_with_cancel` on a helper thread with `Arc<Client>`, poll `get_search_results` for deltas; one live search per query string in the core; `forget_search` on cancel/close. |
+| G5 | `.part`/final path not reported; `Completed` carries no path. Same basename into the same dir collides (shared `.part`, resume across unrelated files, rename overwrites). | Must derive paths ourselves; must avoid collisions. | `paths::part_path/final_path` reproduce the rule; per-transfer cache dirs `cache/t<id>/`; downloads into `downloads/<folder>/` with a core-side collision check. |
+| G6 | No auto-reconnect; `Displaced` vs `Disconnected` only by polling `session_loss()`. | MVP needs auto-reconnect. | Worker polls; on `Disconnected` drop the `Client` and rebuild with backoff; on `Displaced` stop. |
+| G7 | Login rejection reason (bad password vs other) not surfaced: only `AuthenticationFailed`. | Generic error text in onboarding. | Accept; message "login rejected". |
+| G8 | `DownloadStatus::TimedOut` is never emitted; a remote-queued download can sit in `Queued` forever; browse has no timeout/failure. | ▶ could hang. | Core timeouts: play fails if no `InProgress` within N s (UI may pick another source); browse fails after N s. |
+| G9 | Default `ClientVersion` minor 1 = "unidentified". | Etiquette only. | Request a minor upstream (issue #12) before release. |
+| G10 | `connect` and `set_shared_directories` scan shares synchronously on the caller's thread. | Large shares block. | Always called on the core worker, never the UI thread. |
+| G11 | `cancel_download` deletes the `.part` and is keyed by (user, filename). | Cancelling a play and a download of the same file from the same user would hit both. | Core refuses a second concurrent transfer of the same (user, path); ↓ of an in-flight play promotes it (moves on completion) instead. |
+| G12 | Listener silently falls back to an ephemeral port if the configured one is busy. | UPnP/forwarding mismatch. | Report the bound port in `Connected { listen_port }`; settings shows it. |
+| G13 | Library logger writes ANSI to stderr by default. | Noise in a GUI. | App sets `LOG_FILE` (e.g. `~/.cache/goalseek/slsk.log`) or `logger::set_log_level`. |
+| G14 | Folder contents are keyed by the folder string the peer echoes. | Lookup could miss if a peer echoes a different spelling. | Fall back to the peer's full browse listing. |
+
+---
+
+## 3. Proposed goalseek-core interface (skeleton compiled in `crates/goalseek-core`)
+
+Design: one `Core` handle, non-blocking commands, one ordered event channel. A single worker
+thread owns the `soulseek_rs::Client` (in an `Arc` so a search helper thread can poll), receives
+`Command`s, polls the library every `POLL_TICK` (150 ms), and emits `CoreEvent`s.
+
+```rust
+// src/core.rs
+impl Core {
+    pub fn start(settings: Settings) -> io::Result<(Core, Receiver<CoreEvent>)>;
+    pub fn login(&self, Credentials);            // auto-reconnect until logout
+    pub fn logout(&self);
+    pub fn search(&self, query: &str) -> SearchId;
+    pub fn cancel_search(&self, SearchId);
+    pub fn browse(&self, username: &str);
+    pub fn play_fetch(&self, &RemoteFile) -> PlayTicket { id, part_path, final_path }  // cache only
+    pub fn download(&self, &RemoteFile) -> TransferId;     // downloads/<folder>/; reuses cache
+    pub fn download_folder(&self, username: &str, folder: &str);
+    pub fn cancel(&self, TransferId);
+    pub fn retry(&self, TransferId);
+    pub fn set_shares(&mut self, Vec<PathBuf>);
+    pub fn rescan_shares(&self);
+    pub fn apply_settings(&mut self, Settings);  // port change → reconnect
+}
+
+// src/event.rs
+pub enum CoreEvent {
+    Connected { username, listen_port: Option<u16> },
+    Disconnected { reason: DisconnectReason /* LoginRejected|Displaced|Network(_)|User */, will_retry },
+    SearchResults { search, hits: Vec<SearchHit> },   // deltas, filtered + FLAC-first ranked
+    SearchFinished { search, total_files },
+    BrowseResult { username, dirs: Vec<BrowseDir> },
+    FolderContents { username, folder, dirs },
+    BrowseFailed { username, reason },
+    TransferQueued { id, kind: Play|Download, file, part_path },
+    TransferRemoteQueued { id, place: Option<u32> },
+    TransferProgress { id, bytes, total, speed, part_path },
+    TransferDone { id, path },
+    TransferFailed { id, reason },
+    TransferCancelled { id },
+    ShareCounts { folders, files },
+    Uploads(Vec<UploadRow>),
+    Error { context, message },
+}
+```
+
+Data (`src/model.rs`): `RemoteFile { username, path, size, attrs: AudioAttrs }`,
+`SearchHit { file, free_slot, speed }`, `BrowseDir { path, files }`, `UploadRow`, `Settings`
+(download dir, cache dir + cap, share dirs, listen port, upload slots, port_mapping (G2);
+no upload speed limit — deferred, G1), `Credentials` (Debug-redacted). No `soulseek_rs` types leak into the UI.
+
+Helpers (real, tested): `paths` (`.part`/final/cache-dir/download-dir rules), `rank`
+(audio filter, FLAC → MP3 → other audio, then free slot, speed; conversion from
+`soulseek_rs::SearchResult`).
+
+Play / download rules:
+- ▶ `play_fetch` → `download(…, cache/t<id>/)`; path known immediately; player opens the `.part`
+  after the first `TransferProgress`. Never writes to downloads.
+- ↓ `download` → if the same (user, path) is complete in cache, `fs::rename` (copy+delete across
+  filesystems) into `downloads/<folder>/`; if a play of it is in flight, mark it "keep" and move on
+  `TransferDone`; else fetch into `downloads/<folder>/`.
+- Cache cap: on each `TransferDone` of a play, evict oldest `cache/t*/` dirs that are not playing.
+
+### 3.1 Port mapping (CP1 item, G2)
+
+- New module `goalseek-core/src/port_mapping/` ported from `soulseek-rs/src/port_mapping/mod.rs`
+  and `nat_pmp.rs` @ 434dcc0. Each ported file keeps a header with the original copyright
+  (Michel de Graaf, soulseek-rs, MIT) and the source path/revision.
+- Shape kept from upstream: `PortMapper::spawn(port) -> PortMapper` (background thread, renews at
+  half the lease, removes the mapping on `Drop`, never blocks shutdown >1 s). UPnP-IGD first via
+  `igd-next`, then std-only NAT-PMP. Replace upstream's use of `soulseek_rs::utils::logger` levels
+  with our own logging as needed.
+- The worker starts it after `connect()` with the **bound** port (`Client::listen_port()`, G12)
+  when `Settings.port_mapping` is true, and restarts it on reconnect/port change. Outcome surfaces
+  as a `CoreEvent` (e.g. `PortMapping { external: Option<SocketAddr>, method }`) for settings.
+- Needs `igd-next` added to root `[workspace.dependencies]` by the TL at CP1.
+
+**CP0 status:** types, handle, id allocation, path rules, ranking and the worker/channel plumbing are
+implemented and tested. Worker protocol arms are stubs that emit
+`CoreEvent::Error { context, message: "not implemented yet (CP1)" }` (no `todo!()` panics).
+
+## 4. Smoke example
+
+`GOALSEEK_USER=… GOALSEEK_PASS=… cargo run -p goalseek-core --example smoke -- "<query>"`
+(`crates/goalseek-core/examples/smoke.rs`) uses `soulseek_rs::Client` directly: connect, login,
+`search` (window `GOALSEEK_SEARCH_SECS`, default 12), `rank::hits_from_results` + `rank::rank`
+(audio-only, FLAC first), prints the top 10, `forget_search`, disconnect. Compiled, **not run**.
+Live test: `crates/goalseek-core/tests/live.rs`, `#[ignore]`d.
