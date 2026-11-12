@@ -94,15 +94,6 @@ pub fn speaker(size: f32, c: Color) -> El {
     )
 }
 
-pub fn back(size: f32, c: Color) -> El {
-    icon(
-        size,
-        Shape::new()
-            .line([1.5, 5.0], [8.5, 5.0], 1.2, LineCap::Round, c)
-            .stroke(vec![[4.5, 2.0], [1.5, 5.0], [4.5, 8.0]], 1.2, c),
-    )
-}
-
 pub fn close(size: f32, c: Color) -> El {
     icon(
         size,
@@ -154,5 +145,96 @@ pub fn folder(size: f32, c: Color) -> El {
             1.0,
             c,
         ),
+    )
+}
+
+pub fn plus(size: f32, c: Color) -> El {
+    icon(
+        size,
+        Shape::new()
+            .line([5.0, 1.5], [5.0, 8.5], 1.2, LineCap::Round, c)
+            .line([1.5, 5.0], [8.5, 5.0], 1.2, LineCap::Round, c),
+    )
+}
+
+pub fn search(size: f32, c: Color) -> El {
+    use std::f32::consts::TAU;
+    icon(
+        size,
+        Shape::new()
+            .stroke(ring(4.2, 4.2, 3.0, 0.0, TAU, 24), 1.1, c)
+            .line([6.4, 6.4], [9.0, 9.0], 1.2, LineCap::Round, c),
+    )
+}
+
+pub fn user(size: f32, c: Color) -> El {
+    use std::f32::consts::{PI, TAU};
+    icon(
+        size,
+        Shape::new()
+            .stroke(ring(5.0, 3.2, 2.0, 0.0, TAU, 20), 1.1, c)
+            .stroke(ring(5.0, 10.2, 4.0, PI * 1.12, PI * 1.88, 16), 1.1, c),
+    )
+}
+
+/// ⋯
+pub fn more(size: f32, c: Color) -> El {
+    let dot = |x: f32| ring(x, 5.0, 0.8, 0.0, std::f32::consts::TAU, 10);
+    icon(
+        size,
+        Shape::new()
+            .fill(dot(2.0), c)
+            .fill(dot(5.0), c)
+            .fill(dot(8.0), c),
+    )
+}
+
+/// ⏭ (`back` false) / ⏮ (`back` true).
+pub fn skip(size: f32, back: bool, c: Color) -> El {
+    let (tri, bar) = if back {
+        (
+            vec![[8.0, 1.5], [2.8, 5.0], [8.0, 8.5]],
+            [[1.8, 1.5], [1.8, 8.5]],
+        )
+    } else {
+        (
+            vec![[2.0, 1.5], [7.2, 5.0], [2.0, 8.5]],
+            [[8.2, 1.5], [8.2, 8.5]],
+        )
+    };
+    icon(
+        size,
+        Shape::new()
+            .fill(tri, c)
+            .line(bar[0], bar[1], 1.3, LineCap::Butt, c),
+    )
+}
+
+/// An external-link box: "open".
+pub fn open(size: f32, c: Color) -> El {
+    icon(
+        size,
+        Shape::new()
+            .stroke(
+                vec![[4.5, 1.5], [1.5, 1.5], [1.5, 8.5], [8.5, 8.5], [8.5, 5.5]],
+                1.0,
+                c,
+            )
+            .line([5.0, 5.0], [8.8, 1.2], 1.0, LineCap::Round, c)
+            .stroke(vec![[6.0, 1.2], [8.8, 1.2], [8.8, 4.0]], 1.0, c),
+    )
+}
+
+/// Two overlapping sheets: "copy".
+pub fn copy(size: f32, c: Color) -> El {
+    icon(
+        size,
+        Shape::new()
+            .stroke(
+                vec![[3.5, 3.5], [8.5, 3.5], [8.5, 8.8], [3.5, 8.8], [3.5, 3.5]],
+                1.0,
+                c,
+            )
+            .stroke(vec![[1.5, 6.5], [1.5, 1.2], [6.5, 1.2]], 1.0, c),
     )
 }

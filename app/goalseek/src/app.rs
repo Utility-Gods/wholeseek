@@ -2,28 +2,41 @@
 //! Views (`view/`) only read it and attach handlers that call the methods here.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc::Receiver;
 
 use goalseek_audio::{PlayState, PlayerSnapshot, SeekError};
 use goalseek_core::{
-    BrowseDir, CoreEvent, Credentials, DisconnectReason, PlayTicket, PortMapOutcome, RemoteFile,
-    SearchHit, SearchId, Settings, TransferId, TransferKind, UploadRow, rank,
+    CoreEvent, Credentials, DisconnectReason, PlayTicket, PortMapOutcome, RemoteFile, Settings,
+    TransferId, TransferKind, UploadRow, rank,
 };
-use rune::TextEdit;
+use rune::{TextEdit, Tx};
 
+use crate::actions::DrawerUi;
 use crate::backend::{Backend, RealBackend};
 use crate::demo::{DemoBackend, FakePlayer, World};
+use crate::desktop::{DemoDesktop, Desktop, DesktopCall, RealDesktop};
+use crate::menu::Menu;
 use crate::playback::{Playback, RealPlayer};
 use crate::profile::Profiles;
+use crate::queue::PlayQueue;
 use crate::store::{MemoryStore, RealStore, Store, StoreNote};
+use crate::tabs::{BrowseView, SearchTab, SearchView, Tab, TabId, TabKind, UserTab};
 
 /// Results drawn at most; the rest are counted ("showing 300 of 4 120").
 pub const MAX_ROWS: usize = 300;
 
+/// Seconds between equalizer frames while a track plays.
+pub const EQ_FRAME: f64 = 1.0 / 12.0;
+
+/// How long settings' "Saved" tick shows.
+pub const SAVED_FOR: f64 = 1.5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
+    /// Reading the saved account (off the UI thread); the window is already up.
+    Starting,
     Onboarding,
     Main,
 }
@@ -58,27 +71,20 @@ pub struct Onboarding {
 }
 
 pub struct SettingsForm {
+    /// Typed fallbacks, used only when no folder dialog can show (`manual`).
     pub download_dir: TextEdit,
     pub listen_port: TextEdit,
-    pub upload_slots: TextEdit,
     pub share_input: TextEdit,
-    pub shares: Vec<PathBuf>,
-    pub message: Option<(bool, String)>,
-}
-
-pub struct SearchView {
-    pub id: SearchId,
-    pub query: String,
-    pub hits: Vec<SearchHit>,
-    pub finished: bool,
-}
-
-pub struct BrowseView {
-    pub username: String,
-    pub dirs: Option<Vec<BrowseDir>>,
-    pub error: Option<String>,
-    pub selected: Option<String>,
-    pub expanded: BTreeSet<String>,
+    /// Why folder dialogs are unavailable (then paths are typed).
+    pub manual: Option<String>,
+    pub path_error: Option<String>,
+    /// Clock time of the last applied change, for the "Saved" tick.
+    pub saved_at: Option<f64>,
+    /// A new port typed, waiting for "Reconnect".
+    pub port_confirm: Option<u16>,
+    pub port_invalid: bool,
+    /// The port field is open (after "Change").
+    pub port_editing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,6 +134,8 @@ pub struct NowPlaying {
     pub keep: bool,
     pub snapshot: Option<PlayerSnapshot>,
     pub failed: Option<String>,
+    /// Which source this is, from 1 (the one clicked); >1 shows "Trying another source…".
+    pub attempt: usize,
 }
 
 pub struct App {
@@ -139,9 +147,11 @@ pub struct App {
     pub conn: Conn,
     pub onboarding: Onboarding,
     pub settings_form: SettingsForm,
-    pub search_edit: TextEdit,
-    pub search: Option<SearchView>,
-    pub browse: Option<BrowseView>,
+    /// Open tabs, in strip order; never empty.
+    pub tabs: Vec<Tab>,
+    /// Index of the shown tab.
+    pub active: usize,
+    next_tab: TabId,
     pub transfers: Vec<Transfer>,
     pub uploads: Vec<UploadRow>,
     pub share_counts: Option<(u32, u32)>,
@@ -152,16 +162,46 @@ pub struct App {
     pub notice: Option<(String, f64)>,
     /// Last core error, shown under the search bar until dismissed.
     pub error: Option<String>,
-    /// Router port-mapping result, as settings shows it.
-    pub port_mapping: Option<String>,
+    /// Router port mapping: (port, mapped).
+    pub port_mapping: Option<(u16, bool)>,
+    /// Open files and folders, measure the disk (never launches anything in demo/tests).
+    pub desktop: Box<dyn Desktop>,
+    /// The demo desktop's record of calls (empty with the real one).
+    pub desktop_log: Rc<RefCell<Vec<DesktopCall>>>,
+    pub menu: Option<Menu>,
+    pub drawer: DrawerUi,
+    /// What plays in order; the player strip shows its current item.
+    pub queue: Option<PlayQueue>,
+    /// Scroll the highlighted file into view once its folder is listed.
+    pub reveal: bool,
+    /// The core's polled snapshot, refreshed each frame.
+    pub status: goalseek_core::CoreStatus,
     pub store: Box<dyn Store>,
     /// False when the system keyring can't hold the password: sign-in is per session.
     pub keyring_available: bool,
     /// Credentials typed in onboarding, saved once the server accepts them.
     pending_credentials: Option<Credentials>,
-    pub audio_only: bool,
     /// Peer profiles by username (one per open user view).
     pub profiles: Profiles,
+    /// The account signed in with this run, for Reconnect (memory only).
+    credentials: Option<Credentials>,
+    /// Waiting for the startup load; `Screen::Starting` until it lands.
+    pub boot: Option<Boot>,
+    /// The window's waker (from setup), handed to a backend started later.
+    waker: Option<rune::Waker>,
+}
+
+/// What the startup load found, and how to start the session with it.
+pub struct Booted {
+    pub settings: Settings,
+    pub startup: Startup,
+}
+
+/// Startup still reading the saved account off the UI thread (real mode).
+pub struct Boot {
+    pub rx: Receiver<Booted>,
+    /// Builds the session backend from the loaded settings.
+    pub make: fn(Settings) -> Box<dyn Backend>,
 }
 
 /// What `config::load()` found at startup (real mode).
@@ -182,6 +222,12 @@ impl App {
         startup: Startup,
         demo: bool,
     ) -> Self {
+        let desktop_log = Rc::new(RefCell::new(Vec::new()));
+        let desktop: Box<dyn Desktop> = if demo {
+            Box::new(DemoDesktop::new(desktop_log.clone()))
+        } else {
+            Box::new(RealDesktop)
+        };
         let settings = backend.settings().clone();
         let mut app = Self {
             onboarding: Onboarding {
@@ -199,9 +245,9 @@ impl App {
             now: 0.0,
             screen: Screen::Onboarding,
             conn: Conn::Offline,
-            search_edit: edit(""),
-            search: None,
-            browse: None,
+            tabs: Vec::new(),
+            active: 0,
+            next_tab: 1,
             transfers: Vec::new(),
             uploads: Vec::new(),
             share_counts: None,
@@ -211,21 +257,95 @@ impl App {
             notice: None,
             error: None,
             port_mapping: None,
+            desktop,
+            desktop_log,
+            menu: None,
+            drawer: DrawerUi::default(),
+            queue: None,
+            reveal: false,
+            status: goalseek_core::CoreStatus::default(),
             store,
             keyring_available: startup.keyring_available,
             pending_credentials: None,
-            audio_only: true,
             profiles: Profiles::default(),
+            credentials: None,
+            boot: None,
+            waker: None,
         };
-        // A remembered account skips onboarding and signs straight in.
-        if let Some(c) = startup.credentials {
-            app.onboarding.username.replace_text(c.username.clone());
-            app.onboarding.password.replace_text(c.password.clone());
-            app.screen = Screen::Main;
-            app.conn = Conn::Connecting;
-            app.backend.login(c);
-        }
+        app.new_search_tab();
+        app.begin(startup);
         app
+    }
+
+    /// A remembered account skips onboarding and signs straight in.
+    fn begin(&mut self, startup: Startup) {
+        self.keyring_available = startup.keyring_available;
+        self.screen = Screen::Onboarding;
+        if let Some(c) = startup.credentials {
+            self.onboarding.username.replace_text(c.username.clone());
+            self.onboarding.password.replace_text(c.password.clone());
+            self.screen = Screen::Main;
+            self.conn = Conn::Connecting;
+            self.credentials = Some(c.clone());
+            self.backend.login(c);
+        }
+    }
+
+    /// The window is up before the saved account is read: `Screen::Starting` ("Signing
+    /// in…") until `boot` delivers, then onboarding or the signed-in main view.
+    pub fn booting(
+        player: Box<dyn Playback>,
+        store: Box<dyn Store>,
+        boot: Boot,
+        demo: bool,
+    ) -> Self {
+        let mut app = Self::with(
+            Box::new(crate::backend::IdleBackend::default()),
+            player,
+            store,
+            Startup {
+                credentials: None,
+                keyring_available: true,
+            },
+            demo,
+        );
+        app.screen = Screen::Starting;
+        app.boot = Some(boot);
+        app
+    }
+
+    pub fn set_waker(&mut self, wake: rune::Waker) {
+        self.store.set_waker(wake.clone());
+        self.profiles.set_waker(wake.clone());
+        self.backend.set_waker(wake.clone());
+        self.player.set_waker(wake.clone());
+        self.waker = Some(wake);
+    }
+
+    /// The startup load landed: start the session backend with its settings and begin.
+    fn finish_boot(&mut self, booted: Booted) {
+        let Some(boot) = self.boot.take() else { return };
+        let mut backend = (boot.make)(booted.settings);
+        if let Some(w) = &self.waker {
+            backend.set_waker(w.clone());
+        }
+        let settings = backend.settings().clone();
+        self.backend = backend;
+        self.onboarding.shares.clone_from(&settings.share_dirs);
+        self.settings_form = SettingsForm::from_settings(&settings);
+        self.begin(booted.startup);
+    }
+
+    /// Signed in elsewhere (or dropped for good): sign in again with this run's account.
+    /// Never automatic — the other client would be pushed off in turn.
+    pub fn reconnect(&mut self) {
+        match self.credentials.clone() {
+            Some(c) => {
+                self.conn = Conn::Connecting;
+                self.backend.login(c);
+            }
+            None => self.screen = Screen::Onboarding,
+        }
     }
 
     /// Fake session and player on the frame clock.
@@ -248,19 +368,27 @@ impl App {
         )
     }
 
-    /// The real core and the system audio device.
-    pub fn real(settings: Settings, startup: Startup) -> Self {
-        let backend = RealBackend::start(settings).unwrap_or_else(|e| {
-            eprintln!("goalseek: could not start the core: {e}");
-            std::process::exit(1);
-        });
-        Self::with(
-            Box::new(backend),
+    /// The real core and the system audio device. The window shows at once; the saved
+    /// settings and account (config file + keyring, which can take seconds) load on a
+    /// background thread started in `setup`.
+    pub fn real() -> (Self, std::sync::mpsc::Sender<Booted>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let boot = Boot {
+            rx,
+            make: |settings| {
+                Box::new(RealBackend::start(settings).unwrap_or_else(|e| {
+                    eprintln!("goalseek: could not start the core: {e}");
+                    std::process::exit(1);
+                }))
+            },
+        };
+        let app = Self::booting(
             Box::new(RealPlayer::new()),
             Box::new(RealStore::new()),
-            startup,
+            boot,
             false,
-        )
+        );
+        (app, tx)
     }
 
     // ---- frame tick ----------------------------------------------------------------------
@@ -269,9 +397,15 @@ impl App {
     /// Also returns how long until the next tick is wanted.
     pub fn tick(&mut self, now: f64) -> (bool, Option<f64>) {
         self.now = now;
+        let booted = self.boot.as_ref().and_then(|b| b.rx.try_recv().ok());
+        if let Some(b) = booted {
+            self.finish_boot(b);
+            return (true, Some(0.0));
+        }
         let events = self.backend.drain(now);
         let notes = self.store.drain();
         let mut changed = !events.is_empty() || !notes.is_empty();
+        changed |= self.profiles.settle();
         for e in events {
             self.apply(e);
         }
@@ -282,7 +416,21 @@ impl App {
             }
         }
         self.player.tick(now);
+        let player_events = self.player.events();
+        changed |= !player_events.is_empty();
+        for e in player_events {
+            self.apply_player(e);
+        }
         let mut wake = self.backend.next_tick();
+        let status = self.backend.status();
+        if status != self.status {
+            self.status = status;
+            changed = true;
+        }
+        if self.status.reconnect.is_some() {
+            // "Reconnecting in 5 s" counts down.
+            wake = Some(wake.map_or(0.5, |w: f64| w.min(0.5)));
+        }
         if let Some(p) = &mut self.playing
             && p.opened
         {
@@ -293,7 +441,19 @@ impl App {
                 changed = true;
             }
             if running {
-                wake = Some(wake.map_or(0.25, |w: f64| w.min(0.25)));
+                // The playing row's equalizer moves with the clock: ~12 frames a second.
+                wake = Some(wake.map_or(EQ_FRAME, |w: f64| w.min(EQ_FRAME)));
+                changed = true;
+            }
+        }
+        if let Some(at) = self.settings_form.saved_at {
+            let until = at + SAVED_FOR;
+            if now >= until {
+                self.settings_form.saved_at = None;
+                changed = true;
+            } else {
+                let d = until - now;
+                wake = Some(wake.map_or(d, |w| w.min(d)));
             }
         }
         if let Some((_, until)) = &self.notice {
@@ -347,19 +507,18 @@ impl App {
                 }
             }
             CoreEvent::SearchResults { search, hits } => {
-                let audio_only = self.audio_only;
-                if let Some(s) = self.search.as_mut().filter(|s| s.id == search) {
+                if let Some(s) = self.search_by_id(search) {
                     s.hits.extend(hits);
-                    rank::rank(&mut s.hits, audio_only);
+                    rank::rank(&mut s.hits, true);
                 }
             }
             CoreEvent::SearchFinished { search, .. } => {
-                if let Some(s) = self.search.as_mut().filter(|s| s.id == search) {
+                if let Some(s) = self.search_by_id(search) {
                     s.finished = true;
                 }
             }
             CoreEvent::BrowseResult { username, dirs } => {
-                if let Some(b) = self.browse.as_mut().filter(|b| b.username == username) {
+                if let Some(b) = self.browse_of(&username) {
                     b.dirs = Some(dirs);
                     b.error = None;
                     let first = b.selected.clone().or_else(|| {
@@ -374,7 +533,7 @@ impl App {
                 }
             }
             CoreEvent::FolderContents { username, dirs, .. } => {
-                if let Some(b) = self.browse.as_mut().filter(|b| b.username == username) {
+                if let Some(b) = self.browse_of(&username) {
                     let have = b.dirs.get_or_insert_with(Vec::new);
                     for d in dirs {
                         match have.iter_mut().find(|h| h.path == d.path) {
@@ -391,7 +550,7 @@ impl App {
                 self.profiles.failed(&username, reason);
             }
             CoreEvent::BrowseFailed { username, reason } => {
-                if let Some(b) = self.browse.as_mut().filter(|b| b.username == username) {
+                if let Some(b) = self.browse_of(&username) {
                     b.error = Some(reason);
                 }
             }
@@ -425,14 +584,7 @@ impl App {
                     t.state = TState::Active;
                     t.part_path.clone_from(&part_path);
                 }
-                if let Some(p) = &mut self.playing
-                    && p.ticket.id == id
-                    && !p.opened
-                {
-                    p.opened = true;
-                    self.player.play(&part_path, total);
-                    self.player.set_volume(self.volume);
-                }
+                self.queue_progress(id, &part_path, total);
             }
             CoreEvent::TransferDone { id, path } => {
                 if let Some(t) = self.transfer_mut(id) {
@@ -444,7 +596,10 @@ impl App {
                 if let Some(t) = self.transfer_mut(id) {
                     t.state = TState::Failed(reason.clone());
                 }
-                if let Some(p) = self.playing.as_mut().filter(|p| p.ticket.id == id) {
+                // ▶ never started (stalled, queued, refused): other sources, then skip.
+                if !self.queue_failed(id, &reason)
+                    && let Some(p) = self.playing.as_mut().filter(|p| p.ticket.id == id)
+                {
                     p.failed = Some(reason);
                 }
             }
@@ -456,21 +611,11 @@ impl App {
             CoreEvent::ShareCounts { folders, files } => self.share_counts = Some((folders, files)),
             CoreEvent::Uploads(rows) => self.uploads = rows,
             CoreEvent::PortMapping { port, outcome } => {
-                self.port_mapping = Some(match outcome {
-                    PortMapOutcome::Mapped { method, external } => {
-                        let via = match method.as_str() {
-                            "natpmp" => "NAT-PMP".to_string(),
-                            "upnp" => "UPnP".to_string(),
-                            m => m.to_string(),
-                        };
-                        let ext = external.map(|e| format!(" ({e})")).unwrap_or_default();
-                        format!("Port {port} mapped via {via}{ext}")
-                    }
-                    PortMapOutcome::Unavailable(advice) => {
-                        format!("Port {port} not mapped — forward it manually. {advice}")
-                    }
-                });
+                let mapped = matches!(outcome, PortMapOutcome::Mapped { .. });
+                self.port_mapping = Some((port, mapped));
             }
+            // Settings shows the port in effect; no banner for a busy port.
+            CoreEvent::Error { context, .. } if context == "listen_port" => {}
             CoreEvent::Error { context, message } => {
                 let text = format!("{context}: {message}");
                 if self.onboarding.connecting && context == "login" {
@@ -561,9 +706,9 @@ impl App {
                 self.onboarding.connecting = true;
                 self.conn = Conn::Connecting;
                 let shares = self.onboarding.shares.clone();
-                self.settings_form.shares.clone_from(&shares);
                 self.backend.set_shares(shares);
                 self.pending_credentials = Some(credentials.clone());
+                self.credentials = Some(credentials.clone());
                 self.backend.login(credentials);
             }
             Err(e) => self.onboarding.error = Some(e),
@@ -587,54 +732,191 @@ impl App {
 
     // ---- search & browse -----------------------------------------------------------------
 
+    /// Run the query typed in the shown search tab (replacing its previous search).
     pub fn submit_search(&mut self) {
-        let query = self.search_edit.text.trim().to_string();
+        let Some(tab) = self.tabs.get_mut(self.active).and_then(Tab::search_mut) else {
+            return;
+        };
+        let query = tab.edit.text.trim().to_string();
         if query.is_empty() {
             return;
         }
-        if let Some(old) = self.search.take()
+        let old = tab.search.take();
+        if let Some(old) = old
             && !old.finished
         {
             self.backend.cancel_search(old.id);
         }
         let id = self.backend.search(&query);
-        self.search = Some(SearchView {
-            id,
-            query,
-            hits: Vec::new(),
-            finished: false,
-        });
-        self.browse = None;
+        if let Some(tab) = self.tabs.get_mut(self.active).and_then(Tab::search_mut) {
+            tab.search = Some(SearchView {
+                id,
+                query,
+                hits: Vec::new(),
+                finished: false,
+            });
+        }
+        if let Some(t) = self.tabs.get(self.active) {
+            t.scroll.set(0.0);
+        }
         self.error = None;
     }
 
+    // ---- tabs ----------------------------------------------------------------------------
+
+    fn push_tab(&mut self, kind: TabKind) {
+        let id = self.next_tab;
+        self.next_tab += 1;
+        let at = if self.tabs.is_empty() {
+            0
+        } else {
+            self.active + 1
+        };
+        self.tabs.insert(at, Tab::new(id, kind));
+        self.active = at;
+    }
+
+    /// ＋ / Ctrl+T: an empty search tab, shown.
+    pub fn new_search_tab(&mut self) {
+        self.push_tab(TabKind::Search(SearchTab {
+            edit: edit(""),
+            search: None,
+            filters: crate::tabs::Filters::default(),
+        }));
+    }
+
+    /// Show the user's tab, opening it (browse + profile requests) if there is none.
     pub fn open_user(&mut self, username: &str) {
-        if let Some(old) = self.browse.as_ref().map(|b| b.username.clone()) {
-            self.profiles.forget(&old);
+        if let Some(i) = self
+            .tabs
+            .iter()
+            .position(|t| t.username() == Some(username))
+        {
+            self.active = i;
+            return;
         }
         self.backend.browse(username);
         self.backend.user_profile(username);
         self.profiles.requested(username);
-        self.browse = Some(BrowseView {
-            username: username.to_string(),
-            dirs: None,
-            error: None,
-            selected: None,
-            expanded: BTreeSet::new(),
-        });
+        self.push_tab(TabKind::User(UserTab {
+            browse: BrowseView::new(username),
+        }));
     }
 
-    /// Browse straight into the folder of a search hit.
+    /// The user's tab, at the folder of a search hit.
     pub fn open_folder_of(&mut self, file: &RemoteFile) {
         self.open_user(&file.username);
-        if let Some(b) = &mut self.browse {
+        if let Some(b) = self.tabs.get_mut(self.active).and_then(Tab::browse_mut) {
             b.select(file.folder());
         }
     }
 
-    pub fn back(&mut self) {
-        if let Some(b) = self.browse.take() {
-            self.profiles.forget(&b.username);
+    /// Type `query` into the shown search tab (a new one if a user tab is shown) and run it.
+    pub fn search_for(&mut self, query: &str) {
+        self.show_search_tab();
+        if let Some(st) = self.tab_mut().search_mut() {
+            st.edit.replace_text(query);
+        }
+        self.submit_search();
+    }
+
+    /// Ctrl+L / Ctrl+F: stay on a search tab, else go to the nearest one on the left (or the
+    /// first), else open one.
+    pub fn show_search_tab(&mut self) {
+        if self.tab().search().is_some() {
+            return;
+        }
+        let left = (0..self.active)
+            .rev()
+            .find(|&i| self.tabs[i].search().is_some());
+        match left.or_else(|| self.tabs.iter().position(|t| t.search().is_some())) {
+            Some(i) => self.active = i,
+            None => self.new_search_tab(),
+        }
+    }
+
+    pub fn activate(&mut self, i: usize) {
+        if i < self.tabs.len() {
+            self.active = i;
+        }
+    }
+
+    /// Ctrl+Tab (+1) / Ctrl+Shift+Tab (-1), wrapping.
+    pub fn cycle_tabs(&mut self, step: isize) {
+        let n = self.tabs.len() as isize;
+        self.active = (self.active as isize + step).rem_euclid(n) as usize;
+    }
+
+    /// × / middle-click / Ctrl+W. Stops a running search; the last tab leaves an empty
+    /// search tab in its place.
+    pub fn close_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(i);
+        match tab.kind {
+            TabKind::Search(s) => {
+                if let Some(v) = s.search.filter(|v| !v.finished) {
+                    self.backend.cancel_search(v.id);
+                }
+            }
+            TabKind::User(u) => self.profiles.forget(&u.browse.username),
+        }
+        if self.tabs.is_empty() {
+            self.new_search_tab();
+            return;
+        }
+        if i < self.active || self.active >= self.tabs.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+    }
+
+    pub fn close_active(&mut self) {
+        self.close_tab(self.active);
+    }
+
+    pub fn tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    pub fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+
+    /// The shown search tab's search, if the shown tab is a search.
+    pub fn active_search(&self) -> Option<&SearchView> {
+        self.tab().search()?.search.as_ref()
+    }
+
+    /// The shown tab's browse, if it is a user tab.
+    pub fn active_browse(&self) -> Option<&BrowseView> {
+        self.tab().browse()
+    }
+
+    pub fn active_browse_mut(&mut self) -> Option<&mut BrowseView> {
+        self.tab_mut().browse_mut()
+    }
+
+    fn search_by_id(&mut self, id: goalseek_core::SearchId) -> Option<&mut SearchView> {
+        self.tabs
+            .iter_mut()
+            .filter_map(|t| t.search_mut()?.search.as_mut())
+            .find(|s| s.id == id)
+    }
+
+    fn browse_of(&mut self, username: &str) -> Option<&mut BrowseView> {
+        self.tabs
+            .iter_mut()
+            .filter_map(Tab::browse_mut)
+            .find(|b| b.username == username)
+    }
+
+    /// After a tab switch: put the shown tab's lists back where they were scrolled to.
+    pub fn restore_scroll(&self, tx: &mut Tx) {
+        let t = self.tab();
+        tx.scroll_to_instant(t.list_key(), 0.0, t.scroll.get());
+        if t.browse().is_some() {
+            tx.scroll_to_instant(t.tree_key(), 0.0, t.tree_scroll.get());
         }
     }
 
@@ -642,36 +924,8 @@ impl App {
 
     /// ▶ on a file: fetch into the cache and play once bytes arrive; ▶ on the playing file
     /// toggles pause.
-    pub fn play(&mut self, file: &RemoteFile) {
-        if self
-            .playing
-            .as_ref()
-            .is_some_and(|p| &p.file == file && p.failed.is_none())
-        {
-            self.toggle_pause();
-            return;
-        }
-        self.player.stop();
-        if let Some(prev) = self.playing.take() {
-            let live = self
-                .transfers
-                .iter()
-                .any(|t| t.id == prev.ticket.id && t.is_live());
-            if live && !prev.keep {
-                self.backend.cancel(prev.ticket.id);
-            }
-        }
-        let ticket = self.backend.play_fetch(file);
-        self.upsert(ticket.id, TransferKind::Play, file);
-        self.playing = Some(NowPlaying {
-            ticket,
-            file: file.clone(),
-            opened: false,
-            keep: false,
-            snapshot: None,
-            failed: None,
-        });
-        self.notice = None;
+    pub(crate) fn upsert_play(&mut self, id: TransferId, file: &RemoteFile) {
+        self.upsert(id, TransferKind::Play, file);
     }
 
     pub fn toggle_pause(&mut self) {
@@ -741,10 +995,6 @@ impl App {
         self.upsert(id, TransferKind::Download, file);
     }
 
-    pub fn download_folder(&mut self, username: &str, folder: &str) {
-        self.backend.download_folder(username, folder);
-    }
-
     /// Latest download (not play fetch) of this file.
     pub fn download_of(&self, file: &RemoteFile) -> Option<&Transfer> {
         self.transfers.iter().rev().find(|t| {
@@ -756,16 +1006,6 @@ impl App {
 
     pub fn cancel_upload(&mut self, username: &str, path: &str) {
         self.backend.cancel_upload(username, path);
-    }
-
-    /// Flip the audio-only filter and run the current search again under it.
-    pub fn toggle_audio_only(&mut self) {
-        self.audio_only = !self.audio_only;
-        self.backend.set_audio_only(self.audio_only);
-        if let Some(q) = self.search.as_ref().map(|s| s.query.clone()) {
-            self.search_edit.replace_text(q);
-            self.submit_search();
-        }
     }
 
     pub fn cancel(&mut self, id: TransferId) {
@@ -797,69 +1037,38 @@ impl App {
 
     pub fn toggle_panel(&mut self, p: Panel) {
         self.panel = if self.panel == p { Panel::None } else { p };
+        self.drawer.confirm_cancel = None;
         if self.panel == Panel::Settings {
-            let mut form = SettingsForm::from_settings(self.backend.settings());
-            form.shares.clone_from(&self.onboarding.shares);
-            self.settings_form = form;
+            self.settings_form = SettingsForm::from_settings(self.backend.settings());
         }
     }
 
-    pub fn add_settings_share(&mut self) {
+    /// A typed folder (no folder dialog on this desktop): add it to the shares.
+    pub fn add_typed_share(&mut self) {
         match parse_dir(&self.settings_form.share_input.text) {
             Ok(dir) => {
-                if !self.settings_form.shares.contains(&dir) {
-                    self.settings_form.shares.push(dir);
-                }
                 self.settings_form.share_input.clear();
-                self.settings_form.message = None;
+                self.settings_form.path_error = None;
+                self.add_share(dir);
             }
-            Err(e) => self.settings_form.message = Some((false, e)),
+            Err(e) => self.settings_form.path_error = Some(e),
+        }
+    }
+
+    /// A typed download folder (no folder dialog): applied if it exists.
+    pub fn set_typed_download_dir(&mut self) {
+        match parse_dir(&self.settings_form.download_dir.text) {
+            Ok(dir) => {
+                self.settings_form.path_error = None;
+                self.set_download_dir(dir);
+            }
+            Err(e) => self.settings_form.path_error = Some(e),
         }
     }
 
     pub fn rescan(&mut self) {
         self.backend.rescan_shares();
-        self.settings_form.message = Some((true, "Rescanning shares…".into()));
-    }
-
-    pub fn apply_settings(&mut self) {
-        let form = &self.settings_form;
-        let port = match form.listen_port.text.trim().parse::<u16>() {
-            Ok(p) if p >= 1024 => p,
-            _ => {
-                self.settings_form.message = Some((
-                    false,
-                    "Listen port must be a number from 1024 to 65535.".into(),
-                ));
-                return;
-            }
-        };
-        let slots = match form.upload_slots.text.trim().parse::<usize>() {
-            Ok(n) if (1..=100).contains(&n) => n,
-            _ => {
-                self.settings_form.message = Some((false, "Upload slots must be 1–100.".into()));
-                return;
-            }
-        };
-        let dl = form.download_dir.text.trim();
-        if dl.is_empty() {
-            self.settings_form.message = Some((false, "Choose a download folder.".into()));
-            return;
-        }
-        let shares = form.shares.clone();
-        let mut settings = self.backend.settings().clone();
-        settings.download_dir = expand_tilde(dl);
-        settings.listen_port = port;
-        settings.upload_slots = slots;
-        let shares_changed = shares != self.onboarding.shares;
-        settings.share_dirs.clone_from(&shares);
-        self.store.save_settings(&settings);
-        self.backend.apply_settings(settings);
-        if shares_changed {
-            self.backend.set_shares(shares.clone());
-            self.onboarding.shares = shares;
-        }
-        self.settings_form.message = Some((true, "Saved.".into()));
+        self.share_counts = None;
     }
 }
 
@@ -868,75 +1077,24 @@ impl SettingsForm {
         Self {
             download_dir: edit(&s.download_dir.display().to_string()),
             listen_port: edit(&s.listen_port.to_string()),
-            upload_slots: edit(&s.upload_slots.to_string()),
             share_input: edit(""),
-            shares: s.share_dirs.clone(),
-            message: None,
-        }
-    }
-}
-
-impl BrowseView {
-    /// Select a folder and expand its ancestors so it is visible in the tree.
-    pub fn select(&mut self, path: &str) {
-        let mut prefix = String::new();
-        for part in path.split('\\') {
-            if !prefix.is_empty() {
-                self.expanded.insert(prefix.clone());
-                prefix.push('\\');
-            }
-            prefix.push_str(part);
-        }
-        self.selected = Some(path.to_string());
-    }
-
-    pub fn toggle(&mut self, path: &str) {
-        if !self.expanded.remove(path) {
-            self.expanded.insert(path.to_string());
+            manual: None,
+            path_error: None,
+            saved_at: None,
+            port_confirm: None,
+            port_invalid: false,
+            port_editing: false,
         }
     }
 
-    pub fn selected_dir(&self) -> Option<&BrowseDir> {
-        let sel = self.selected.as_deref()?;
-        self.dirs.as_ref()?.iter().find(|d| d.path == sel)
-    }
-
-    /// Folder tree rows to draw: (path, depth, has children, expanded), in order.
-    pub fn visible_tree(&self) -> Vec<(String, usize, bool, bool)> {
-        let mut all = BTreeSet::new();
-        for d in self.dirs.iter().flatten() {
-            let mut prefix = String::new();
-            for part in d.path.split('\\') {
-                if !prefix.is_empty() {
-                    prefix.push('\\');
-                }
-                prefix.push_str(part);
-                all.insert(prefix.clone());
-            }
+    /// After a change was applied: fields show what is in effect.
+    pub fn sync(&mut self, s: &Settings) {
+        self.download_dir
+            .replace_text(s.download_dir.display().to_string());
+        if self.port_confirm.is_none() {
+            self.listen_port.replace_text(s.listen_port.to_string());
+            self.port_invalid = false;
         }
-        let mut out = Vec::new();
-        for p in &all {
-            let depth = p.matches('\\').count();
-            let mut visible = true;
-            let mut anc = p.as_str();
-            while let Some(i) = anc.rfind('\\') {
-                anc = &anc[..i];
-                if !self.expanded.contains(anc) {
-                    visible = false;
-                    break;
-                }
-            }
-            if !visible {
-                continue;
-            }
-            let child_prefix = format!("{p}\\");
-            let has_children = all
-                .range(child_prefix.clone()..)
-                .next()
-                .is_some_and(|n| n.starts_with(&child_prefix));
-            out.push((p.clone(), depth, has_children, self.expanded.contains(p)));
-        }
-        out
     }
 }
 

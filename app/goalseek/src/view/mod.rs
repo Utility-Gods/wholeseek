@@ -1,58 +1,225 @@
 //! Views: pure functions of [`App`]; handlers call `App` methods.
+//!
+//! Look: flat and dense on Turable's navy palette, one orange accent (active tab, playing
+//! track, primary buttons, focus). Motion: none on entry or exit — the whole window lands
+//! changes at once (`instant_changes`); only hover/press colours move, in 60 ms.
 
+mod files;
 mod icons;
-mod main_view;
+mod menu;
 mod onboarding;
 mod panels;
 mod player;
 mod profile;
+mod search;
+mod strip;
+mod user;
+#[cfg(test)]
+pub use files::more_key as files_more_key;
 
-use rune::tok::{self, TextStyle, Theme, type_};
-use rune::{Color, Cursor, Cx, El, TextEdit, col, el, oklch, row, text};
+use rune::tok::{TextStyle, Theme, type_};
+use rune::{Color, Cursor, Curve, Cx, El, TextEdit, col, el, row, text};
 
-use crate::app::{App, Panel, Screen};
+use crate::app::{App, Conn, Panel, Screen};
+use crate::tabs::TabKind;
 
-pub fn view(s: &App, _: &mut Cx<App>) -> El {
-    let t = tok::theme(true);
-    match s.screen {
-        Screen::Onboarding => onboarding::view(s, &t),
-        Screen::Main => {
-            let mut body = row()
-                .key("body")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .child(main_view::content(s, &t));
-            match s.panel {
-                Panel::None => {}
-                Panel::Transfers => body = body.child(vline(&t)).child(panels::transfers(s, &t)),
-                Panel::Settings => body = body.child(vline(&t)).child(panels::settings(s, &t)),
-            }
-            col()
-                .w_full()
-                .h_full()
-                .fill(t.bg)
-                .child(main_view::top_bar(s, &t))
-                .child(hairline(&t))
-                .child(body)
-                .child(hairline(&t))
-                .child(player::strip(s, &t))
-        }
+/// Hover/press colour change, in and out.
+const HOVER_SECS: f32 = 0.06;
+pub const DRAWER_W: f32 = 380.0;
+
+fn hex(rgb: u32) -> Color {
+    let c = |s: u32| rune::theme::srgb_decode(((rgb >> s) & 0xff) as f32 / 255.0);
+    Color {
+        r: c(16),
+        g: c(8),
+        b: c(0),
+        a: 1.0,
     }
 }
 
+/// Turable's dark palette.
+pub mod pal {
+    use super::hex;
+    use rune::Color;
+    pub fn bg() -> Color {
+        hex(0x0f172a)
+    }
+    pub fn raised() -> Color {
+        hex(0x111a2c)
+    }
+    pub fn hover() -> Color {
+        hex(0x1e293b)
+    }
+    pub fn line() -> Color {
+        hex(0x1e293b)
+    }
+    pub fn line_strong() -> Color {
+        hex(0x334155)
+    }
+    pub fn text() -> Color {
+        hex(0xe2e8f0)
+    }
+    pub fn muted() -> Color {
+        hex(0x94a3b8)
+    }
+    pub fn accent() -> Color {
+        hex(0xfb923c)
+    }
+}
+
+pub fn theme() -> Theme {
+    let mut t = rune::tok::theme(true);
+    t.bg = pal::bg();
+    t.card = pal::raised();
+    t.card_border = pal::line_strong();
+    t.text = pal::text();
+    t.text_secondary = pal::muted();
+    t.separator = pal::line();
+    t.control_off = pal::hover();
+    t.control_track = pal::line_strong();
+    t.indicator = hex(0x475569);
+    t.hover = pal::hover();
+    t.press = pal::line_strong();
+    t
+}
+
+pub fn view(s: &App, _: &mut Cx<App>) -> El {
+    let t = theme();
+    let page = match s.screen {
+        Screen::Starting => starting(&t),
+        Screen::Onboarding => onboarding::view(s, &t),
+        Screen::Main => main(s, &t),
+    };
+    page.instant_changes()
+        .hover_motion_within(Curve::linear(HOVER_SECS), Curve::linear(HOVER_SECS))
+}
+
+/// Before the saved account is read (off the UI thread).
+fn starting(t: &Theme) -> El {
+    col()
+        .key("starting")
+        .w_full()
+        .h_full()
+        .center()
+        .fill(t.bg)
+        .child(
+            text("Signing in…")
+                .font(type_::BODY)
+                .color(t.text_secondary),
+        )
+}
+
+fn main(s: &App, t: &Theme) -> El {
+    let content = match &s.tab().kind {
+        TabKind::Search(st) => search::page(s, s.tab(), st, t),
+        TabKind::User(u) => user::page(s, s.tab(), &u.browse, t),
+    };
+    let mut body = col()
+        .key("body")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(content);
+    // Drawers lie over the page (it keeps its layout under them).
+    let drawer = match s.panel {
+        Panel::None => None,
+        Panel::Transfers => Some(panels::transfers(s, t)),
+        Panel::Settings => Some(panels::settings(s, t)),
+    };
+    if let Some(d) = drawer {
+        body = body.child(
+            row()
+                .pin(None, Some(0.0), Some(0.0), Some(0.0))
+                .w(DRAWER_W + 1.0)
+                .child(vline(t))
+                .child(d),
+        );
+    }
+    let mut page = col()
+        .w_full()
+        .h_full()
+        .fill(t.bg)
+        .child(strip::view(s, t))
+        .child(hairline(t));
+    if let Some(b) = banner(s, t) {
+        page = page.child(b);
+    }
+    page = page
+        .child(body)
+        .child(hairline(t))
+        .child(player::strip(s, t));
+    // Last at the root: a context menu draws over everything and anchors to earlier keys.
+    match menu::layer(s, t) {
+        Some(m) => page.child(m),
+        None => page,
+    }
+}
+
+/// One line under the tab strip: signed in elsewhere (with Reconnect), else the last error.
+fn banner(s: &App, t: &Theme) -> Option<El> {
+    let line = |key: &str, msg: String, tint: Color| {
+        row()
+            .key(key.to_string())
+            .h(32.0)
+            .w_full()
+            .px(12.0)
+            .gap(10.0)
+            .center_y()
+            .fill(tint.alpha(0.10))
+            .child(
+                text(msg)
+                    .font(type_::BODY)
+                    .color(t.text)
+                    .truncate()
+                    .grow(1.0)
+                    .shrink(),
+            )
+    };
+    if let Some(r) = &s.status.reconnect {
+        return Some(
+            line(
+                "reconnecting",
+                format!("Reconnecting in {} s", r.in_secs()),
+                amber(),
+            )
+            .help(format!("Attempt {}", r.attempt)),
+        );
+    }
+    if s.conn == Conn::Displaced {
+        return Some(
+            line("displaced", "Signed in elsewhere".into(), pal::muted()).child(
+                button("reconnect", "Reconnect", false, t)
+                    .h(24.0)
+                    .on_press(|s: &mut App| s.reconnect()),
+            ),
+        );
+    }
+    let e = s.error.as_ref()?;
+    Some(
+        line("error", e.clone(), red()).child(
+            icon_button("dismiss", icons::close(9.0, t.text_secondary), t)
+                .size(22.0, 22.0)
+                .label("Dismiss")
+                .on_press(|s: &mut App| s.error = None),
+        ),
+    )
+}
+
 pub fn accent() -> Color {
-    tok::accent(0, true)
+    pal::accent()
 }
 pub fn green() -> Color {
-    oklch(0.72, 0.14, 150.0)
+    hex(0x4ade80)
 }
 pub fn amber() -> Color {
-    oklch(0.8, 0.13, 75.0)
+    hex(0xfbbf24)
 }
 pub fn red() -> Color {
-    oklch(0.7, 0.16, 25.0)
+    hex(0xf87171)
 }
+
+/// 11 px meta text.
+pub const META: TextStyle = TextStyle::new(11.0, 450.0);
 
 pub fn tnum(style: TextStyle) -> TextStyle {
     TextStyle {
@@ -73,11 +240,11 @@ pub fn vline(t: &Theme) -> El {
 pub fn icon_button(key: &str, icon: El, t: &Theme) -> El {
     row()
         .key(key.to_string())
-        .size(28.0, 28.0)
+        .size(24.0, 24.0)
         .center()
-        .radius(6.0)
-        .hover(t.control_off)
-        .press(t.control_track)
+        .radius(4.0)
+        .hover(t.hover)
+        .press(t.press)
         .cursor(Cursor::Pointer)
         .role("button")
         .child(icon)
@@ -87,27 +254,23 @@ pub fn icon_button(key: &str, icon: El, t: &Theme) -> El {
 pub fn button(key: &str, label: &str, primary: bool, t: &Theme) -> El {
     let b = row()
         .key(key.to_string())
-        .h(30.0)
-        .px(14.0)
+        .h(28.0)
+        .px(12.0)
         .center()
-        .radius(7.0)
+        .radius(4.0)
         .cursor(Cursor::Pointer)
         .role("button")
         .label(label.to_string())
         .child(
             text(label.to_string())
                 .font(type_::LABEL)
-                .color(if primary {
-                    oklch(0.99, 0.0, 0.0)
-                } else {
-                    t.text
-                }),
+                .color(if primary { pal::bg() } else { t.text }),
         );
     if primary {
-        b.fill(accent()).hover(oklch(1.0, 0.0, 0.0).alpha(0.06))
+        b.fill(accent()).hover(hex(0xfdba74)).press(hex(0xf97316))
     } else {
-        b.fill(t.control_off)
-            .hover(t.control_off)
+        b.fill(t.hover)
+            .hover(t.control_track)
             .press(t.control_track)
     }
 }
@@ -116,10 +279,10 @@ pub fn button(key: &str, label: &str, primary: bool, t: &Theme) -> El {
 pub fn field_box(key: &str, input: El, t: &Theme) -> El {
     row()
         .key(key.to_string())
-        .h(32.0)
-        .px(10.0)
+        .h(28.0)
+        .px(8.0)
         .center_y()
-        .radius(7.0)
+        .radius(4.0)
         .fill(t.card)
         .border(1.0, t.card_border)
         .child(input.grow(1.0))
@@ -143,14 +306,12 @@ pub fn section(label: &str, t: &Theme) -> El {
 pub fn progress(key: &str, fraction: f32, w: f32, color: Color, t: &Theme) -> El {
     el().key(key.to_string())
         .w(w)
-        .h(4.0)
-        .radius(2.0)
-        .fill(t.control_off)
+        .h(3.0)
+        .fill(t.control_track)
         .child(
             el().absolute(0.0, 0.0)
                 .w_frac(fraction.clamp(0.0, 1.0))
-                .h(4.0)
-                .radius(2.0)
+                .h(3.0)
                 .fill(color),
         )
 }

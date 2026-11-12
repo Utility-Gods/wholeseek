@@ -24,6 +24,8 @@ pub struct ProfileEntry {
     pub picture: Option<Image>,
     /// "more" pressed on the description.
     pub expanded: bool,
+    /// The picture was still decoding at the last `settle`.
+    decoding: bool,
 }
 
 impl ProfileEntry {
@@ -33,12 +35,15 @@ impl ProfileEntry {
             profile: UserProfile::default(),
             picture: None,
             expanded: false,
+            decoding: false,
         }
     }
 
-    /// A picture that decoded (or is still decoding) — not one Rune rejected.
+    /// The picture once it decoded fine: not while decoding (no flash), not one Rune rejected.
     pub fn shown_picture(&self) -> Option<&Image> {
-        self.picture.as_ref().filter(|i| i.error().is_none())
+        self.picture
+            .as_ref()
+            .filter(|i| i.is_ready() && i.error().is_none())
     }
 }
 
@@ -95,12 +100,15 @@ impl Profiles {
         let Some(entry) = self.entries.get_mut(username) else {
             return false;
         };
-        // Same bytes = same handle (the cache is content-addressed): a repeat event doesn't
-        // redecode.
-        entry.picture = profile
-            .picture
-            .as_ref()
-            .map(|bytes| self.images.load(bytes.clone()));
+        // Unchanged bytes keep the handle (and its decode state): a later partial event never
+        // restarts decoding.
+        if profile.picture != entry.profile.picture || entry.picture.is_none() {
+            entry.picture = profile
+                .picture
+                .as_ref()
+                .map(|bytes| self.images.load(bytes.clone()));
+        }
+        entry.decoding = entry.picture.as_ref().is_some_and(|i| !i.is_ready());
         entry.profile = profile;
         entry.status = ProfileStatus::Known;
         true
@@ -115,6 +123,18 @@ impl Profiles {
             entry.status = ProfileStatus::Failed(reason);
         }
         true
+    }
+
+    /// True when a picture finished decoding since the last call (the header redraws).
+    pub fn settle(&mut self) -> bool {
+        let mut changed = false;
+        for e in self.entries.values_mut() {
+            if e.decoding && e.picture.as_ref().is_some_and(Image::is_ready) {
+                e.decoding = false;
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn toggle_expanded(&mut self, username: &str) {

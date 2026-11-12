@@ -4,57 +4,64 @@
 //! `cargo run -p goalseek -- --demo`   fake peers and a simulated player: no network, no audio
 //!
 //! Headless (Rune tooling, same renderer, virtual clock), e.g.
-//! `goalseek --demo --scene results --snap results.png --at 4 --size 1100x700 --scale 1`.
-//! Scenes (demo): results, browse, transfers, settings, onboarding-error, rejected.
+//! `goalseek --demo --scene search-tab --snap search-tab.png --at 4 --size 1100x700 --scale 1`.
+//! Scenes (demo): search-tab, user-tab, three-tabs, transfers-drawer, player-buffering,
+//! settings, uploads, displaced, browse-profile(-minimal), onboarding-error, rejected,
+//! no-keyring.
 
+mod actions;
 mod app;
 mod backend;
 mod demo;
+mod desktop;
 mod fmt;
+mod menu;
 mod playback;
 mod profile;
+mod queue;
 mod store;
+mod tabs;
+mod transfers;
 mod view;
 
 #[cfg(test)]
 mod tests;
 
-use std::sync::OnceLock;
+use std::sync::mpsc::Sender;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use goalseek_core::config;
-use rune::{AppSpec, Tx};
+use rune::{AppSpec, Key, KeyEvent, Tx};
 
-use app::{App, Panel};
+use app::{App, Booted, Panel, Startup};
 
 const W: f32 = 1100.0;
 const H: f32 = 700.0;
 
 static DEMO: OnceLock<bool> = OnceLock::new();
-/// What `config::load()` found, read in `main` before the window exists (the keyring can take
-/// seconds; it never runs on the UI thread).
-static LOADED: OnceLock<config::Loaded> = OnceLock::new();
+/// Where the startup loader sends what it read (real mode), taken by `setup`.
+static BOOT_TX: Mutex<Option<Sender<Booted>>> = Mutex::new(None);
 
 fn init() -> App {
     if *DEMO.get().unwrap_or(&false) {
         return App::demo();
     }
-    let loaded = LOADED.get().cloned().unwrap_or_else(|| config::Loaded {
-        settings: goalseek_core::Settings::default(),
-        credentials: None,
-        keyring_available: false,
-    });
-    let startup = app::Startup {
-        credentials: loaded.credentials,
-        keyring_available: loaded.keyring_available,
-    };
-    App::real(loaded.settings, startup)
+    let (app, tx) = App::real();
+    if let Ok(mut slot) = BOOT_TX.lock() {
+        *slot = Some(tx);
+    }
+    app
 }
 
 /// Each frame: drain core events and refresh the player snapshot; ask for the next wake while
 /// something is moving (playback, demo timers, a notice to expire). Never blocks.
 pub fn poll(s: &mut App, t: f64, tx: &mut Tx) -> bool {
     let (changed, wake) = s.tick(t);
+    // A deep link's file, once its folder is listed: scroll it into view.
+    if let Some((list, row)) = s.take_reveal() {
+        tx.scroll_into_view_in(list, row);
+    }
     if let Some(w) = wake {
         tx.wake_after(Duration::from_secs_f64(w.max(1.0 / 60.0)));
     }
@@ -62,9 +69,82 @@ pub fn poll(s: &mut App, t: f64, tx: &mut Tx) -> bool {
 }
 
 fn setup(s: &mut App, wake: rune::Waker) {
-    s.store.set_waker(wake.clone());
-    s.profiles.set_waker(wake.clone());
-    s.backend.set_waker(wake);
+    s.set_waker(wake.clone());
+    let tx = BOOT_TX.lock().ok().and_then(|mut t| t.take());
+    if let Some(tx) = tx {
+        spawn_loader(tx, wake);
+    }
+}
+
+/// Read the config file and the keyring (up to its 5 s timeout) off the UI thread; the
+/// window already shows "Signing in…".
+fn spawn_loader(tx: Sender<Booted>, wake: rune::Waker) {
+    let spawned = std::thread::Builder::new()
+        .name("goalseek-config".into())
+        .spawn(move || {
+            let booted = match config::load() {
+                Ok(l) => Booted {
+                    settings: l.settings,
+                    startup: Startup {
+                        credentials: l.credentials,
+                        keyring_available: l.keyring_available,
+                    },
+                },
+                Err(e) => {
+                    eprintln!("goalseek: could not read the config, starting fresh ({e})");
+                    Booted {
+                        settings: goalseek_core::Settings::default(),
+                        startup: Startup {
+                            credentials: None,
+                            keyring_available: false,
+                        },
+                    }
+                }
+            };
+            let _ = tx.send(booted);
+            wake();
+        });
+    if let Err(e) = spawned {
+        eprintln!("goalseek: could not start the config loader ({e})");
+    }
+}
+
+/// Window shortcuts: Ctrl+T new search tab, Ctrl+W close tab, Ctrl+(Shift+)Tab cycle tabs,
+/// Ctrl+L / Ctrl+F the search field, Space play/pause, Ctrl+→ / Ctrl+← next / previous
+/// track, Escape closes a menu. Only keys the focused control left alone get here.
+pub fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if s.screen != app::Screen::Main {
+        return false;
+    }
+    if s.menu.is_some() && ev.key == Key::Escape {
+        s.menu = None;
+        return true;
+    }
+    let plain = !(ev.mods.ctrl || ev.mods.cmd || ev.mods.alt);
+    match &ev.key {
+        Key::Text(t) if t == " " && plain => s.toggle_pause(),
+        Key::Right if ev.mods.ctrl => s.next_track(),
+        Key::Left if ev.mods.ctrl => s.previous_track(),
+        Key::Tab if ev.mods.ctrl => {
+            s.cycle_tabs(if ev.mods.shift { -1 } else { 1 });
+            s.restore_scroll(tx);
+        }
+        _ if ev.is_command('t') => {
+            s.new_search_tab();
+            tx.focus("query", false);
+        }
+        _ if ev.is_command('w') => {
+            s.close_active();
+            s.restore_scroll(tx);
+        }
+        _ if ev.is_command('l') || ev.is_command('f') => {
+            s.show_search_tab();
+            s.restore_scroll(tx);
+            tx.focus("query", true);
+        }
+        _ => return false,
+    }
+    true
 }
 
 // ---- demo scenes (headless screenshots) ------------------------------------------------------
@@ -92,8 +172,7 @@ impl App {
 
     fn demo_search(&mut self) {
         self.demo_login();
-        self.search_edit.replace_text("hollow lights");
-        self.submit_search();
+        self.search_for("hollow lights");
     }
 }
 
@@ -110,6 +189,31 @@ fn scene_browse(s: &mut App) {
     let f = demo_file("alice", "03 Low Tide Radio.flac");
     s.download(&f);
     s.open_folder_of(&f);
+}
+
+/// Results tab, then alice's and vinyl_rips' tabs; vinyl_rips is shown.
+fn scene_three_tabs(s: &mut App) {
+    s.demo_search();
+    s.play(&demo_file("alice", "02 Salt Roads.flac"));
+    s.open_user("alice");
+    s.activate(0);
+    s.open_user("vinyl_rips");
+}
+
+/// A big track a few seconds in: the downloaded region runs ahead of the play position.
+fn scene_player_buffering(s: &mut App) {
+    s.demo_search();
+    s.play(&demo_file("alice", "04 Morning Crossing.flac"));
+}
+
+/// Another client took the account (demo user "twice", 1.5 s in): the banner, no
+/// reconnect loop.
+fn scene_displaced(s: &mut App) {
+    s.onboarding.username.replace_text("twice");
+    s.onboarding.password.replace_text("demo-password");
+    s.onboarding.shares = vec![std::env::temp_dir()];
+    s.connect();
+    s.search_for("hollow lights");
 }
 
 /// Browse alice: picture, stats, long description (clamped).
@@ -172,19 +276,24 @@ fn main() {
         if let Err(e) = unsafe { config::init_logging(&config::default_log_path()) } {
             eprintln!("goalseek: protocol log stays on stderr ({e})");
         }
-        // Before the window: the keyring lookup may block up to its timeout.
-        match config::load() {
-            Ok(loaded) => {
-                let _ = LOADED.set(loaded);
-            }
-            Err(e) => eprintln!("goalseek: could not read the config, starting fresh ({e})"),
-        }
+    }
+    // X11 WM_CLASS / Wayland app_id: the desktop matches the window to goalseek.desktop
+    // (Icon=goalseek, StartupWMClass=goalseek) and shows its icon. Rune's `set_app_icon` sets the
+    // window/taskbar icon on macOS and Windows only; on Linux the .desktop entry provides it.
+    rune::set_app_id("goalseek");
+    if let Err(e) =
+        rune::set_app_icon(include_bytes!("../../../assets/holeseek-256.png").as_slice())
+    {
+        eprintln!("goalseek: app icon not set ({e})");
     }
     rune::run(AppSpec::<App> {
         scenes: &[
-            ("results", scene_results),
-            ("browse", scene_browse),
-            ("transfers", scene_transfers),
+            ("search-tab", scene_results),
+            ("user-tab", scene_browse),
+            ("three-tabs", scene_three_tabs),
+            ("transfers-drawer", scene_transfers),
+            ("player-buffering", scene_player_buffering),
+            ("displaced", scene_displaced),
             ("settings", scene_settings),
             ("onboarding-error", scene_onboarding_error),
             ("rejected", scene_rejected),
@@ -196,6 +305,7 @@ fn main() {
         min_size: Some((820.0, 520.0)),
         setup: Some(setup),
         poll: Some(poll),
+        on_key: Some(on_key),
         ..AppSpec::new("goalseek", (W, H), init, view::view)
     });
 }

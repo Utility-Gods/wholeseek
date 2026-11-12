@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=goalseek
+Comment=Minimal Soulseek client for music
+Exec=goalseek
+Icon=goalseek
+Terminal=false
+Categories=AudioVideo;Audio;P2P;
+StartupWMClass=goalseek

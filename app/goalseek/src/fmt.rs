@@ -64,3 +64,13 @@ pub fn title(f: &RemoteFile) -> String {
         .map_or(base, |i| &base[..i])
         .to_string()
 }
+
+/// A local path with the home directory shown as `~`.
+pub fn home_short(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
+            format!("~{}", &path[home.len()..])
+        }
+        _ => path.to_string(),
+    }
+}

@@ -9,6 +9,53 @@ use goalseek_core::{
 };
 
 use crate::demo::Call;
+use goalseek_core::status::CoreStatus;
+
+/// Stands in until the saved settings are read at startup: does nothing, says nothing.
+#[derive(Default)]
+pub struct IdleBackend {
+    settings: Settings,
+}
+
+impl Backend for IdleBackend {
+    fn settings(&self) -> &Settings {
+        &self.settings
+    }
+    fn login(&mut self, _: Credentials) {}
+    fn logout(&mut self) {}
+    fn search(&mut self, _: &str) -> SearchId {
+        SearchId(0)
+    }
+    fn cancel_search(&mut self, _: SearchId) {}
+    fn browse(&mut self, _: &str) {}
+    fn play_fetch(&mut self, f: &RemoteFile) -> PlayTicket {
+        let dir = goalseek_core::paths::cache_transfer_dir(&self.settings.cache_dir, TransferId(0));
+        PlayTicket {
+            id: TransferId(0),
+            part_path: goalseek_core::paths::part_path(&dir, &f.path),
+            final_path: goalseek_core::paths::final_path(&dir, &f.path),
+        }
+    }
+    fn download(&mut self, _: &RemoteFile) -> TransferId {
+        TransferId(0)
+    }
+    fn download_folder(&mut self, _: &str, _: &str) {}
+    fn cancel(&mut self, _: TransferId) {}
+    fn retry(&mut self, _: TransferId) {}
+    fn set_shares(&mut self, _: Vec<PathBuf>) {}
+    fn rescan_shares(&mut self) {}
+    fn apply_settings(&mut self, _: Settings) {}
+    fn cancel_upload(&mut self, _: &str, _: &str) {}
+    fn user_profile(&mut self, _: &str) {}
+    fn set_audio_only(&mut self, _: bool) {}
+    fn drain(&mut self, _: f64) -> Vec<CoreEvent> {
+        Vec::new()
+    }
+    fn status(&self) -> CoreStatus {
+        CoreStatus::default()
+    }
+    fn clear_cache(&mut self) {}
+}
 
 /// The UI's view of the Soulseek session (mirrors `Core`'s public methods).
 pub trait Backend {
@@ -32,6 +79,10 @@ pub trait Backend {
     fn set_audio_only(&mut self, on: bool);
     /// Every event ready now. Never blocks. `now` is the frame clock (virtual when headless).
     fn drain(&mut self, now: f64) -> Vec<CoreEvent>;
+    /// The core's polled snapshot: reconnect wait, listen port, search progress, cache.
+    fn status(&self) -> CoreStatus;
+    /// Delete cached plays except the current and in-flight ones.
+    fn clear_cache(&mut self);
     /// Seconds until `drain` has more to say without an outside wake (demo timers).
     fn next_tick(&self) -> Option<f64> {
         None
@@ -111,6 +162,12 @@ impl Backend for RealBackend {
     }
     fn set_audio_only(&mut self, on: bool) {
         self.core.set_audio_only(on);
+    }
+    fn status(&self) -> CoreStatus {
+        self.core.status()
+    }
+    fn clear_cache(&mut self) {
+        self.core.clear_cache();
     }
     fn drain(&mut self, _now: f64) -> Vec<CoreEvent> {
         let mut out = Vec::new();

@@ -5,6 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-rune = { workspace = true }
+rune = { workspace = true, features = ["native-file-dialog"] }
 goalseek-core = { workspace = true }
 goalseek-audio = { workspace = true }

@@ -11,8 +11,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
-use goalseek_audio::{PlayState, PlayerSnapshot, SeekError};
+use goalseek_audio::{PlayState, PlayerEvent, PlayerSnapshot, QueueItem, SeekError};
 use goalseek_core::{
     AudioAttrs, BrowseDir, CoreEvent, Credentials, DisconnectReason, PlayTicket, RemoteFile,
     SearchHit, SearchId, Settings, TransferId, TransferKind, UploadRow, UploadState, UserProfile,
@@ -21,6 +22,9 @@ use goalseek_core::{
 
 use crate::backend::Backend;
 use crate::playback::Playback;
+use goalseek_core::status::{
+    CacheUsage, CoreStatus, ListenStatus, ReconnectStatus, SearchProgress,
+};
 
 /// A command the demo backend received (tests assert on these).
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +45,7 @@ pub enum Call {
     CancelUpload(String, String),
     UserProfile(String),
     SetAudioOnly(bool),
+    ClearCache,
 }
 
 struct Peer {
@@ -200,6 +205,19 @@ pub fn catalog() -> Vec<RemoteFile> {
             secs,
         ));
     }
+    // Folder junk "Download folder" skips (transfers::JUNK_*).
+    for (name, size) in [
+        ("Thumbs.db", 18_432),
+        ("desktop.ini", 182),
+        ("Night Ferry EP.url", 96),
+    ] {
+        v.push(RemoteFile {
+            username: "alice".into(),
+            path: format!("{ferry}\\{name}"),
+            size,
+            attrs: AudioAttrs::default(),
+        });
+    }
     for (i, (name, secs)) in [
         ("Signals", 214),
         ("Static Bloom", 187),
@@ -315,6 +333,7 @@ struct FakeTransfer {
     last_tick: f64,
     last_emit: f64,
     fail_at: Option<u64>,
+    kind: TransferKind,
 }
 
 pub struct DemoBackend {
@@ -328,9 +347,33 @@ pub struct DemoBackend {
     world: Rc<RefCell<World>>,
     marten_failed: bool,
     shares: Vec<PathBuf>,
+    /// Who signed in (reconnects come back as them).
+    user: String,
+    /// Wall-clock origin of the virtual clock, so `status()` deadlines are stable.
+    epoch: Instant,
+    /// A (re)scan runs until this time; files found per share, +3 per rescan.
+    scan_until: f64,
+    rescans: u32,
     audio_only: bool,
     uploads: Vec<UploadRow>,
+    /// Open search windows: id, query, clock end; files and users delivered so far.
+    searches: Vec<(
+        SearchId,
+        String,
+        f64,
+        usize,
+        std::collections::HashSet<String>,
+    )>,
+    connected: bool,
+    /// A scripted reconnect wait: attempt and its clock window.
+    reconnect: Option<(u32, f64, f64)>,
+    /// Cached plays from earlier runs, until "Clear cache".
+    cache_base: u64,
 }
+
+/// A port the demo pretends another program holds: the session falls back to 45543.
+pub const DEMO_BUSY_PORT: u16 = 2240;
+const DEMO_FALLBACK_PORT: u16 = 45543;
 
 impl DemoBackend {
     pub fn new(world: Rc<RefCell<World>>) -> Self {
@@ -349,8 +392,24 @@ impl DemoBackend {
             world,
             marten_failed: false,
             shares: Vec::new(),
+            user: String::new(),
+            epoch: Instant::now(),
+            scan_until: 0.0,
+            rescans: 0,
             audio_only: true,
             uploads: Vec::new(),
+            searches: Vec::new(),
+            connected: false,
+            reconnect: None,
+            cache_base: 412 * 1024 * 1024,
+        }
+    }
+
+    fn bound_port(&self) -> u16 {
+        if self.settings.listen_port == DEMO_BUSY_PORT {
+            DEMO_FALLBACK_PORT
+        } else {
+            self.settings.listen_port
         }
     }
 
@@ -416,6 +475,7 @@ impl DemoBackend {
             last_tick: self.now,
             last_emit: f64::NEG_INFINITY,
             fail_at,
+            kind,
         });
     }
 
@@ -464,6 +524,12 @@ impl DemoBackend {
             }
             if bytes == t.file.size {
                 t.phase = Phase::Done;
+                // The finished file plays from disk too.
+                let mut w = self.world.borrow_mut();
+                if let Some(b) = w.buffers.get(&t.part_path).copied() {
+                    w.buffers.insert(t.final_path.clone(), b);
+                }
+                drop(w);
                 out.push(CoreEvent::TransferDone {
                     id: t.id,
                     path: t.final_path.clone(),
@@ -501,6 +567,7 @@ impl Backend for DemoBackend {
 
     fn login(&mut self, c: Credentials) {
         self.calls.push(Call::Login(c.username.clone()));
+        self.user.clone_from(&c.username);
         if c.password == "wrong" {
             self.at(
                 0.4,
@@ -511,11 +578,41 @@ impl Backend for DemoBackend {
             );
             return;
         }
+        // "flaky" loses the connection after a second and is back 5 s later.
+        if c.username == "flaky" {
+            self.at(
+                1.0,
+                CoreEvent::Disconnected {
+                    reason: DisconnectReason::Network(
+                        "the connection to the server dropped".into(),
+                    ),
+                    will_retry: true,
+                },
+            );
+            self.reconnect = Some((1, self.now + 1.0, self.now + 6.0));
+            self.at(
+                6.0,
+                CoreEvent::Connected {
+                    username: c.username.clone(),
+                    listen_port: Some(self.bound_port()),
+                },
+            );
+        }
+        // "twice" is signed in elsewhere a moment later (the server ends this session).
+        if c.username == "twice" {
+            self.at(
+                1.5,
+                CoreEvent::Disconnected {
+                    reason: DisconnectReason::Displaced,
+                    will_retry: false,
+                },
+            );
+        }
         self.at(
             0.3,
             CoreEvent::Connected {
                 username: c.username,
-                listen_port: Some(self.settings.listen_port),
+                listen_port: Some(self.bound_port()),
             },
         );
         let n = u32::try_from(self.shares.len()).unwrap_or(0);
@@ -617,6 +714,9 @@ impl Backend for DemoBackend {
                 },
             );
         }
+        self.searches.retain(|s| s.1 != query);
+        self.searches
+            .push((id, query, self.now + 1.4, 0, Default::default()));
         self.at(
             1.4,
             CoreEvent::SearchFinished {
@@ -675,6 +775,7 @@ impl Backend for DemoBackend {
         let files: Vec<RemoteFile> = catalog()
             .into_iter()
             .filter(|f| f.username == username && f.folder() == folder)
+            .filter(|f| !goalseek_core::is_download_junk(&f.path))
             .collect();
         for f in files {
             let id = TransferId(self.id());
@@ -732,7 +833,9 @@ impl Backend for DemoBackend {
 
     fn set_shares(&mut self, dirs: Vec<PathBuf>) {
         self.calls.push(Call::SetShares(dirs.clone()));
+        self.settings.share_dirs.clone_from(&dirs);
         self.shares = dirs;
+        self.scan_until = self.now + 0.5;
         let n = u32::try_from(self.shares.len()).unwrap_or(0);
         self.at(
             0.5,
@@ -745,6 +848,8 @@ impl Backend for DemoBackend {
 
     fn rescan_shares(&mut self) {
         self.calls.push(Call::RescanShares);
+        self.scan_until = self.now + 0.5;
+        self.rescans += 1;
         let n = u32::try_from(self.shares.len()).unwrap_or(0);
         self.at(
             0.5,
@@ -757,7 +862,111 @@ impl Backend for DemoBackend {
 
     fn apply_settings(&mut self, settings: Settings) {
         self.calls.push(Call::ApplySettings(settings.clone()));
+        let port_changed = settings.listen_port != self.settings.listen_port;
         self.settings = settings;
+        // As the core: a new listen port reconnects the session.
+        if port_changed && self.connected {
+            self.at(
+                0.0,
+                CoreEvent::Disconnected {
+                    reason: DisconnectReason::Network("listen port changed; reconnecting".into()),
+                    will_retry: true,
+                },
+            );
+            self.at(
+                0.5,
+                CoreEvent::Connected {
+                    username: self.user.clone(),
+                    listen_port: Some(self.bound_port()),
+                },
+            );
+        }
+    }
+
+    fn status(&self) -> CoreStatus {
+        let ahead = |at: f64| self.epoch + Duration::from_secs_f64(at.max(0.0));
+        let bound = self.connected.then(|| self.bound_port());
+        let requested = self.settings.listen_port;
+        let live_play = |t: &&FakeTransfer| {
+            t.kind == TransferKind::Play
+                && matches!(
+                    t.phase,
+                    Phase::Waiting | Phase::RemoteQueued | Phase::Active
+                )
+        };
+        let plays: u64 = self
+            .transfers
+            .iter()
+            .filter(|t| t.kind == TransferKind::Play && t.phase != Phase::Stopped)
+            .map(|t| t.bytes)
+            .sum();
+        CoreStatus {
+            reconnect: self
+                .reconnect
+                .filter(|(_, from, until)| (*from..*until).contains(&self.now))
+                .map(|(attempt, _, until)| ReconnectStatus {
+                    attempt,
+                    delay: Duration::from_secs(5),
+                    at: ahead(until),
+                }),
+            listen: ListenStatus {
+                requested,
+                bound,
+                note: bound
+                    .filter(|b| *b != requested)
+                    .map(|b| format!("port {requested} is in use, so the system picked port {b}")),
+            },
+            searches: self
+                .searches
+                .iter()
+                .filter(|s| s.2 > self.now)
+                .map(|(id, query, end, files, users)| SearchProgress {
+                    id: *id,
+                    query: query.clone(),
+                    files: *files,
+                    users: users.len(),
+                    ends_at: ahead(*end),
+                })
+                .collect(),
+            cache: CacheUsage {
+                used_bytes: self.cache_base + plays,
+                cap_bytes: self.settings.cache_cap_bytes,
+                in_use_bytes: self
+                    .transfers
+                    .iter()
+                    .filter(live_play)
+                    .map(|t| t.bytes)
+                    .sum(),
+            },
+            shares: self
+                .shares
+                .iter()
+                .map(|dir| goalseek_core::status::ShareStatus {
+                    dir: dir.clone(),
+                    folders: 42,
+                    files: 518 + 3 * self.rescans,
+                    scanning: self.now < self.scan_until,
+                })
+                .collect(),
+        }
+    }
+
+    fn clear_cache(&mut self) {
+        self.calls.push(Call::ClearCache);
+        self.cache_base = 0;
+        let keep: Vec<TransferId> = self
+            .transfers
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.phase,
+                    Phase::Waiting | Phase::RemoteQueued | Phase::Active
+                )
+            })
+            .map(|t| t.id)
+            .collect();
+        self.transfers
+            .retain(|t| t.kind != TransferKind::Play || keep.contains(&t.id));
     }
 
     fn cancel_upload(&mut self, username: &str, path: &str) {
@@ -793,8 +1002,17 @@ impl Backend for DemoBackend {
         let mut out: Vec<CoreEvent> = self.queue.drain(..due).map(|(_, e)| e).collect();
         // An uploads snapshot is taken when it is sent, like the core's.
         for e in &mut out {
-            if let CoreEvent::Uploads(rows) = e {
-                rows.clone_from(&self.uploads);
+            match e {
+                CoreEvent::Uploads(rows) => rows.clone_from(&self.uploads),
+                CoreEvent::Connected { .. } => self.connected = true,
+                CoreEvent::Disconnected { .. } => self.connected = false,
+                CoreEvent::SearchResults { search, hits } => {
+                    if let Some(s) = self.searches.iter_mut().find(|s| s.0 == *search) {
+                        s.3 += hits.len();
+                        s.4.extend(hits.iter().map(|h| h.file.username.clone()));
+                    }
+                }
+                _ => {}
             }
         }
         self.step_transfers(&mut out);
@@ -831,6 +1049,10 @@ pub struct FakePlayer {
     last: Option<f64>,
     volume: f32,
     notice: Option<String>,
+    queue: Vec<QueueItem>,
+    index: Option<usize>,
+    prefetched: bool,
+    events: Vec<PlayerEvent>,
 }
 
 impl FakePlayer {
@@ -843,7 +1065,30 @@ impl FakePlayer {
             last: None,
             volume: 0.8,
             notice: None,
+            queue: Vec::new(),
+            index: None,
+            prefetched: false,
+            events: Vec::new(),
         }
+    }
+
+    fn start(&mut self, path: Option<PathBuf>) {
+        self.path = path;
+        self.state = PlayState::Buffering;
+        self.position = 0.0;
+        self.notice = None;
+    }
+
+    /// As the real player: `TrackChanged`, then play the item or wait for its path.
+    fn goto(&mut self, i: usize) {
+        self.index = Some(i);
+        self.prefetched = false;
+        let item = self.queue[i].clone();
+        self.events.push(PlayerEvent::TrackChanged {
+            index: i,
+            id: item.id,
+        });
+        self.start(item.path);
     }
 
     fn buffer(&self) -> Option<Buffer> {
@@ -870,10 +1115,9 @@ impl Buffer {
 
 impl Playback for FakePlayer {
     fn play(&mut self, path: &Path, _total: u64) {
-        self.path = Some(path.to_path_buf());
-        self.state = PlayState::Buffering;
-        self.position = 0.0;
-        self.notice = None;
+        self.queue.clear();
+        self.index = None;
+        self.start(Some(path.to_path_buf()));
     }
     fn pause(&mut self) {
         if matches!(self.state, PlayState::Playing | PlayState::Buffering) {
@@ -889,6 +1133,8 @@ impl Playback for FakePlayer {
         }
     }
     fn stop(&mut self) {
+        self.queue.clear();
+        self.index = None;
         self.path = None;
         self.state = PlayState::Idle;
         self.position = 0.0;
@@ -924,11 +1170,66 @@ impl Playback for FakePlayer {
             notice: self.notice.clone(),
         }
     }
+    fn set_queue(&mut self, items: Vec<QueueItem>, start: usize) {
+        self.queue.clear();
+        self.index = None;
+        if start >= items.len() {
+            self.stop();
+            return;
+        }
+        self.queue = items;
+        self.goto(start);
+    }
+    fn set_queue_path(&mut self, index: usize, path: &Path, size: u64) -> bool {
+        let Some(item) = self.queue.get_mut(index) else {
+            return false;
+        };
+        item.path = Some(path.to_path_buf());
+        item.size = size;
+        if self.index == Some(index) && self.path.is_none() {
+            self.start(Some(path.to_path_buf()));
+        }
+        true
+    }
+    fn next(&mut self) {
+        let Some(i) = self.index else { return };
+        if i + 1 < self.queue.len() {
+            self.goto(i + 1);
+        } else {
+            self.events.push(PlayerEvent::QueueEnded);
+            self.state = PlayState::Ended;
+        }
+    }
+    fn previous(&mut self) {
+        let Some(i) = self.index else { return };
+        if self.position > goalseek_audio::PREVIOUS_RESTART_SECS {
+            self.position = 0.0;
+        } else {
+            self.goto(i.saturating_sub(1));
+        }
+    }
+    fn queue_index(&self) -> Option<usize> {
+        self.index
+    }
+    fn events(&mut self) -> Vec<PlayerEvent> {
+        std::mem::take(&mut self.events)
+    }
     fn tick(&mut self, now: f64) {
         let dt = self.last.map_or(0.0, |l| (now - l).max(0.0));
         self.last = Some(now);
         let Some(b) = self.buffer() else { return };
         let complete = b.bytes >= b.total;
+        if let Some(i) = self.index
+            && i + 1 < self.queue.len()
+            && !self.prefetched
+            && (b.duration - self.position <= goalseek_audio::PREFETCH_REMAINING_SECS
+                || (complete && self.position > b.duration / 2.0))
+        {
+            self.prefetched = true;
+            let id = self.queue[i + 1].id.clone();
+            self.events
+                .push(PlayerEvent::PrefetchNext { index: i + 1, id });
+        }
         match self.state {
             PlayState::Buffering if complete || b.secs() > self.position + 1.0 => {
                 self.state = PlayState::Playing
@@ -938,6 +1239,15 @@ impl Playback for FakePlayer {
                     (self.position + dt).min(if complete { b.duration } else { b.secs() });
                 if self.position >= b.duration {
                     self.state = PlayState::Ended;
+                    if let Some(i) = self.index {
+                        self.events.push(PlayerEvent::Ended);
+                        self.events.push(PlayerEvent::TrackEnded { index: i });
+                        if i + 1 < self.queue.len() {
+                            self.goto(i + 1);
+                        } else {
+                            self.events.push(PlayerEvent::QueueEnded);
+                        }
+                    }
                 } else if !complete && self.position >= b.secs() - 0.05 {
                     self.state = PlayState::Buffering;
                 }
