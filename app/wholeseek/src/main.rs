@@ -324,7 +324,8 @@ fn scene_file_menu(s: &mut App) {
     scene_results(s);
     folders_layout(s);
     demo_recent_dirs(s);
-    let f = demo_file("alice", "03 Low Tide Radio.flac");
+    let f = demo_file("dj_ivo", "Hollow Lights - Salt Roads.mp3");
+    s.tab_mut().selected = Some(f.path.clone()); // its ⋯ shows, as when clicked
     let items = crate::menu::file_items(&f, false, &s.backend.settings().recent_download_dirs);
     let key = crate::view::files_more_key(s.tab().id, &f.path);
     s.open_menu(crate::menu::MenuAnchor::Key(key), items);

@@ -26,12 +26,10 @@ use crate::tabs::TabKind;
 pub const PLAYER: f32 = 44.0;
 /// Search inspector / user folder header cover.
 pub const HEADER: f32 = 104.0;
-/// Folder row thumbnail (only when cached). Rows are not wired yet (v0.1.2 ships without).
-#[allow(dead_code)]
-pub const ROW: f32 = 28.0;
-/// Height of a folder row that shows a thumbnail.
-#[allow(dead_code)]
-pub const ROW_H: f32 = 32.0;
+/// Album row thumbnail (fixed slot; rows are 48 pt). Only when cached.
+pub const ROW: f32 = 32.0;
+/// Thumbnail in dense 22–24 pt rows (search folder lines, user folder tree).
+pub const SMALL: f32 = 16.0;
 /// Decoded handles kept at most (folder rows of a long list).
 const MAX_HANDLES: usize = 256;
 
@@ -63,6 +61,9 @@ pub struct Art {
     ready_handles: usize,
     embedded: Embedded,
     results: (Sender<ArtResult>, Receiver<ArtResult>),
+    /// Tests: a cover cache for a backend that has none (the demo).
+    #[cfg(test)]
+    pub test_covers: Option<Covers>,
 }
 
 impl Default for Art {
@@ -84,6 +85,8 @@ impl Default for Art {
             ready_handles: 0,
             embedded: Embedded::default(),
             results: mpsc::channel(),
+            #[cfg(test)]
+            test_covers: None,
         }
     }
 }
@@ -121,9 +124,18 @@ impl Art {
     }
 }
 
+/// The backend's cover cache (or a test's).
+fn covers_of(s: &App) -> Option<&Covers> {
+    #[cfg(test)]
+    if let Some(c) = &s.art.test_covers {
+        return Some(c);
+    }
+    s.backend.covers()
+}
+
 /// The cover of (user, folder) if it is cached and decoded. Memory only.
 pub fn cached_image(s: &App, username: &str, folder: &str) -> Option<Image> {
-    let path = s.backend.covers()?.cached(username, folder)?;
+    let path = covers_of(s)?.cached(username, folder)?;
     s.art.image(&path)
 }
 
@@ -146,17 +158,21 @@ pub fn cover(s: &App, key: &str, username: &str, folder: &str, size: f32, t: &Th
     }
 }
 
-/// A folder row's thumbnail, only when the cover is already cached and decoded; `None` keeps
-/// the row as it was. Never asks for a fetch.
-#[allow(dead_code)]
-pub fn row_thumb(s: &App, key: &str, username: &str, folder: &str) -> Option<El> {
+/// A row's thumbnail of `size`, only when the cover is already cached and decoded; `None`
+/// draws nothing. Never asks for a fetch.
+pub fn row_thumb(s: &App, key: &str, username: &str, folder: &str, size: f32) -> Option<El> {
     let img = cached_image(s, username, folder)?;
     Some(
         el().key(key.to_string())
-            .size(ROW, ROW)
-            .radius(4.0)
+            .size(size, size)
+            .radius(if size < 20.0 { 2.0 } else { 4.0 })
             .pixels_fit(img.pixels(), SurfaceFit::Fill),
     )
+}
+
+/// A fixed `size` slot (album rows): the cached thumbnail, or empty — the row never moves.
+pub fn row_slot(s: &App, key: &str, username: &str, folder: &str, size: f32) -> El {
+    row_thumb(s, key, username, folder, size).unwrap_or_else(|| el().size(size, size))
 }
 
 fn is_image(path: &str) -> bool {
@@ -173,7 +189,7 @@ impl App {
     /// per change), try the playing file's embedded art, and notice covers that landed or
     /// decoded. Returns true if something visible changed.
     pub fn sync_covers(&mut self) -> bool {
-        let Some(covers) = self.backend.covers().cloned() else {
+        let Some(covers) = covers_of(self).cloned() else {
             return false;
         };
         let mut changed = false;
@@ -307,7 +323,7 @@ pub const GAP: f32 = 14.0;
 /// cover up with the header's text. Only while a cover exists or is being fetched (a plain
 /// square then); no cover known → just the header, no space spent.
 pub fn above(s: &App, username: &str, folder: &str, inset: f32, header: El, t: &Theme) -> El {
-    let square = match s.backend.covers().map(|c| c.state(username, folder)) {
+    let square = match covers_of(s).map(|c| c.state(username, folder)) {
         Some(CoverState::Ready(_)) => match cached_image(s, username, folder) {
             Some(_) => cover(s, "header-cover", username, folder, HEADER, t),
             // Decoding: a plain square for a moment.
@@ -345,4 +361,93 @@ pub fn beside(s: &App, username: &str, folder: &str, inset: f32, header: El, t: 
             t,
         )))
         .child(rune::col().grow(1.0).shrink().min_w(0.0).child(header))
+}
+
+#[cfg(test)]
+mod tests {
+    use rune::{Env, Runtime};
+    use wholeseek_core::{CoverState, Covers};
+
+    use crate::app::App;
+    use crate::{poll, view};
+
+    fn png() -> Vec<u8> {
+        wholeseek_core::cover::test_png(2, 2)
+    }
+
+    fn run(rt: &mut Runtime<App>, secs: f64) {
+        for _ in 0..(secs * 60.0).round() as usize {
+            rt.frame(1.0 / 60.0);
+        }
+    }
+
+    fn title_y(rt: &Runtime<App>) -> f32 {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("details-title"))
+            .expect("inspector title")
+            .rect[1]
+    }
+
+    fn has_square(rt: &Runtime<App>) -> bool {
+        rt.elements()
+            .into_iter()
+            .any(|e| e.key.as_deref() == Some("header-cover"))
+    }
+
+    /// No cover known → no space; fetching → a square; cached → the image.
+    #[test]
+    fn inspector_cover_takes_space_only_when_there_is_one() {
+        let dir = std::env::temp_dir().join(format!("wholeseek-art-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let covers = Covers::open(&dir);
+        let mut app = App::demo();
+        app.art.test_covers = Some(covers.clone());
+        let mut rt = Runtime::new(
+            app,
+            view::view,
+            (1920.0, 1080.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        rt.poll = Some(poll);
+        rt.frame(0.0);
+        rt.state.demo_login();
+        run(&mut rt, 1.0);
+        rt.update(|s, _| s.search_for("hollow lights"));
+        run(&mut rt, 1.6);
+        let f = crate::demo_file("alice", "02 Salt Roads.flac");
+        let (u, d) = (f.username.clone(), f.folder().to_string());
+        let pick = (u.clone(), d.clone());
+        rt.update(move |s, _| s.tab_mut().group = Some(pick.clone()));
+        run(&mut rt, 0.1);
+
+        assert_eq!(covers.state(&u, &d), CoverState::Unknown);
+        assert!(!has_square(&rt), "no cover known: nothing drawn");
+        let bare = title_y(&rt);
+
+        assert!(covers.mark_pending(&u, &d));
+        rt.frame(1.0 / 60.0);
+        assert!(has_square(&rt), "fetching: a plain square");
+        assert!(
+            title_y(&rt) >= bare + super::HEADER,
+            "the square sits above the title"
+        );
+        assert!(super::cached_image(&rt.state, &u, &d).is_none());
+
+        let path = covers.store_embedded(&u, &d, &png()).unwrap();
+        let img = rt.state.art.image(&path);
+        assert!(img.is_none(), "first ask starts the decode");
+        let handle = rt.state.art.handles.borrow().get(&path).cloned().unwrap();
+        handle.wait().expect("decodes");
+        rt.frame(1.0 / 60.0);
+        assert!(
+            super::cached_image(&rt.state, &u, &d).is_some(),
+            "cached: the image"
+        );
+        assert!(has_square(&rt));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

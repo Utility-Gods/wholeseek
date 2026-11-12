@@ -2455,3 +2455,26 @@ fn folder_download_and_cover_fetch_share_the_reply() {
         h.core.covers().cached("alice", r"Music\Album").is_some()
     });
 }
+
+/// Two spellings of one folder (case, slashes): the peer answers one of them; both waiters
+/// get that reply instead of one falling back to a full browse.
+#[test]
+fn folder_reply_reaches_waiters_with_another_spelling() {
+    let mut h = harness();
+    let s = h.online();
+    let b = h.tmp.path().join("b");
+    h.core.download_folder("alice", r"Music\Album");
+    h.core.download_folder_to("alice", "music/album", &b);
+    wait_until("2 requests", || s.st().folder_requests.len() == 2);
+    s.st().folders.insert(
+        ("alice".into(), "music/album".into()),
+        vec![dir(r"Music\Album", &["01.flac"])],
+    );
+    h.want("contents", |e| {
+        matches!(e, CoreEvent::FolderContents { .. })
+    });
+    for _ in 0..2 {
+        h.want("queued", |e| matches!(e, CoreEvent::TransferQueued { .. }));
+    }
+    assert!(s.st().browse_requests.is_empty(), "no browse fallback");
+}

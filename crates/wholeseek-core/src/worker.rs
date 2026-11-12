@@ -1309,7 +1309,9 @@ impl Worker {
             .map(|f| (f.username.clone(), f.folder.clone()))
             .chain(self.covers.listing_waits())
         {
-            if !asked.iter().any(|(au, ad)| *au == u && same_folder(ad, &d)) {
+            // Each spelling was requested as typed and the library keys replies exactly, so
+            // look each one up; a reply then goes to every same_folder waiter below.
+            if !asked.iter().any(|(au, ad)| *au == u && *ad == d) {
                 asked.push((u, d));
             }
         }

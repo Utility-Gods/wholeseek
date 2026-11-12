@@ -807,7 +807,10 @@ fn folder_line(
             let items = s.folder_menu(&u, &d);
             super::menu::at_point(s, p, items);
         })
-        .child(icons::folder(icons::SM, t.text_secondary));
+        .child(
+            super::art::row_thumb(s, "thumb", username, folder, super::art::SMALL)
+                .unwrap_or_else(|| icons::folder(icons::SM, t.text_secondary)),
+        );
     for (k, seg) in shown.into_iter().enumerate() {
         if k > 0 {
             r = r.child(text("/").font(META).color(t.text_secondary.alpha(0.6)));

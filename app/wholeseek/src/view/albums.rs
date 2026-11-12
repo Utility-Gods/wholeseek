@@ -246,6 +246,7 @@ fn album_row(
     let r = frame(format!("album-{i}"), 48.0, best, sel, play, t)
         .help(fmt::crumbs(&d))
         .child(play_button(s, &files, "Play album", t))
+        .child(super::art::row_slot(s, "thumb", &u, &d, super::art::ROW))
         .child(
             col()
                 .grow(1.0)

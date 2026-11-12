@@ -83,14 +83,14 @@ pub fn page(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
             .w_full()
             .grow(1.0)
             .min_h(0.0)
-            .child(tree(tab, b, t))
+            .child(tree(s, tab, b, t))
             .child(vline(t))
             .child(folder(s, tab, b, t))
     };
     page.child(body)
 }
 
-fn tree(tab: &Tab, b: &BrowseView, t: &Theme) -> El {
+fn tree(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
     let filter = field_box(
         "tree-filter",
         input(&b.filter, "Filter folders", t)
@@ -133,6 +133,10 @@ fn tree(tab: &Tab, b: &BrowseView, t: &Theme) -> El {
                     .truncate()
                     .shrink(),
             );
+        // Cached covers only, at the row's end (the name never moves).
+        if let Some(th) = super::art::row_thumb(s, "thumb", &b.username, &path, super::art::SMALL) {
+            r = r.child(rune::el().grow(1.0)).child(th);
+        }
         r = if selected {
             r.fill(t.hover).child(
                 rune::el()

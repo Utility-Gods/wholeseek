@@ -132,6 +132,16 @@ pub fn downscale(bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// A `w`×`h` orange PNG (tests).
+#[doc(hidden)]
+#[must_use]
+pub fn test_png(w: u32, h: u32) -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(w, h, image::Rgb([251, 146, 60]));
+    let mut out = std::io::Cursor::new(Vec::new());
+    let _ = img.write_to(&mut out, image::ImageFormat::Png);
+    out.into_inner()
+}
+
 /// Called after any cover changes state (the app passes its window waker).
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
@@ -320,6 +330,12 @@ impl Covers {
         self.index().pending.insert(key.to_string());
         self.notify();
         true
+    }
+
+    /// Mark (user, folder) as being fetched if nothing is known about it (tests, previews).
+    #[doc(hidden)]
+    pub fn mark_pending(&self, username: &str, folder: &str) -> bool {
+        self.begin(&cover_key(username, folder))
     }
 
     /// A pending fetch was dropped without an answer (session ended): back to unknown.

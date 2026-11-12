@@ -679,3 +679,325 @@ fn live_search_arrival_times() {
         )
     }
 }
+
+/// Release check (0.1.3): normalize + broaden, `download_to`, two concurrent
+/// `download_folder_to` of one folder (the fan-out), and history after each.
+/// Prints PASS/FAIL per step; peers are shown as `peer#n`, never by name.
+/// Optional: WHOLESEEK_LISTEN_PORT (default 2240), WHOLESEEK_QUERY.
+#[test]
+#[ignore = "live Soulseek network; needs WHOLESEEK_USER/WHOLESEEK_PASS and permission"]
+fn live_release_check() {
+    use std::collections::HashMap;
+    use wholeseek_core::{HistoryQuery, Outcome, TransferId};
+
+    let mut peers: HashMap<String, usize> = HashMap::new();
+    let mut peer = |u: &str| {
+        let n = peers.len() + 1;
+        format!("peer#{}", *peers.entry(u.to_string()).or_insert(n))
+    };
+    let mut fails = Vec::new();
+    let mut step = |name: &str, ok: bool, detail: String| {
+        println!(
+            "STEP {} | {name} | {detail}",
+            if ok { "PASS" } else { "FAIL" }
+        );
+        if !ok {
+            fails.push(name.to_string());
+        }
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let settings = Settings {
+        download_dir: tmp.path().join("downloads"),
+        cache_dir: tmp.path().join("cache"),
+        data_dir: tmp.path().join("data"),
+        listen_port: port("WHOLESEEK_LISTEN_PORT", 2240),
+        ..Settings::default()
+    };
+    let (mut core, ev) = Core::start(settings).expect("start");
+    core.login(creds());
+    let e = want(&ev, Duration::from_secs(60), "Connected", |e| {
+        matches!(
+            e,
+            CoreEvent::Connected { .. } | CoreEvent::Disconnected { .. }
+        )
+    });
+    let connected = matches!(e, Some(CoreEvent::Connected { .. }));
+    step(
+        "login",
+        connected,
+        format!("{:?}", e.map(|e| matches!(e, CoreEvent::Connected { .. }))),
+    );
+    assert!(connected);
+
+    let collect = |id, secs| {
+        let mut hits: Vec<SearchHit> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match ev.recv_timeout(left) {
+                Ok(CoreEvent::SearchResults { search, hits: h }) if search == id => hits.extend(h),
+                Ok(CoreEvent::SearchFinished { search, .. }) if search == id => break,
+                _ => {}
+            }
+        }
+        hits
+    };
+
+    // 1. Normalize: punctuation goes on the wire as spaces.
+    let q = std::env::var("WHOLESEEK_QUERY").unwrap_or_else(|_| "wasn't me shaggy".into());
+    let id = core.search(&q);
+    let mut hits = collect(id, 45);
+    let info = core.search_info(id).expect("search_info");
+    step(
+        "search normalize",
+        info.sent == "wasn t me shaggy" || q != "wasn't me shaggy",
+        format!(
+            "typed {:?} sent {:?}; {} hits",
+            info.typed,
+            info.sent,
+            hits.len()
+        ),
+    );
+    step(
+        "search results",
+        !hits.is_empty(),
+        format!("{} audio hits", hits.len()),
+    );
+
+    // 2. Broaden: a zero-result query is re-run once, accents folded and 1-char words dropped.
+    let mut broadened = None;
+    for bq in [
+        "bjórk jóga q",
+        "sigur rós svefn-g-englar z",
+        "aphéx twin windowlicker q z",
+    ] {
+        let id = core.search(bq);
+        let n = collect(id, 70).len();
+        let info = core.search_info(id).expect("search_info");
+        println!(
+            "   broaden probe {bq:?}: sent {:?} → broadened_to {:?}, {n} hits",
+            info.sent, info.broadened_to
+        );
+        if info.broadened_to.is_some() {
+            broadened = Some((bq, info.broadened_to.clone(), n));
+            break;
+        }
+    }
+    step(
+        "search broaden",
+        broadened.as_ref().is_some_and(|b| b.2 > 0),
+        format!("{broadened:?}"),
+    );
+
+    // 3. download_to: smallest free-slot hits first, into a temp dir; history after.
+    wholeseek_core::rank::rank(&mut hits, true);
+    let mut cands: Vec<&SearchHit> = hits
+        .iter()
+        .filter(|h| h.free_slot && h.file.size < 15_000_000)
+        .collect();
+    cands.sort_by_key(|h| std::cmp::Reverse(h.speed));
+    let to_dir = tmp.path().join("chosen");
+    let mut got = None;
+    for c in cands.iter().take(6) {
+        let id = core.download_to(&c.file, &to_dir);
+        let e = want(&ev, Duration::from_secs(90), "done/failed", |e| match e {
+            CoreEvent::TransferDone { id: i, .. } | CoreEvent::TransferFailed { id: i, .. } => {
+                *i == id
+            }
+            _ => false,
+        });
+        match e {
+            Some(CoreEvent::TransferDone { path, .. }) => {
+                got = Some((c.file.clone(), path));
+                break;
+            }
+            other => {
+                println!(
+                    "   {} from {}: {other:?}",
+                    c.file.path,
+                    peer(&c.file.username)
+                );
+                core.cancel(id);
+            }
+        }
+    }
+    let ok = got
+        .as_ref()
+        .is_some_and(|(_, p)| p.parent() == Some(to_dir.as_path()) && p.is_file());
+    step(
+        "download_to (flat)",
+        ok,
+        format!(
+            "{:?}",
+            got.as_ref().map(|(f, p)| (
+                peer(&f.username),
+                p.strip_prefix(tmp.path()).ok().map(Path::to_path_buf)
+            ))
+        ),
+    );
+    if let Some((f, p)) = &got {
+        let h = core.history(&HistoryQuery::default());
+        let e = h.iter().find(|e| e.remote_path == f.path);
+        step(
+            "history after download_to",
+            e.is_some_and(|e| {
+                e.outcome == Outcome::Done
+                    && e.local_path.as_deref() == Some(p.as_path())
+                    && e.exists_on_disk()
+            }) && core.was_downloaded(&f.username, &f.path)
+                && core
+                    .downloaded_keys()
+                    .contains(&(f.username.clone(), f.path.clone())),
+            format!(
+                "{} rows; outcomes {:?}",
+                h.len(),
+                h.iter().map(|e| e.outcome).collect::<Vec<_>>()
+            ),
+        );
+    }
+
+    // 4. Two download_folder_to of one small folder at once (fan-out).
+    let mut folders: HashMap<(String, String), (usize, u64, bool)> = HashMap::new();
+    for h in &hits {
+        let dir = h
+            .file
+            .path
+            .rsplit_once('\\')
+            .map_or("", |p| p.0)
+            .to_string();
+        let e = folders.entry((h.file.username.clone(), dir)).or_default();
+        e.0 += 1;
+        e.1 += h.file.size;
+        e.2 = h.free_slot;
+    }
+    let mut small: Vec<_> = folders
+        .into_iter()
+        .filter(|(_, (n, sz, free))| *free && *n <= 3 && *sz < 40_000_000)
+        .collect();
+    small.sort_by_key(|(_, (_, sz, _))| *sz);
+    let (a, b) = (tmp.path().join("fan a"), tmp.path().join("fan b"));
+    let mut fan_ok = false;
+    for ((user, folder), (nfiles, _, _)) in small.iter().take(4) {
+        let before = core.history(&HistoryQuery::default()).len();
+        core.download_folder_to(user, folder, &a);
+        core.download_folder_to(user, folder, &b);
+        let mut contents = 0;
+        let mut queued: Vec<(TransferId, std::path::PathBuf)> = Vec::new();
+        let (mut done, mut failed, mut refused) = (Vec::new(), 0, 0);
+        let deadline = Instant::now() + Duration::from_secs(150);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match ev.recv_timeout(left) {
+                Ok(CoreEvent::FolderContents { username, .. }) if &username == user => {
+                    contents += 1
+                }
+                Ok(CoreEvent::TransferQueued {
+                    id,
+                    file,
+                    part_path,
+                    ..
+                }) if &file.username == user => {
+                    queued.push((id, part_path));
+                }
+                Ok(CoreEvent::TransferDone { id, path }) if queued.iter().any(|q| q.0 == id) => {
+                    done.push(path)
+                }
+                Ok(CoreEvent::TransferFailed { id, reason })
+                    if queued.iter().any(|q| q.0 == id) =>
+                {
+                    if reason.contains("already being downloaded") {
+                        refused += 1;
+                    } else {
+                        failed += 1;
+                        println!("   fan-out transfer failed: {reason}");
+                    }
+                }
+                Ok(CoreEvent::Error { context, message }) => println!(
+                    "  [error {context}] {}",
+                    message.replace(user.as_str(), "<peer>")
+                ),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            if !queued.is_empty() && done.len() + failed + refused == queued.len() {
+                break;
+            }
+        }
+        let rel = |p: &std::path::PathBuf| {
+            p.strip_prefix(tmp.path())
+                .map_or_else(|_| p.clone(), Path::to_path_buf)
+        };
+        println!(
+            "   folder of {} ({nfiles} files in results): FolderContents×{contents}, queued {}, done {:?}, refused {refused}, failed {failed}",
+            peer(user),
+            queued.len(),
+            done.iter().map(rel).collect::<Vec<_>>()
+        );
+        for (id, _) in &queued {
+            core.cancel(*id);
+        }
+        if done.is_empty() {
+            continue;
+        }
+        let in_a = done.iter().filter(|p| p.starts_with(&a)).count();
+        let in_b = done.iter().filter(|p| p.starts_with(&b)).count();
+        let foldered = done.iter().all(|p| {
+            p.parent()
+                .and_then(Path::parent)
+                .is_some_and(|d| d == a || d == b)
+        });
+        step(
+            "download_folder ×2 fan-out",
+            contents <= 1 && queued.len() >= 2 && foldered && failed == 0,
+            format!(
+                "FolderContents×{contents}; queued {}; done in a {in_a}, in b {in_b}; refused dup {refused}; all in <root>/<album>/: {foldered}",
+                queued.len()
+            ),
+        );
+        let h = core.history(&HistoryQuery::default());
+        let new = &h[..h.len() - before];
+        step(
+            "history after folder downloads",
+            new.iter().filter(|e| e.outcome == Outcome::Done).count() == done.len()
+                && new.iter().all(|e| {
+                    e.reason
+                        .as_deref()
+                        .is_none_or(|r| !r.contains("already being downloaded"))
+                }),
+            format!(
+                "{} new rows: {:?}",
+                new.len(),
+                new.iter()
+                    .map(|e| (e.outcome, e.album.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        fan_ok = true;
+        break;
+    }
+    if !fan_ok {
+        step(
+            "download_folder ×2 fan-out",
+            false,
+            format!("no folder finished ({} tried)", small.len().min(4)),
+        );
+    }
+
+    // 5. History survives a restart.
+    let n = core.history(&HistoryQuery::default()).len();
+    core.logout();
+    drop(core);
+    let (core2, _ev2) = Core::start(Settings {
+        download_dir: tmp.path().join("downloads"),
+        cache_dir: tmp.path().join("cache"),
+        data_dir: tmp.path().join("data"),
+        listen_port: port("WHOLESEEK_LISTEN_PORT", 2240),
+        ..Settings::default()
+    })
+    .unwrap();
+    let m = core2.history(&HistoryQuery::default()).len();
+    step(
+        "history reload",
+        n == m && n > 0,
+        format!("{n} rows before, {m} after restart"),
+    );
+    assert!(fails.is_empty(), "failed steps: {fails:?}");
+}
