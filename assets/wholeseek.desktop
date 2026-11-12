@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=wholeseek
+Comment=Minimal Soulseek client for music
+Exec=wholeseek
+Icon=wholeseek
+Terminal=false
+Categories=AudioVideo;Audio;P2P;
+StartupWMClass=wholeseek

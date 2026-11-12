@@ -1,4 +1,4 @@
-# goalseek — MVP
+# wholeseek — MVP
 
 Status: **final**. License: **MIT**. Platform: **Linux** (Rune is cross-platform; others later).
 
@@ -53,17 +53,17 @@ Chat/rooms, private messages, wishlist, buddies, playlists/queue, library, tags,
 | UI | [Rune](https://github.com/anomalyco/rune) (pinned `dev` rev) | Native GPU Rust UI, headless render/test. Pre-release accepted. |
 | Audio | symphonia (FLAC/MP3/OGG/M4A decode) + cpal (output) | Pure Rust, FLAC-first. |
 | Secrets | `keyring` crate | Password not stored in plain config. |
-| Config | TOML in `~/.config/goalseek/` | Simple. |
+| Config | TOML in `~/.config/wholeseek/` | Simple. |
 
 Rejected: slskd sidecar (.NET runtime, second process, AGPL); writing our own protocol (unnecessary given soulseek-rs-lib).
 
 ## Architecture
 
 ```
-goalseek/
-├─ crates/goalseek-core   session wrapper over soulseek-rs-lib, search/browse/transfer state, config, cache
-├─ crates/goalseek-audio  play a growing file: wait-for-bytes reader → symphonia → cpal
-└─ app/goalseek           Rune UI
+wholeseek/
+├─ crates/wholeseek-core   session wrapper over soulseek-rs-lib, search/browse/transfer state, config, cache
+├─ crates/wholeseek-audio  play a growing file: wait-for-bytes reader → symphonia → cpal
+└─ app/wholeseek           Rune UI
 ```
 
 The UI never blocks: core runs the client on its own thread(s) and sends events to the UI state.
@@ -82,4 +82,4 @@ The UI never blocks: core runs the client on its own thread(s) and sends events 
 - Search → results in seconds → ▶ a FLAC starts within a few seconds of transfer start; nothing appears in downloads.
 - ↓ on the same track saves it (reusing the cache when complete).
 - Open a user → browse → ▶ and ↓ work there too.
-- Another client (e.g. Nicotine+) can browse and download from goalseek.
+- Another client (e.g. Nicotine+) can browse and download from wholeseek.

@@ -1,4 +1,3 @@
 /target/
+/proof/
 .agents/turable/
-# Large binary proof artifacts stay local
-proof/**/*.wav

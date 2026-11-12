@@ -1,0 +1,10 @@
+[package]
+name = "wholeseek"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rune = { workspace = true, features = ["native-file-dialog"] }
+wholeseek-core = { workspace = true }
+wholeseek-audio = { workspace = true }

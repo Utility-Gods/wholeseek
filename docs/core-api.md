@@ -1,4 +1,4 @@
-# goalseek-core — library survey & core API (CP0, implemented in CP1)
+# wholeseek-core — library survey & core API (CP0, implemented in CP1)
 
 Library: `soulseek-rs-lib` @ `434dcc0155ed87203cafcd1cf7b1a1073f88a63d` (lib crate `soulseek_rs`).
 File references are relative to `soulseek-rs-lib/src/` in that revision unless prefixed
@@ -29,7 +29,7 @@ credentials authorised at CP0).
   `mpsc::Receiver<DownloadStatus>` per download, `client/downloads.rs:112-182`). Search results,
   browse listings, folder contents, uploads, session loss and share counts are read by calling
   accessors (`get_search_results`, `take_browse_result`, `take_folder_contents`, `uploads`,
-  `take_upload_events`, `session_loss`, `shared_counts`). goalseek-core therefore polls on a tick.
+  `take_upload_events`, `session_loss`, `shared_counts`). wholeseek-core therefore polls on a tick.
 - Logging: a global logger to stderr (ANSI colours), configured by env `LOG_LEVEL`/`RUST_LOG`
   and `LOG_FILE`; `Client::with_settings` calls `logger::init()` (`client/mod.rs:693`,
   `utils/logger.rs:41-95`). Default level Warn. Login logs the username only
@@ -89,7 +89,7 @@ no failure/timeout signal for a browse that never answers.
 - Paths: `final = expand_tilde(dir) / basename(remote)`; `part = final + ".part"`
   (`peer/download_peer.rs:74-125`, `utils/path.rs:7-17`). `part_path_of` exists but is in a
   `pub(crate)` module (`peer/download_peer.rs:85`, `lib.rs:15`) — we reproduce the rule in
-  `goalseek_core::paths` (unit-tested).
+  `wholeseek_core::paths` (unit-tested).
 - Write path: `PartFile::open` creates parent dirs, **resumes an existing smaller `.part`**
   (appends, requests offset), restarts one ≥ size (`peer/download_peer.rs:137-165`); writes are
   unbuffered `File::write_all` (`:169-178`), so bytes are visible to another reader immediately.
@@ -153,7 +153,7 @@ No separate rescan call: rescan = `set_shared_directories(same dirs)`.
 | # | Gap | Impact | Proposed handling |
 |---|---|---|---|
 | G1 | No upload speed limit (only `set_download_speed_limit`). | Settings "speed limit" (MVP) can't be honoured. | **Decided (TL): deferred, out of MVP.** Upload slot cap only; the library is not patched. `Settings` has no upload-limit field. |
-| G2 | No UPnP/NAT-PMP in the lib; MVP doc credits the lib with it. | Firewalled users unreachable without manual forwarding. | **Decided (TL): goalseek-core owns port mapping — CP1 item.** Port `soulseek-rs/src/port_mapping/{mod,nat_pmp}.rs` (MIT) into goalseek-core, keeping the soulseek-rs copyright/MIT attribution notice in the ported file; UPnP via `igd-next`, NAT-PMP std-only. See §3.1. |
+| G2 | No UPnP/NAT-PMP in the lib; MVP doc credits the lib with it. | Firewalled users unreachable without manual forwarding. | **Decided (TL): wholeseek-core owns port mapping — CP1 item.** Port `soulseek-rs/src/port_mapping/{mod,nat_pmp}.rs` (MIT) into wholeseek-core, keeping the soulseek-rs copyright/MIT attribution notice in the ported file; UPnP via `igd-next`, NAT-PMP std-only. See §3.1. |
 | G3 | Events are polled, not pushed (except per-download status). | Need a worker with a tick (~150 ms). | `Core` worker polls; emits deltas. |
 | G4 | No public non-blocking network search; results keyed by query string (same query twice shares/replaces one entry). | Streaming needs a helper thread; duplicate queries collide. | Run `search_with_cancel` on a helper thread with `Arc<Client>`, poll `get_search_results` for deltas; one live search per query string in the core; `forget_search` on cancel/close. |
 | G5 | `.part`/final path not reported; `Completed` carries no path. Same basename into the same dir collides (shared `.part`, resume across unrelated files, rename overwrites). | Must derive paths ourselves; must avoid collisions. | `paths::part_path/final_path` reproduce the rule; per-transfer cache dirs `cache/t<id>/`; downloads into `downloads/<folder>/` with a core-side collision check. |
@@ -164,7 +164,7 @@ No separate rescan call: rescan = `set_shared_directories(same dirs)`.
 | G10 | `connect` and `set_shared_directories` scan shares synchronously on the caller's thread. | Large shares block. | Always called on the core worker, never the UI thread. |
 | G11 | `cancel_download` deletes the `.part` and is keyed by (user, filename). | Cancelling a play and a download of the same file from the same user would hit both. | Core refuses a second concurrent transfer of the same (user, path); ↓ of an in-flight play promotes it (moves on completion) instead. |
 | G12 | Listener silently falls back to an ephemeral port if the configured one is busy. | UPnP/forwarding mismatch. | Report the bound port in `Connected { listen_port }`; settings shows it. |
-| G13 | Library logger writes ANSI to stderr by default. | Noise in a GUI. | App sets `LOG_FILE` (e.g. `~/.cache/goalseek/slsk.log`) or `logger::set_log_level`. |
+| G13 | Library logger writes ANSI to stderr by default. | Noise in a GUI. | App sets `LOG_FILE` (e.g. `~/.cache/wholeseek/slsk.log`) or `logger::set_log_level`. |
 | G14 | Folder contents are keyed by the folder string the peer echoes. | Lookup could miss if a peer echoes a different spelling. | Fall back to the peer's full browse listing. |
 | G15 | Peer UserInfo picture bytes are parsed past and dropped (`PeerInfo::picture_bytes` is only a length). | Profile header cannot show the peer's picture. | `UserProfile.picture` stays `None`; needs an upstream change to keep the bytes (with a cap). |
 
@@ -176,7 +176,7 @@ No separate rescan call: rescan = `set_shared_directories(same dirs)`.
 | G2 | **Done** | `src/port_mapping/` (MIT-attributed port), `CoreEvent::PortMapping { port, outcome }`; started after each login with the bound port when `port_mapping` is on, stopped on logout/reconnect/drop. |
 | G3 | **Done** | Worker tick `POLL_TICK` (150 ms) polls session loss, search counts, browse/folder answers, download status channels, uploads (1 s). |
 | G4 | **Done** | Search window 15 s on a helper thread (`search_with_cancel`); deltas `results[seen..]` ranked per batch; a repeat of a live query ends the old `SearchId` first; `forget_search` on finish/cancel (deferred until the helper returns). Offline/empty query → `Error` + `SearchFinished { total_files: 0 }`. |
-| G5 | **Done** | ▶ into `cache/t<id>/`. ↓ streams into `downloads/.goalseek-partial/t<id>/` and is moved to `downloads/<folder>/` on completion; existing names get ` (1)`, ` (2)` … — never overwritten. `TransferQueued/Progress.part_path` is the real growing file. |
+| G5 | **Done** | ▶ into `cache/t<id>/`. ↓ streams into `downloads/.wholeseek-partial/t<id>/` and is moved to `downloads/<folder>/` on completion; existing names get ` (1)`, ` (2)` … — never overwritten. `TransferQueued/Progress.part_path` is the real growing file. |
 | G6 | **Done** | `Disconnected{Network("… — reconnecting in N s (attempt k)"), will_retry:true}` → reconnect after 2, 5, 15, 30, then 60 s (reset on success); countdown in `status().reconnect` (§3.8). The new session re-announces shares and the bound port at login. `LoginRejected` / `Displaced` / `User` → no retry. Login while connected restarts the session. |
 | G7 | Accepted | `DisconnectReason::LoginRejected`. |
 | G8 | **Done** | ▶ that has received no data within `Settings::play_start_timeout_secs` (default 8 s, counted from that ▶'s own start) → `TransferFailed`, reason starts with `PLAY_STALLED` ("no data from <user> within …"); library transfer cancelled unless a ↓ shares it (§3.5). Browse fails after 60 s, folder contents falls back after 30 s. After 5 s without bytes: `TransferRemoteQueued { place: None }`, then the polled place when known. |
@@ -184,13 +184,13 @@ No separate rescan call: rescan = `set_shared_directories(same dirs)`.
 | G10 | **Done** | `connect` (share scan) on a connect helper thread; `set_shares`/`rescan_shares` on a shares helper thread; offline, `ShareCounts` comes from a local scan. |
 | G11 | **Done** | One library transfer per (user, path); further ▶/↓ subscribe to it. ↓ during ▶ = promotion (cache copy kept, ↓ gets a hard link/copy). ▶ during ↓ gets a hard link to the growing `.part` at its ticket path. Second ↓ of the same file → `TransferFailed("already being downloaded …")`. `cancel` only cancels the library transfer when the last subscriber leaves. |
 | G12 | **Done** | `Connected { listen_port }` = bound port; port mapping uses it. If it differs from `Settings::listen_port`, an `Error { context: "listen_port" }` explains why and `status().listen` keeps `{requested, bound, note}` (§3.8). Reconnects wait (≤ 5 s) for the old session to release the port, so our own previous session no longer causes the fallback. |
-| G13 | **Done** | `goalseek_core::config::init_logging(&default_log_path())` (unsafe: call first in `main`) → `~/.cache/goalseek/slsk.log`, Info level. |
+| G13 | **Done** | `wholeseek_core::config::init_logging(&default_log_path())` (unsafe: call first in `main`) → `~/.cache/wholeseek/slsk.log`, Info level. |
 | G14 | **Done** | Folder contents: exact (case/slash-insensitive) match, else the whole reply; no reply within 30 s → full browse of the user, then the folder is picked from it. |
 | G15 | Open (upstream) | See §3.4; everything else in the profile is served. |
 
 ---
 
-## 3. goalseek-core interface (implemented)
+## 3. wholeseek-core interface (implemented)
 
 Design: one `Core` handle, non-blocking commands, one ordered event channel. A single worker
 thread owns the `soulseek_rs::Client` (in an `Arc` so a search helper thread can poll), receives
@@ -261,7 +261,7 @@ Play / download rules (as implemented):
 - ▶ `play_fetch` → library download into `cache/t<id>/` (ticket paths known immediately; the
   player opens `part_path` after the first `TransferProgress`). Never writes to downloads. A
   complete cached copy of the same (user, path) — also from a previous run, via
-  `cache/t<id>/.goalseek-meta` — is linked into the new ticket dir: `TransferQueued`,
+  `cache/t<id>/.wholeseek-meta` — is linked into the new ticket dir: `TransferQueued`,
   one `TransferProgress { bytes = total }`, `TransferDone`, no network.
 - ↓ `download` → complete in cache: hard link (copy across filesystems) into
   `downloads/<folder>/`, cache untouched. In flight (▶ or ↓): subscribe (G11). Else fetch
@@ -275,7 +275,7 @@ Play / download rules (as implemented):
 
 ### 3.1 Port mapping (G2, done)
 
-- New module `goalseek-core/src/port_mapping/` ported from `soulseek-rs/src/port_mapping/mod.rs`
+- New module `wholeseek-core/src/port_mapping/` ported from `soulseek-rs/src/port_mapping/mod.rs`
   and `nat_pmp.rs` @ 434dcc0. Each ported file keeps a header with the original copyright
   (Michel de Graaf, soulseek-rs, MIT) and the source path/revision.
 - Shape kept from upstream, plus a report callback: `PortMapper::spawn(port, report) -> PortMapper` (background thread, renews at
@@ -285,10 +285,10 @@ Play / download rules (as implemented):
 - The worker starts it after `connect()` with the **bound** port (`Client::listen_port()`, G12)
   when `Settings.port_mapping` is true, and restarts it on reconnect/port change. Outcome surfaces
   as `CoreEvent::PortMapping { port, outcome }` (method `"upnp"`/`"natpmp"`, `external` = `"ip:port"` when UPnP reports it).
-- `igd-next = "0.17"` is a direct dependency in `crates/goalseek-core/Cargo.toml` (not in the
+- `igd-next = "0.17"` is a direct dependency in `crates/wholeseek-core/Cargo.toml` (not in the
   root workspace table; TL may hoist it).
 
-### 3.2 Persistence — `goalseek_core::config` (CP1)
+### 3.2 Persistence — `wholeseek_core::config` (CP1)
 
 Called by the app before `Core::start`; the worker never touches config or keyring.
 
@@ -298,18 +298,18 @@ pub fn save_settings(&Settings) -> io::Result<()>;          // keeps the remembe
 pub fn save_credentials(&Credentials) -> Result<(), KeyringUnavailable>;
 pub fn forget_credentials() -> io::Result<()>;
 // *_in(dir, [&Arc<dyn SecretStore>], …) variants for tests; SecretStore { get, set, delete }
-pub fn config_dir() -> PathBuf;                 // $XDG_CONFIG_HOME/goalseek
-pub fn default_log_path() -> PathBuf;           // $XDG_CACHE_HOME/goalseek/slsk.log
+pub fn config_dir() -> PathBuf;                 // $XDG_CONFIG_HOME/wholeseek
+pub fn default_log_path() -> PathBuf;           // $XDG_CACHE_HOME/wholeseek/slsk.log
 pub unsafe fn init_logging(&Path) -> io::Result<()>;  // G13; first thing in main
 ```
 
 - `config.toml`: `username` + `[settings]` (serde, every field defaulted, so partial files load).
   Atomic write (temp + rename). Invalid TOML → `Err(InvalidData)`.
-- Password only in the OS keyring (service `goalseek`, account = username; Secret Service on Linux
+- Password only in the OS keyring (service `wholeseek`, account = username; Secret Service on Linux
   via the pure-Rust zbus backend). Never in the file, never logged. Each keyring call is bounded by
   `KEYRING_TIMEOUT` (5 s). Unreachable keyring: `load` → `keyring_available: false`,
   `credentials: None`; `save_credentials` → `Err(KeyringUnavailable(msg))` (username is still saved).
-- `Settings::default()`: downloads `$XDG_DOWNLOAD_DIR/goalseek`, cache `$XDG_CACHE_HOME/goalseek`,
+- `Settings::default()`: downloads `$XDG_DOWNLOAD_DIR/wholeseek`, cache `$XDG_CACHE_HOME/wholeseek`,
   cap 1 GiB, port 2234, 10 upload slots, port mapping on.
 
 ### 3.4 User profile (additive)
@@ -347,7 +347,7 @@ pub struct UserProfile {
   (keep the bytes, with a size cap); not forked here.
 - Our side: the library already answers peers' UserInfoRequest itself (`ClientOperation::UserInfoRequested`
   → `build_user_info(upload_slots, upload queue length, has free slot)`, empty description, no
-  picture). Nothing to do in goalseek-core.
+  picture). Nothing to do in wholeseek-core.
 
 ### 3.5 ▶ source fallback (additive)
 
@@ -357,7 +357,7 @@ Live data: many peers that advertise a free slot never send (3 of 4 in one run).
   load). A ▶ that has received **no data** (a progress report with 0 bytes, as the library sends on
   opening the `.part`, does not count) that long after its own start is cancelled and reported as
   **`CoreEvent::TransferFailed { id, reason }`**, with `reason` starting with
-  `goalseek_core::PLAY_STALLED` (`"no data from"`). No new variant: the app matches `CoreEvent`
+  `wholeseek_core::PLAY_STALLED` (`"no data from"`). No new variant: the app matches `CoreEvent`
   exhaustively and is mid-restructure, and every ▶ failure before playback should trigger the same
   fallback anyway. `retry(id)` still works. ↓ is unaffected (keeps waiting in the remote queue); a
   ▶ attached to a ↓ fails on its own deadline but leaves the ↓'s library transfer running.
@@ -372,9 +372,9 @@ Live data: many peers that advertise a free slot never send (3 of 4 in one run).
 
 ### 3.6 Rename prep — `config::migrate_legacy` (additive)
 
-- `config::APP_NAME` (`"goalseek"`) names the config dir, default download/cache dirs, log path and
-  keyring service (`KEYRING_SERVICE = APP_NAME`); `config::LEGACY_APP_NAME` (`"goalseek"`) is the
-  previous name. The Holeseek rename flips `APP_NAME = "holeseek"`, `LEGACY_APP_NAME = "goalseek"`.
+- `config::APP_NAME` (`"wholeseek"`) names the config dir, default download/cache dirs, log path and
+  keyring service (`KEYRING_SERVICE = APP_NAME`); `config::LEGACY_APP_NAME` (`"wholeseek"`) is the
+  previous name. The Wholeseek rename flips `APP_NAME = "wholeseek"`, `LEGACY_APP_NAME = "wholeseek"`.
 - `config::migrate_legacy() -> io::Result<Migration>`: call once at startup, before `load()`.
   Idempotent — does nothing if the names are equal (today), the new config dir exists, or there is
   no old `config.toml`. Otherwise copies `config.toml` to the new dir, replacing `download_dir` /
@@ -444,9 +444,9 @@ unreadable directory reads 0/0. The `ShareCounts` event (totals) is unchanged.
 
 ### 3.9 Folder download skips OS junk (additive)
 
-`goalseek_core::DOWNLOAD_SKIP = ["thumbs.db", "desktop.ini", ".ds_store", "*.url", "._*"]`, matched
+`wholeseek_core::DOWNLOAD_SKIP = ["thumbs.db", "desktop.ini", ".ds_store", "*.url", "._*"]`, matched
 case-insensitively against the basename (`*x` = ends with, `x*` = starts with, else exact), and
-`goalseek_core::is_download_junk(remote_path)`. `Core::download_folder` leaves those files out;
+`wholeseek_core::is_download_junk(remote_path)`. `Core::download_folder` leaves those files out;
 `.cue`, `.log`, `.jpg`, `.png`, `.nfo` and everything else are downloaded. The skip is **silent**:
 no existing event can carry a count without a new variant. `FolderContents` / `BrowseResult`
 still list every file, so the UI can show "N system files skipped" with `is_download_junk`. A
@@ -455,7 +455,7 @@ folder that holds only junk gives `Error { context: "download_folder", "… has 
 
 ### 3.7 Tests
 
-Offline: `cargo test -p goalseek-core` — paths, ranking + `alternates` matching, cache
+Offline: `cargo test -p wholeseek-core` — paths, ranking + `alternates` matching, cache
 scan/eviction plan, config round trip + legacy migration with a temp dir and in-memory keyring,
 backoff, and the worker against a fake session/connector (login/reject/backoff/displaced, search
 deltas, browse timeout, folder fallback, cache-only play, promotion, cache reuse across restart,
@@ -465,19 +465,19 @@ search progress over several batches, cache usage + `clear_cache`, folder junk s
 status at startup and across rescans).
 
 Live (`#[ignore]`, throwaway accounts only, never the user's own; `--nocapture`):
-- `live_core_end_to_end` (`GOALSEEK_USER`/`GOALSEEK_PASS`, `GOALSEEK_LISTEN_PORT`): login, search
-  (`GOALSEEK_QUERY`, default "aphex twin"), top FLAC hits, browse + profile of the top user,
+- `live_core_end_to_end` (`WHOLESEEK_USER`/`WHOLESEEK_PASS`, `WHOLESEEK_LISTEN_PORT`): login, search
+  (`WHOLESEEK_QUERY`, default "aphex twin"), top FLAC hits, browse + profile of the top user,
   `play_fetch` with time to first `TransferProgress`, cancel, downloads dir stays empty.
   Proof: `proof/cp1/live/profile-live.log`.
-- `live_share_upload_between_two_accounts` (+ `GOALSEEK_USER2`/`GOALSEEK_PASS2`,
-  `GOALSEEK_PORT_A`=2241, `GOALSEEK_PORT_B`=2242, ffmpeg): A shares a generated FLAC, B browses A
+- `live_share_upload_between_two_accounts` (+ `WHOLESEEK_USER2`/`WHOLESEEK_PASS2`,
+  `WHOLESEEK_PORT_A`=2241, `WHOLESEEK_PORT_B`=2242, ffmpeg): A shares a generated FLAC, B browses A
   and downloads it, bytes must match, A must emit an `Uploads` row for B. Proof:
   `proof/cp1/live/shares-live.log`.
 
 ## 4. Smoke example
 
-`GOALSEEK_USER=… GOALSEEK_PASS=… cargo run -p goalseek-core --example smoke -- "<query>"`
-(`crates/goalseek-core/examples/smoke.rs`) uses `soulseek_rs::Client` directly: connect, login,
-`search` (window `GOALSEEK_SEARCH_SECS`, default 12), `rank::hits_from_results` + `rank::rank`
+`WHOLESEEK_USER=… WHOLESEEK_PASS=… cargo run -p wholeseek-core --example smoke -- "<query>"`
+(`crates/wholeseek-core/examples/smoke.rs`) uses `soulseek_rs::Client` directly: connect, login,
+`search` (window `WHOLESEEK_SEARCH_SECS`, default 12), `rank::hits_from_results` + `rank::rank`
 (audio-only, FLAC first), prints the top 10, `forget_search`, disconnect. Compiled, **not run**.
-Live test: `crates/goalseek-core/tests/live.rs`, `#[ignore]`d.
+Live test: `crates/wholeseek-core/tests/live.rs`, `#[ignore]`d.

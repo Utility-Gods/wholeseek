@@ -1347,38 +1347,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "goalseek"
-version = "0.1.0"
-dependencies = [
- "goalseek-audio",
- "goalseek-core",
- "rune",
-]
-
-[[package]]
-name = "goalseek-audio"
-version = "0.1.0"
-dependencies = [
- "cpal",
- "goalseek-core",
- "symphonia 0.6.1",
- "tempfile",
-]
-
-[[package]]
-name = "goalseek-core"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "igd-next",
- "keyring",
- "serde",
- "soulseek-rs-lib",
- "tempfile",
- "toml",
-]
-
-[[package]]
 name = "gpu-allocator"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4714,6 +4682,38 @@ dependencies = [
  "raw-window-handle",
  "static_assertions",
  "web-sys",
+]
+
+[[package]]
+name = "wholeseek"
+version = "0.1.0"
+dependencies = [
+ "rune",
+ "wholeseek-audio",
+ "wholeseek-core",
+]
+
+[[package]]
+name = "wholeseek-audio"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "symphonia 0.6.1",
+ "tempfile",
+ "wholeseek-core",
+]
+
+[[package]]
+name = "wholeseek-core"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "igd-next",
+ "keyring",
+ "serde",
+ "soulseek-rs-lib",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
