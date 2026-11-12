@@ -48,7 +48,8 @@ jobs:
           DMG: ${{ steps.dmg.outputs.dmg }}
         run: |
           # Race-safe with the linux job: whoever loses the create sees it exists.
-          gh release create "$TAG" --title "wholeseek $TAG" --generate-notes 2>/dev/null \
+          # Draft until both builds are attached, so /releases/latest never points at a half release.
+          gh release create "$TAG" --draft --title "wholeseek $TAG" --generate-notes 2>/dev/null \
             || gh release view "$TAG" >/dev/null
           # Stable name so websites can link to
           # https://github.com/Utility-Gods/wholeseek/releases/latest/download/wholeseek-macos-apple-silicon.dmg
@@ -102,17 +103,34 @@ jobs:
           TAG: ${{ github.ref_name }}
           TARBALL: ${{ steps.tar.outputs.tarball }}
         run: |
-          gh release create "$TAG" --title "wholeseek $TAG" --generate-notes 2>/dev/null \
+          # Draft until both builds are attached, so /releases/latest never points at a half release.
+          gh release create "$TAG" --draft --title "wholeseek $TAG" --generate-notes 2>/dev/null \
             || gh release view "$TAG" >/dev/null
           # Stable name: .../releases/latest/download/wholeseek-linux-x86_64.tar.gz
           stable="$(dirname "$TARBALL")/wholeseek-linux-x86_64.tar.gz"
           cp "$TARBALL" "$stable"
           gh release upload "$TAG" "$TARBALL" "$stable" --clobber
 
-  verify-site-links:
-    # After both builds are attached, prove the website's download links serve this release.
+  publish:
+    # Both builds are attached: publish the draft and make it the latest release in one step.
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [macos, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release edit "$TAG" --draft=false --latest
+
+  verify-site-links:
+    # After the release is published, prove the website's download links serve it.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [publish]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
