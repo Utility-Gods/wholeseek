@@ -39,6 +39,14 @@ impl App {
         self.menu = None;
         match action {
             MenuAction::Play(f) => self.play(&f),
+            MenuAction::ShowTab(i) => self.activate(i),
+            MenuAction::ToggleFormat(label) => {
+                if let Some(st) = self.tab_mut().search_mut() {
+                    st.filters.toggle(label);
+                    let chosen = st.filters.clone();
+                    self.last_filters = chosen;
+                }
+            }
             MenuAction::Download(f) => self.download(&f),
             MenuAction::DownloadFolder { username, folder } => {
                 self.download_folder(&username, &folder)
@@ -137,6 +145,7 @@ impl App {
     /// Other sources for `file`, best first, at most [`MAX_ALTERNATES`].
     pub(crate) fn alternates_for(&self, file: &RemoteFile) -> Vec<RemoteFile> {
         let mut v = wholeseek_core::rank::alternates(file, &self.all_hits());
+        v.retain(crate::tabs::is_playable);
         v.truncate(MAX_ALTERNATES);
         v
     }

@@ -1,9 +1,10 @@
-//! Audio-only filter and "FLAC first" ordering for search results, plus the
-//! conversion from the library's result type.
+//! Audio-only filter and availability ordering for search results (no format
+//! preference: users pick formats with filters), plus the conversion from the
+//! library's result type.
 
 use crate::model::{AudioAttrs, RemoteFile, SearchHit};
 
-/// Extensions treated as audio. Order is irrelevant; ranking is [`format_rank`].
+/// Extensions treated as audio. Order is irrelevant; ranking never looks at the format.
 pub const AUDIO_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "ogg", "opus", "m4a", "aac", "wav", "aif", "aiff", "alac", "ape", "wv",
 ];
@@ -21,17 +22,6 @@ pub fn extension(path: &str) -> String {
 #[must_use]
 pub fn is_audio(path: &str) -> bool {
     AUDIO_EXTENSIONS.contains(&extension(path).as_str())
-}
-
-/// Lower is better: FLAC, then MP3, then other audio, then anything else.
-#[must_use]
-pub fn format_rank(path: &str) -> u8 {
-    match extension(path).as_str() {
-        "flac" => 0,
-        "mp3" => 1,
-        e if AUDIO_EXTENSIONS.contains(&e) => 2,
-        _ => 3,
-    }
 }
 
 /// Flatten library search responses into hits (one per file).
@@ -54,20 +44,22 @@ pub fn hits_from_results(results: &[soulseek_rs::SearchResult]) -> Vec<SearchHit
         .collect()
 }
 
-/// Apply the MVP's default view: optionally keep only audio, then sort
-/// FLAC first, then MP3, then other audio; within a format, free slot first,
-/// then faster peers, then path for a stable order.
+/// Optionally keep only audio, then order by availability: free slot first,
+/// then faster peer; ties keep their original (arrival) order. The format is
+/// never preferred. With `audio_only` off, non-audio files sort after audio.
+///
+/// Peers' queue lengths are not part of a search response (the library
+/// reports only `slots` and `speed`), so "shorter queue" can't rank here.
 pub fn rank(hits: &mut Vec<SearchHit>, audio_only: bool) {
     if audio_only {
         hits.retain(|h| is_audio(&h.file.path));
     }
+    // Stable sort: equal keys keep arrival order.
     hits.sort_by(|a, b| {
-        format_rank(&a.file.path)
-            .cmp(&format_rank(&b.file.path))
+        is_audio(&b.file.path)
+            .cmp(&is_audio(&a.file.path))
             .then(b.free_slot.cmp(&a.free_slot))
             .then(b.speed.cmp(&a.speed))
-            .then_with(|| a.file.username.cmp(&b.file.username))
-            .then_with(|| a.file.path.cmp(&b.file.path))
     });
 }
 
@@ -177,25 +169,51 @@ mod tests {
         assert_eq!(extension(r"a.dir\noext"), "");
     }
 
-    #[test]
-    fn flac_first_then_mp3_then_other_audio_and_filters_non_audio() {
-        let mut hits = vec![
-            hit(r"x\a.mp3", true, 9),
-            hit(r"x\cover.jpg", true, 9),
-            hit(r"x\b.ogg", true, 9),
-            hit(r"x\c.flac", false, 1),
-            hit(r"x\d.FLAC", true, 1),
-        ];
-        rank(&mut hits, true);
-        let order: Vec<_> = hits.iter().map(|h| h.file.path.as_str()).collect();
-        assert_eq!(order, [r"x\d.FLAC", r"x\c.flac", r"x\a.mp3", r"x\b.ogg"]);
+    fn order(hits: &[SearchHit]) -> Vec<&str> {
+        hits.iter().map(|h| h.file.path.as_str()).collect()
     }
 
     #[test]
-    fn audio_only_off_keeps_everything_last() {
-        let mut hits = vec![hit(r"x\cover.jpg", true, 9), hit(r"x\a.mp3", true, 9)];
+    fn ranking_is_by_availability_not_format_and_filters_non_audio() {
+        let mut hits = vec![
+            hit(r"x\a.flac", false, 9_000),
+            hit(r"x\cover.jpg", true, 9),
+            hit(r"x\b.mp3", true, 100),
+            hit(r"x\c.wav", true, 500),
+            hit(r"x\d.ogg", false, 50),
+        ];
+        rank(&mut hits, true);
+        // Free slot first, then speed; FLAC gets no bonus.
+        assert_eq!(
+            order(&hits),
+            [r"x\c.wav", r"x\b.mp3", r"x\a.flac", r"x\d.ogg"]
+        );
+    }
+
+    #[test]
+    fn same_availability_keeps_arrival_order_whatever_the_format() {
+        let paths = [
+            r"x\1.mp3",
+            r"x\2.flac",
+            r"x\3.wav",
+            r"x\4.opus",
+            r"x\5.FLAC",
+        ];
+        let mut hits: Vec<_> = paths.iter().map(|p| hit(p, true, 100)).collect();
+        rank(&mut hits, true);
+        assert_eq!(order(&hits), paths);
+        // Reversed arrival gives the reversed result: nothing reorders by format.
+        let mut hits: Vec<_> = paths.iter().rev().map(|p| hit(p, true, 100)).collect();
+        rank(&mut hits, true);
+        let reversed: Vec<&str> = paths.iter().rev().copied().collect();
+        assert_eq!(order(&hits), reversed);
+    }
+
+    #[test]
+    fn audio_only_off_keeps_everything_with_non_audio_last() {
+        let mut hits = vec![hit(r"x\cover.jpg", true, 9_999), hit(r"x\a.mp3", false, 1)];
         rank(&mut hits, false);
-        assert_eq!(hits[1].file.path, r"x\cover.jpg");
+        assert_eq!(order(&hits), [r"x\a.mp3", r"x\cover.jpg"]);
     }
 
     #[test]

@@ -241,7 +241,7 @@ pub fn strip(s: &App, t: &Theme) -> El {
     if queue.is_some() {
         controls = controls.child(
             skip("prev", true)
-                .help("Previous (Ctrl+←)")
+                .help(format!("Previous ({})", crate::desktop::chord("←")))
                 .on_press(|s: &mut App| s.previous_track()),
         );
     }
@@ -251,7 +251,10 @@ pub fn strip(s: &App, t: &Theme) -> El {
         controls = controls
             .child(
                 skip("next", false)
-                    .help(next.map_or_else(|| "Next (Ctrl+→)".into(), |n| format!("Next: {n}")))
+                    .help(next.map_or_else(
+                        || format!("Next ({})", crate::desktop::chord("→")),
+                        |n| format!("Next: {n}"),
+                    ))
                     .on_press(|s: &mut App| s.next_track()),
             )
             .child(

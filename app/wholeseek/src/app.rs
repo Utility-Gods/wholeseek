@@ -170,6 +170,14 @@ pub struct App {
     pub desktop_log: Rc<RefCell<Vec<DesktopCall>>>,
     pub menu: Option<Menu>,
     pub drawer: DrawerUi,
+    /// The search filters last chosen; a new search tab starts with them.
+    pub last_filters: crate::tabs::Filters,
+    /// Counts queues started; see [`crate::queue::PlayQueue::generation`].
+    pub queue_generation: u64,
+    /// The top strip's laid-out width and its right cluster's (status, Transfers, ⚙), in
+    /// points; how many tabs fit before the rest go under "»". Infinite until first laid out.
+    pub strip_w: f32,
+    pub strip_right_w: f32,
     /// What plays in order; the player strip shows its current item.
     pub queue: Option<PlayQueue>,
     /// Scroll the highlighted file into view once its folder is listed.
@@ -261,6 +269,10 @@ impl App {
             desktop_log,
             menu: None,
             drawer: DrawerUi::default(),
+            last_filters: crate::tabs::Filters::default(),
+            queue_generation: 0,
+            strip_w: f32::INFINITY,
+            strip_right_w: 0.0,
             queue: None,
             reveal: false,
             status: wholeseek_core::CoreStatus::default(),
@@ -778,10 +790,11 @@ impl App {
 
     /// ＋ / Ctrl+T: an empty search tab, shown.
     pub fn new_search_tab(&mut self) {
+        let filters = self.last_filters.clone();
         self.push_tab(TabKind::Search(SearchTab {
             edit: edit(""),
             search: None,
-            filters: crate::tabs::Filters::default(),
+            filters,
         }));
     }
 

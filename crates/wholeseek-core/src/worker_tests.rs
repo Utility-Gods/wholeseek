@@ -574,8 +574,8 @@ fn search_streams_ranked_deltas_then_finishes_and_forgets() {
     let paths: Vec<_> = hits.iter().map(|h| h.file.path.as_str()).collect();
     assert_eq!(
         paths,
-        [r"y\1.flac", r"y\2.ogg"],
-        "only the delta, audio-only, FLAC first"
+        [r"y\2.ogg", r"y\1.flac"],
+        "only the delta, audio-only, arrival order (ranking is format-neutral)"
     );
     let e = h.want("finished", |e| {
         matches!(e, CoreEvent::SearchFinished { .. })

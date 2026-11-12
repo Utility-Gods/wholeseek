@@ -29,31 +29,33 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
     .grow(1.0)
     .max_w(560.0)
     .child(icons::search(11.0, t.text_secondary));
-    let f = st.filters;
-    let chips = row()
-        .gap(6.0)
-        .center_y()
-        .child(chip(
-            "flac-only",
-            "FLAC only",
-            f.flac_only,
-            |f| f.flac_only = !f.flac_only,
-            t,
-        ))
-        .child(chip(
-            "free-slot",
-            "Free slot",
-            f.free_slot,
-            |f| f.free_slot = !f.free_slot,
-            t,
-        ))
-        .child(chip(
-            "bit-16",
-            "≥16-bit",
-            f.min_16_bit,
-            |f| f.min_16_bit = !f.min_16_bit,
-            t,
-        ));
+    let f = &st.filters;
+    let mut chips = row().key("chips").gap(6.0).center_y();
+    if let Some(v) = &st.search {
+        let counts = v.format_counts(f);
+        let (shown, rest) = counts.split_at(counts.len().min(MAX_FORMAT_CHIPS));
+        for &(label, n) in shown {
+            chips = chips.child(chip(
+                crate::tabs::format_key(label),
+                label,
+                Some(n),
+                f.has(label),
+                move |f| f.toggle(label),
+                t,
+            ));
+        }
+        if !rest.is_empty() {
+            chips = chips.child(more_formats(rest, f, t));
+        }
+    }
+    let chips = chips.child(chip(
+        "free-slot",
+        "Free slot",
+        None,
+        f.free_slot,
+        |f| f.free_slot = !f.free_slot,
+        t,
+    ));
     let mut bar = row()
         .key("search-bar")
         .h(44.0)
@@ -77,7 +79,16 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
                     .grow(1.0)
                     .center()
                     .gap(6.0)
-                    .help("Ctrl+T new tab · Ctrl+W close · Ctrl+Tab switch · Ctrl+L search")
+                    .help({
+                        use crate::desktop::chord;
+                        format!(
+                            "{} new tab · {} close · {} switch · {} search",
+                            chord("T"),
+                            chord("W"),
+                            chord("Tab"),
+                            chord("L")
+                        )
+                    })
                     .child(
                         text("Search Soulseek")
                             .font(type_::TITLE)
@@ -85,8 +96,8 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
                     ),
             );
     };
-    let groups = search.groups(&f);
-    let shown = search.visible(&f);
+    let groups = search.groups(f);
+    let shown = search.visible(f);
     // "128 results · 34 users · searching…" while the core's window is open.
     let searching = !search.finished || s.status.searches.iter().any(|p| p.id == search.id);
     let mut summary = row().gap(8.0).center_y().child(
@@ -223,24 +234,71 @@ pub fn page(s: &App, tab: &Tab, st: &SearchTab, t: &Theme) -> El {
         )
 }
 
-/// A filter toggle. Flipping it filters the results already in; nothing is re-searched.
-fn chip(key: &str, label: &str, on: bool, flip: fn(&mut Filters), t: &Theme) -> El {
+/// Format chips shown before the rest fold into "+N".
+pub const MAX_FORMAT_CHIPS: usize = 7;
+
+/// "+N": the less common formats, toggled from a menu. Lit while one of them is selected.
+fn more_formats(rest: &[(&'static str, usize)], f: &Filters, t: &Theme) -> El {
+    let on = rest.iter().any(|(l, _)| f.has(l));
+    let label = format!("+{}", rest.len());
     let mut c = row()
-        .key(key.to_string())
+        .key("fmt-more")
         .h(22.0)
         .px(8.0)
         .center_y()
         .radius(4.0)
         .border(1.0, if on { t.control_track } else { t.separator })
         .cursor(Cursor::Pointer)
+        .role("button")
+        .label(format!("{} more formats", rest.len()))
+        .hover(t.hover)
+        .press(t.press)
+        .on_press(|s: &mut App| {
+            let items = s.more_format_items();
+            s.open_menu(crate::menu::MenuAnchor::Key("fmt-more".into()), items);
+        })
+        .child(
+            text(label)
+                .font(META)
+                .color(if on { t.text } else { t.text_secondary }),
+        );
+    if on {
+        c = c.fill(t.hover);
+    }
+    c
+}
+
+/// A filter toggle. Flipping it filters the results already in; nothing is re-searched, and
+/// the choice carries over to the next new search tab. `count` (format chips) is shown after
+/// the label; a chip with nothing to show is dimmed but still clickable.
+fn chip(
+    key: &str,
+    label: &str,
+    count: Option<usize>,
+    on: bool,
+    flip: impl Fn(&mut Filters) + 'static,
+    t: &Theme,
+) -> El {
+    let spoken = count.map_or_else(|| label.to_string(), |n| format!("{label} {n}"));
+    let mut c = row()
+        .key(key.to_string())
+        .h(22.0)
+        .px(8.0)
+        .gap(5.0)
+        .center_y()
+        .radius(4.0)
+        .border(1.0, if on { t.control_track } else { t.separator })
+        .cursor(Cursor::Pointer)
         .role("switch")
-        .label(label.to_string())
+        .label(spoken)
         .checked(on)
         .hover(t.hover)
         .press(t.press)
         .on_press(move |s: &mut App| {
             if let Some(st) = s.tab_mut().search_mut() {
                 flip(&mut st.filters);
+                let chosen = st.filters.clone();
+                s.last_filters = chosen;
             }
         })
         .child(text(label.to_string()).font(META).color(if on {
@@ -248,6 +306,17 @@ fn chip(key: &str, label: &str, on: bool, flip: fn(&mut Filters), t: &Theme) -> 
         } else {
             t.text_secondary
         }));
+    if let Some(n) = count {
+        c = c.child(
+            text(n.to_string())
+                .key("n")
+                .font(tnum(META))
+                .color(t.text_secondary),
+        );
+        if n == 0 && !on {
+            c = c.opacity(0.45);
+        }
+    }
     if on {
         c = c.fill(t.hover);
     }
@@ -281,7 +350,8 @@ fn folder_line(key: &str, username: &str, folder: &str, tab: crate::tabs::TabId,
         .hover_group()
         .help(fmt::crumbs(folder))
         .on_secondary_press(move |s: &mut App, p, _| {
-            super::menu::at_point(s, p, crate::menu::folder_items(&u, &d));
+            let items = s.folder_menu(&u, &d);
+            super::menu::at_point(s, p, items);
         })
         .child(icons::folder(11.0, t.text_secondary));
     for (k, seg) in shown.into_iter().enumerate() {
@@ -318,7 +388,7 @@ fn folder_line(key: &str, username: &str, folder: &str, tab: crate::tabs::TabId,
             .label("Folder actions")
             .group_opacity(0.0, 1.0)
             .on_press(move |s: &mut App| {
-                let items = crate::menu::folder_items(&u2, &d2);
+                let items = s.folder_menu(&u2, &d2);
                 s.open_menu(crate::menu::MenuAnchor::Key(more2.clone()), items);
             }),
     )

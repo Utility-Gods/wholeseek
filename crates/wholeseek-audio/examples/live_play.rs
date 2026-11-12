@@ -1,4 +1,4 @@
-//! End-to-end ▶: log in, search, pick the top FLAC hit, fetch it into the cache and play it
+//! End-to-end ▶: log in, search, pick the top-ranked audio hit (any format), fetch it into the cache and play it
 //! through the real output device while it downloads.
 //!
 //! ```sh
@@ -7,6 +7,7 @@
 //!
 //! Optional env: `WHOLESEEK_PLAY_SECS` (how long to listen, default 30), `WHOLESEEK_SEARCH_SECS`
 //! (max wait for results, default 15), `WHOLESEEK_LISTEN_PORT` (default 2234),
+//! `WHOLESEEK_FORMAT` (`flac`, `mp3` or `wav`: only that format; default any audio),
 //! `WHOLESEEK_WORK_DIR` (where the cache and the (watched, must-stay-empty) downloads dir live;
 //! default a fresh dir under the system temp dir). Credentials come only from the environment
 //! and are never printed. Talks to the live Soulseek network — run only with permission.
@@ -99,15 +100,42 @@ fn wait_core<T>(
     }
 }
 
-fn distinct_flac_users(hits: &[SearchHit]) -> usize {
+/// A playable hit: audio of the wanted format (any audio when `format` is `None`), non-empty.
+fn wanted(h: &SearchHit, format: Option<&str>) -> bool {
+    let ext = h.file.extension();
+    h.file.size > 0
+        && wholeseek_core::rank::is_audio(&h.file.path)
+        && format.is_none_or(|f| ext == f)
+}
+
+/// `WHOLESEEK_FORMAT`: one of flac / mp3 / wav, or unset for any audio format.
+fn format_from_env() -> Result<Option<String>, String> {
+    match std::env::var("WHOLESEEK_FORMAT") {
+        Err(_) => Ok(None),
+        Ok(f) if f.trim().is_empty() => Ok(None),
+        Ok(f) => {
+            let f = f.trim().to_ascii_lowercase();
+            if ["flac", "mp3", "wav"].contains(&f.as_str()) {
+                Ok(Some(f))
+            } else {
+                Err(format!(
+                    "WHOLESEEK_FORMAT must be flac, mp3 or wav (got {f:?})"
+                ))
+            }
+        }
+    }
+}
+
+fn distinct_users(hits: &[SearchHit], format: Option<&str>) -> usize {
     hits.iter()
-        .filter(|h| h.file.extension() == "flac" && h.file.size > 0)
+        .filter(|h| wanted(h, format))
         .map(|h| h.file.username.as_str())
         .collect::<BTreeSet<_>>()
         .len()
 }
 
-/// Best untried FLAC (free slot, then speed). Users not tried yet come first; users who only
+/// Best untried wanted hit (free slot, then speed, then the core's rank order — no format
+/// preference). Users not tried yet come first; users who only
 /// queued us are a last resort (a queue place is per file and another file may start at
 /// once); users who failed or timed out are never retried.
 fn next_candidate(
@@ -115,19 +143,22 @@ fn next_candidate(
     tried_files: &BTreeSet<(String, String)>,
     queued_users: &BTreeSet<String>,
     bad_users: &BTreeSet<String>,
+    format: Option<&str>,
 ) -> Option<SearchHit> {
     hits.iter()
-        .filter(|h| h.file.extension() == "flac" && h.file.size > 0)
-        .filter(|h| !bad_users.contains(&h.file.username))
-        .filter(|h| !tried_files.contains(&(h.file.username.clone(), h.file.path.clone())))
-        .max_by_key(|h| {
+        .enumerate()
+        .filter(|(_, h)| wanted(h, format))
+        .filter(|(_, h)| !bad_users.contains(&h.file.username))
+        .filter(|(_, h)| !tried_files.contains(&(h.file.username.clone(), h.file.path.clone())))
+        .max_by_key(|(i, h)| {
             (
                 !queued_users.contains(&h.file.username),
                 h.free_slot,
                 h.speed,
+                std::cmp::Reverse(*i),
             )
         })
-        .cloned()
+        .map(|(_, h)| h.clone())
 }
 
 /// Why a candidate was given up on.
@@ -222,6 +253,9 @@ fn run() -> Result<(), String> {
     ) else {
         return Err("WHOLESEEK_USER and WHOLESEEK_PASS must be set".into());
     };
+    let format = format_from_env()?;
+    let format = format.as_deref();
+    let kind = format.map_or_else(|| "audio".to_string(), str::to_ascii_uppercase);
     let play_secs = env_num("WHOLESEEK_PLAY_SECS", 30);
     let start_secs = env_num("WHOLESEEK_START_SECS", 15);
     let search_secs = env_num("WHOLESEEK_SEARCH_SECS", 15);
@@ -254,7 +288,7 @@ fn run() -> Result<(), String> {
     );
 
     // Search: take batches until the window closes, or (after a few seconds) enough distinct
-    // FLAC users to choose from. The search stays open during the attempts below.
+    // users with a wanted file to choose from. The search stays open during the attempts below.
     let t_search = Instant::now();
     let search = core.search(&query);
     let mut hits: Vec<SearchHit> = Vec::new();
@@ -265,7 +299,7 @@ fn run() -> Result<(), String> {
         |ev| match ev {
             CoreEvent::SearchResults { search: s, hits: h } if s == search => {
                 hits.extend(h);
-                (distinct_flac_users(&hits) >= MAX_CANDIDATES
+                (distinct_users(&hits, format) >= MAX_CANDIDATES
                     && t_search.elapsed() > Duration::from_secs(4))
                 .then_some(())
             }
@@ -274,19 +308,19 @@ fn run() -> Result<(), String> {
         },
     )
     .or_else(|e| if hits.is_empty() { Err(e) } else { Ok(()) })?;
-    if distinct_flac_users(&hits) == 0 {
+    if distinct_users(&hits, format) == 0 {
         core.cancel_search(search);
         return Err(format!(
-            "no FLAC among {} hits for {query:?} after {:.1} s",
+            "no {kind} among {} hits for {query:?} after {:.1} s",
             hits.len(),
             t_search.elapsed().as_secs_f64()
         ));
     }
     println!(
-        "{} hits from {} FLAC users so far; up to {MAX_CANDIDATES} attempts ({start_secs} s start \
+        "{} hits from {} {kind} users so far; up to {MAX_CANDIDATES} attempts ({start_secs} s start \
          timeout each)",
         hits.len(),
-        distinct_flac_users(&hits)
+        distinct_users(&hits, format)
     );
 
     // ▶: first candidate whose peer starts sending wins.
@@ -297,9 +331,10 @@ fn run() -> Result<(), String> {
     let mut tried_files = BTreeSet::new();
     let (mut queued_users, mut bad_users) = (BTreeSet::new(), BTreeSet::new());
     for n in 1..=MAX_CANDIDATES {
-        let Some(hit) = next_candidate(&hits, &tried_files, &queued_users, &bad_users) else {
+        let Some(hit) = next_candidate(&hits, &tried_files, &queued_users, &bad_users, format)
+        else {
             println!(
-                "[{:>6.2}s] no untried FLAC candidates left",
+                "[{:>6.2}s] no untried {kind} candidates left",
                 t_play.elapsed().as_secs_f64()
             );
             break;
@@ -307,14 +342,14 @@ fn run() -> Result<(), String> {
         tried_files.insert((hit.file.username.clone(), hit.file.path.clone()));
         println!(
             "[{:>6.2}s] attempt {n}/{MAX_CANDIDATES}: {} — {} ({} bytes, free slot {}, speed {} \
-             B/s; {} FLAC users known)",
+             B/s; {} {kind} users known)",
             t_play.elapsed().as_secs_f64(),
             hit.file.username,
             hit.file.path,
             hit.file.size,
             hit.free_slot,
             hit.speed,
-            distinct_flac_users(&hits)
+            distinct_users(&hits, format)
         );
         let t_attempt = Instant::now();
         let timeout = Duration::from_secs(start_secs);

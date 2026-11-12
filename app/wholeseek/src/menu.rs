@@ -40,17 +40,25 @@ pub enum MenuAction {
     },
     Cancel(TransferId),
     Retry(TransferId),
+    /// A format folded under "+N": select or unselect it in the shown search tab.
+    ToggleFormat(&'static str),
+    /// A tab folded under the strip's "»": show it.
+    ShowTab(usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MenuItem {
     pub id: &'static str,
-    pub label: &'static str,
+    pub label: String,
     pub action: MenuAction,
 }
 
-fn item(id: &'static str, label: &'static str, action: MenuAction) -> MenuItem {
-    MenuItem { id, label, action }
+fn item(id: &'static str, label: &str, action: MenuAction) -> MenuItem {
+    MenuItem {
+        id,
+        label: label.to_string(),
+        action,
+    }
 }
 
 /// Where the menu opens: at a pointer (right-click), or under a keyed element (⋯).
@@ -77,7 +85,7 @@ pub fn file_items(f: &RemoteFile, in_user_tab: bool) -> Vec<MenuItem> {
     let username = f.username.clone();
     let folder = f.folder().to_string();
     let mut v = Vec::new();
-    if crate::tabs::is_audio(f) {
+    if crate::tabs::is_playable(f) {
         v.push(item("play", "Play", MenuAction::Play(f.clone())));
     }
     v.push(item(
@@ -118,9 +126,10 @@ pub fn file_items(f: &RemoteFile, in_user_tab: bool) -> Vec<MenuItem> {
 }
 
 /// A folder line in grouped search results.
-pub fn folder_items(username: &str, folder: &str) -> Vec<MenuItem> {
+/// A folder line's menu; "Play folder" only when it holds something the player decodes.
+pub fn folder_items(username: &str, folder: &str, playable: bool) -> Vec<MenuItem> {
     let (u, d) = (username.to_string(), folder.to_string());
-    vec![
+    let mut v = vec![
         item(
             "open-folder",
             "Open folder",
@@ -138,16 +147,19 @@ pub fn folder_items(username: &str, folder: &str) -> Vec<MenuItem> {
                 folder: d.clone(),
             },
         ),
-        item(
+    ];
+    if playable {
+        v.push(item(
             "play-folder",
             "Play folder",
             MenuAction::PlayFolder {
                 username: u,
                 folder: d.clone(),
             },
-        ),
-        item("copy-path", "Copy path", MenuAction::CopyPath(d)),
-    ]
+        ));
+    }
+    v.push(item("copy-path", "Copy path", MenuAction::CopyPath(d)));
+    v
 }
 
 impl App {
@@ -159,7 +171,7 @@ impl App {
         match &t.state {
             TState::Done(path) => {
                 let mut v = Vec::new();
-                if crate::tabs::is_audio(&t.file) {
+                if crate::tabs::is_playable(&t.file) {
                     v.push(item("play", "Play", MenuAction::PlayLocal(id)));
                 }
                 v.push(item(
@@ -253,5 +265,36 @@ impl App {
             }
         }
         v
+    }
+
+    /// The "+N" chip's menu: formats past the first few, "✓" on selected ones.
+    pub fn more_format_items(&self) -> Vec<MenuItem> {
+        let Some(st) = self.tab().search() else {
+            return Vec::new();
+        };
+        let Some(v) = &st.search else {
+            return Vec::new();
+        };
+        v.format_counts(&st.filters)
+            .into_iter()
+            .skip(crate::view::MAX_FORMAT_CHIPS)
+            .map(|(label, n)| {
+                let mark = if st.filters.has(label) { "✓ " } else { "" };
+                item(
+                    crate::tabs::format_key(label),
+                    &format!("{mark}{label} {n}"),
+                    MenuAction::ToggleFormat(label),
+                )
+            })
+            .collect()
+    }
+
+    /// The strip's "»" menu: the tabs that don't fit, in order.
+    pub fn hidden_tab_items(&self, hidden: &[usize]) -> Vec<MenuItem> {
+        hidden
+            .iter()
+            .filter_map(|&i| self.tabs.get(i).map(|t| (i, t)))
+            .map(|(i, t)| item("tab", &t.title(), MenuAction::ShowTab(i)))
+            .collect()
     }
 }

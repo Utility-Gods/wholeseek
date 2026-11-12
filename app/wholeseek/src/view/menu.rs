@@ -36,7 +36,10 @@ pub fn layer(s: &App, t: &Theme) -> Option<El> {
         let action = it.action.clone();
         items = items.child(
             row()
-                .key(format!("menu-{}", it.id))
+                .key(match it.action {
+                    crate::menu::MenuAction::ShowTab(i) => format!("menu-tab-{i}"),
+                    _ => format!("menu-{}", it.id),
+                })
                 .h(26.0)
                 .w_full()
                 .px(10.0)
@@ -45,14 +48,14 @@ pub fn layer(s: &App, t: &Theme) -> Option<El> {
                 .press(t.press)
                 .cursor(Cursor::Pointer)
                 .role("menuitem")
-                .label(it.label)
+                .label(it.label.clone())
                 .on_press_tx(move |s: &mut App, tx| {
                     if let Some(text) = s.run_menu(action.clone()) {
                         tx.copy(text);
                     }
                     s.restore_scroll(tx);
                 })
-                .child(text(it.label).font(type_::BODY).color(t.text)),
+                .child(text(it.label.clone()).font(type_::BODY).color(t.text)),
         );
     }
     let mut layer = el()

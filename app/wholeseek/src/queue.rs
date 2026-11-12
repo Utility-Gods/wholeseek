@@ -31,6 +31,15 @@ pub struct QItem {
 pub struct PlayQueue {
     pub items: Vec<QItem>,
     pub index: usize,
+    /// Which queue this is: player item ids are "<generation>:<index>", so an event the
+    /// player sent for an earlier queue (a late `PrefetchNext` after ▶ on another album) is
+    /// told apart and dropped.
+    pub generation: u64,
+}
+
+/// The player id of queue item `index` in queue `generation`.
+pub fn item_id(generation: u64, index: usize) -> String {
+    format!("{generation}:{index}")
 }
 
 impl PlayQueue {
@@ -48,6 +57,9 @@ impl App {
     /// ▶ on `file` with its folder as the queue (`list`, in order; non-audio dropped). ▶ on the
     /// current track toggles pause instead.
     pub fn play_in(&mut self, file: &RemoteFile, list: &[RemoteFile]) {
+        if !crate::tabs::is_playable(file) {
+            return;
+        }
         if self
             .playing
             .as_ref()
@@ -58,7 +70,7 @@ impl App {
         }
         let mut files: Vec<RemoteFile> = list
             .iter()
-            .filter(|f| crate::tabs::is_audio(f))
+            .filter(|f| crate::tabs::is_playable(f))
             .cloned()
             .collect();
         let start = match files.iter().position(|f| f == file) {
@@ -83,6 +95,7 @@ impl App {
             .iter()
             .find(|t| t.id == id)
             .map(|t| t.file.clone())
+            .filter(crate::tabs::is_playable)
         {
             self.start_queue(vec![f], 0);
         }
@@ -100,9 +113,18 @@ impl App {
     /// search hits in it.
     pub fn play_folder(&mut self, username: &str, folder: &str) {
         let files = self.folder_files(username, folder);
-        if let Some(first) = files.iter().find(|f| crate::tabs::is_audio(f)).cloned() {
+        if let Some(first) = files.iter().find(|f| crate::tabs::is_playable(f)).cloned() {
             self.play_in(&first, &files);
         }
+    }
+
+    /// A folder line's menu, with "Play folder" only if something there can play.
+    pub fn folder_menu(&self, username: &str, folder: &str) -> Vec<crate::menu::MenuItem> {
+        let playable = self
+            .folder_files(username, folder)
+            .iter()
+            .any(crate::tabs::is_playable);
+        crate::menu::folder_items(username, folder, playable)
     }
 
     /// The files of a remote folder as far as the app knows them, in path order.
@@ -143,17 +165,23 @@ impl App {
                 file: f,
             })
             .collect();
+        self.queue_generation += 1;
+        let generation = self.queue_generation;
         let for_player: Vec<QueueItem> = items
             .iter()
             .enumerate()
-            .map(|(i, it)| match &it.path {
-                Some(p) => QueueItem::with_path(i.to_string(), p.clone(), it.file.size),
-                None => QueueItem::new(i.to_string(), it.file.size),
+            .map(|(i, it)| {
+                let id = item_id(generation, i);
+                match &it.path {
+                    Some(p) => QueueItem::with_path(id, p.clone(), it.file.size),
+                    None => QueueItem::new(id, it.file.size),
+                }
             })
             .collect();
         self.queue = Some(PlayQueue {
             items,
             index: start,
+            generation,
         });
         self.notice = None;
         self.ensure_fetch(start);
@@ -260,6 +288,15 @@ impl App {
     // ---- player and transfer events ------------------------------------------------------
 
     pub(crate) fn apply_player(&mut self, e: PlayerEvent) {
+        // A queue event for a queue that's gone (stopped or replaced) changes nothing.
+        if let PlayerEvent::TrackChanged { index, id } | PlayerEvent::PrefetchNext { index, id } =
+            &e
+        {
+            let current = self.queue.as_ref().map(|q| item_id(q.generation, *index));
+            if current.as_deref() != Some(id.as_str()) {
+                return;
+            }
+        }
         match e {
             PlayerEvent::TrackChanged { index, .. } => {
                 let Some(q) = self.queue.as_mut() else { return };
@@ -393,7 +430,7 @@ impl App {
     pub(crate) fn group_done_files(&self, username: &str, folder: &str) -> Vec<RemoteFile> {
         crate::transfers::listed(&self.transfers, &self.drawer.hidden)
             .filter(|t| t.file.username == username && t.file.folder() == folder)
-            .filter(|t| matches!(t.state, TState::Done(_)) && crate::tabs::is_audio(&t.file))
+            .filter(|t| matches!(t.state, TState::Done(_)) && crate::tabs::is_playable(&t.file))
             .map(|t| t.file.clone())
             .collect()
     }

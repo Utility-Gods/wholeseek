@@ -40,30 +40,70 @@ pub struct SearchView {
     pub finished: bool,
 }
 
-/// Client-side result filters (chips). Changing one never re-runs the search.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Filters {
-    pub flac_only: bool,
-    pub free_slot: bool,
-    /// Lossless with a known bit depth of 16 or more.
-    pub min_16_bit: bool,
+/// The format chip a file counts under, by extension, with aliases grouped (m4a/aac →
+/// "AAC/M4A", aif/aiff → "AIFF"). `None` for non-audio. Every audio extension the core
+/// knows (`rank::AUDIO_EXTENSIONS`) has a group.
+pub fn format_of(path: &str) -> Option<&'static str> {
+    Some(match rank::extension(path).as_str() {
+        "flac" => "FLAC",
+        "mp3" => "MP3",
+        "wav" => "WAV",
+        "m4a" | "aac" => "AAC/M4A",
+        "aif" | "aiff" => "AIFF",
+        "ogg" => "OGG",
+        "opus" => "Opus",
+        "alac" => "ALAC",
+        "ape" => "APE",
+        "wv" => "WavPack",
+        _ => return None,
+    })
 }
 
-impl Default for Filters {
-    fn default() -> Self {
-        Self {
-            flac_only: true,
-            free_slot: false,
-            min_16_bit: false,
-        }
+/// Element key (and menu id) of a format chip.
+pub fn format_key(label: &str) -> &'static str {
+    match label {
+        "FLAC" => "fmt-flac",
+        "MP3" => "fmt-mp3",
+        "WAV" => "fmt-wav",
+        "AAC/M4A" => "fmt-aac",
+        "AIFF" => "fmt-aiff",
+        "OGG" => "fmt-ogg",
+        "Opus" => "fmt-opus",
+        "ALAC" => "fmt-alac",
+        "APE" => "fmt-ape",
+        "WavPack" => "fmt-wv",
+        _ => "fmt-other",
     }
 }
 
+/// Client-side result filters (chips). Changing one never re-runs the search.
+/// No format selected (the default) means every format; several mean any of them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Filters {
+    /// Selected format chips (labels from [`format_of`]).
+    pub formats: BTreeSet<&'static str>,
+    pub free_slot: bool,
+}
+
 impl Filters {
+    pub fn has(&self, format: &str) -> bool {
+        self.formats.contains(format)
+    }
+
+    pub fn toggle(&mut self, format: &'static str) {
+        if !self.formats.remove(format) {
+            self.formats.insert(format);
+        }
+    }
+
     pub fn accepts(&self, h: &SearchHit) -> bool {
-        (!self.flac_only || rank::extension(&h.file.path) == "flac")
-            && (!self.free_slot || h.free_slot)
-            && (!self.min_16_bit || h.file.attrs.bit_depth.is_some_and(|b| b >= 16))
+        self.accepts_except_format(h)
+            && (self.formats.is_empty()
+                || format_of(&h.file.path).is_some_and(|f| self.formats.contains(f)))
+    }
+
+    fn accepts_except_format(&self, h: &SearchHit) -> bool {
+        !self.free_slot || h.free_slot
     }
 }
 
@@ -110,6 +150,27 @@ impl SearchView {
 
     pub fn visible(&self, filters: &Filters) -> usize {
         self.hits.iter().filter(|h| filters.accepts(h)).count()
+    }
+
+    /// One chip per format present in the results, with its count under the other filters
+    /// (what selecting it would show), most common first (ties by name). A selected format
+    /// stays listed, at 0, even when no result has it any more.
+    pub fn format_counts(&self, filters: &Filters) -> Vec<(&'static str, usize)> {
+        let mut n: Vec<(&'static str, usize)> = Vec::new();
+        let mut add = |f: &'static str, k: usize| match n.iter_mut().find(|(g, _)| *g == f) {
+            Some((_, c)) => *c += k,
+            None => n.push((f, k)),
+        };
+        for h in &self.hits {
+            if let Some(f) = format_of(&h.file.path) {
+                add(f, usize::from(filters.accepts_except_format(h)));
+            }
+        }
+        for f in &filters.formats {
+            add(f, 0);
+        }
+        n.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        n
     }
 }
 
@@ -298,7 +359,14 @@ impl Tab {
     }
 }
 
-/// Files a user tab's file list draws: audio ones get ▶.
+/// Audio by extension (rows of anything else are dimmed).
 pub fn is_audio(f: &RemoteFile) -> bool {
     rank::is_audio(&f.path)
+}
+
+/// Whether the player can decode `f`: the one test for ▶, "Play" menu items, queues and
+/// ▶ fallback sources (`wholeseek_audio::PLAYABLE_EXTENSIONS`; Opus, APE, WavPack, … are
+/// audio but not playable).
+pub fn is_playable(f: &RemoteFile) -> bool {
+    wholeseek_audio::is_playable(&f.path)
 }

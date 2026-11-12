@@ -47,7 +47,7 @@ pub enum CoreEvent {
     },
 
     /// New hits for a search since the previous batch, already filtered and
-    /// ranked by the core (audio-only, FLAC first). Batches arrive while the
+    /// ranked by the core (audio-only, best sources first). Batches arrive while the
     /// search window is open; the UI merges and re-sorts on append.
     SearchResults {
         search: SearchId,

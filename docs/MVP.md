@@ -19,7 +19,7 @@ A minimal native desktop Soulseek client for music: **search, browse a user, pla
 | Login | First launch: Soulseek username/password (OS keyring). Auto-reconnect. |
 | Shares | Choose folder(s); index on start and on rescan. Peers can search/browse/download them. |
 | Uploads | Slot cap and speed limit; queue handled by the library. |
-| Search | Network search; audio-only filter on by default; **FLAC first** ordering, then MP3/others; free slot and speed visible. |
+| Search | Network search; audio-only by default; format filters (FLAC · MP3 · WAV · Other, none = all); ordered by availability (free slot, queue, speed), not format; free slot and speed visible. |
 | Browse user | Click a username → their folder tree in place; Back returns to results. |
 | Player | Small bottom strip: play/pause, seek (within buffered range), volume, track/user. One track at a time. |
 | Download | File or whole folder; keeps folder name. |
@@ -51,7 +51,7 @@ Chat/rooms, private messages, wishlist, buddies, playlists/queue, library, tags,
 |---|---|---|
 | Protocol | [`soulseek-rs-lib`](https://github.com/michel/soulseek-rs) (MIT, Rust, pinned rev) | Full modern protocol: search, browse, shares, upload queue, resumable downloads, firewalled peers, UPnP/NAT-PMP. Zero deps. Downloads stream to `.part` with progress events — enough for play-while-downloading. |
 | UI | [Rune](https://github.com/anomalyco/rune) (pinned `dev` rev) | Native GPU Rust UI, headless render/test. Pre-release accepted. |
-| Audio | symphonia (FLAC/MP3/OGG/M4A decode) + cpal (output) | Pure Rust, FLAC-first. |
+| Audio | symphonia (FLAC/MP3/OGG/M4A decode) + cpal (output) | Pure Rust. |
 | Secrets | `keyring` crate | Password not stored in plain config. |
 | Config | TOML in `~/.config/wholeseek/` | Simple. |
 
@@ -79,7 +79,7 @@ The UI never blocks: core runs the client on its own thread(s) and sends events 
 ## Done when
 
 - Fresh install → log in → pick share folder → connected, share counts shown.
-- Search → results in seconds → ▶ a FLAC starts within a few seconds of transfer start; nothing appears in downloads.
+- Search → results in seconds → ▶ a track starts within a few seconds of transfer start; nothing appears in downloads.
 - ↓ on the same track saves it (reusing the cache when complete).
 - Open a user → browse → ▶ and ↓ work there too.
 - Another client (e.g. Nicotine+) can browse and download from wholeseek.

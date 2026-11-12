@@ -1,5 +1,5 @@
 //! CP0 protocol smoke: log in, run one search, print the first 10 audio
-//! results (FLAC first), exit.
+//! results, exit.
 //!
 //! ```sh
 //! WHOLESEEK_USER=… WHOLESEEK_PASS=… cargo run -p wholeseek-core --example smoke -- "<query>"

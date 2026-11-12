@@ -43,31 +43,78 @@ fn run(program: &str, args: &[String]) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-impl Desktop for RealDesktop {
-    fn open(&mut self, path: &Path) {
-        let p = path.to_path_buf();
-        background(move || {
-            if !run("xdg-open", &[p.display().to_string()]) {
-                eprintln!("wholeseek: xdg-open {} failed", p.display());
-            }
-        });
-    }
-    fn show_item(&mut self, file: &Path) {
-        let file = file.to_path_buf();
-        background(move || {
-            let shown = show_item_commands(&file)
-                .into_iter()
-                .any(|(program, args)| run(program, &args));
-            if !shown {
-                eprintln!("wholeseek: could not show {}", file.display());
-            }
-        });
+/// Helper invocations, tried in order until one succeeds.
+pub type Commands = Vec<(&'static str, Vec<String>)>;
+
+/// The desktop this build talks to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Os {
+    MacOs,
+    /// Linux and other freedesktop systems.
+    Freedesktop,
+}
+
+pub const OS: Os = if cfg!(target_os = "macos") {
+    Os::MacOs
+} else {
+    Os::Freedesktop
+};
+
+/// A shortcut as this platform writes it: `shortcut(os, "T")` is "⌘T" on macOS and "Ctrl+T"
+/// elsewhere. Tooltips use [`chord`], this build's form.
+pub fn shortcut(os: Os, key: &str) -> String {
+    match os {
+        Os::MacOs => format!("⌘{key}"),
+        Os::Freedesktop => format!("Ctrl+{key}"),
     }
 }
 
-/// How to reveal `file`, in order: the FileManager1 D-Bus interface (selects the file in
-/// Nautilus, Dolphin, Nemo, …) via `gdbus` or `dbus-send`, else open its folder.
-pub fn show_item_commands(file: &Path) -> Vec<(&'static str, Vec<String>)> {
+/// [`shortcut`] for this build.
+pub fn chord(key: &str) -> String {
+    shortcut(OS, key)
+}
+
+/// How to open `path` with its default app (a folder: in the file manager).
+pub fn open_commands(os: Os, path: &Path) -> Commands {
+    let p = path.display().to_string();
+    match os {
+        Os::MacOs => vec![("open", vec![p])],
+        Os::Freedesktop => vec![("xdg-open", vec![p])],
+    }
+}
+
+/// How to reveal `file` selected in the file manager: Finder's `open -R` on macOS; on
+/// Linux the FileManager1 D-Bus interface, else its folder opened.
+pub fn show_item_commands(os: Os, file: &Path) -> Commands {
+    match os {
+        Os::MacOs => vec![("open", vec!["-R".into(), file.display().to_string()])],
+        Os::Freedesktop => freedesktop_show_item(file),
+    }
+}
+
+fn run_first(what: &'static str, path: PathBuf, commands: Commands) {
+    background(move || {
+        if !commands
+            .into_iter()
+            .any(|(program, args)| run(program, &args))
+        {
+            eprintln!("wholeseek: could not {what} {}", path.display());
+        }
+    });
+}
+
+impl Desktop for RealDesktop {
+    fn open(&mut self, path: &Path) {
+        run_first("open", path.to_path_buf(), open_commands(OS, path));
+    }
+    fn show_item(&mut self, file: &Path) {
+        run_first("show", file.to_path_buf(), show_item_commands(OS, file));
+    }
+}
+
+/// FileManager1 `ShowItems` (selects the file in Nautilus, Dolphin, Nemo, …) via `gdbus` or
+/// `dbus-send`, else `xdg-open` on its folder.
+fn freedesktop_show_item(file: &Path) -> Commands {
     let uri = file_uri(file);
     let dir = file.parent().unwrap_or(file).display().to_string();
     vec![

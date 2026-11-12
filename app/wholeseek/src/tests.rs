@@ -163,7 +163,7 @@ fn rejected_login_stays_on_onboarding_with_a_reason() {
 }
 
 #[test]
-fn search_results_stream_in_flac_first() {
+fn search_results_stream_in_ranked_by_availability() {
     let mut rt = signed_in();
     rt.state.search_for("hollow lights");
     run(&mut rt, 0.35);
@@ -180,16 +180,12 @@ fn search_results_stream_in_flac_first() {
         "later batches append: {first} → {}",
         s.hits.len()
     );
-    let ranks: Vec<u8> = s
-        .hits
-        .iter()
-        .map(|h| wholeseek_core::rank::format_rank(&h.file.path))
-        .collect();
+    // Free slot first, then speed; the format plays no part.
+    let keys: Vec<(bool, u32)> = s.hits.iter().map(|h| (h.free_slot, h.speed)).collect();
     assert!(
-        ranks.windows(2).all(|w| w[0] <= w[1]),
-        "FLAC first, then MP3, then others: {ranks:?}"
+        keys.windows(2).all(|w| w[0] >= w[1]),
+        "availability order: {keys:?}"
     );
-    assert_eq!(ranks[0], 0);
     assert!(rt.find("row-0/play").is_some() && rt.find("searching").is_none());
     assert_eq!(
         calls(&rt).last(),
@@ -352,8 +348,8 @@ fn download_shows_progress_then_done() {
 #[test]
 fn failed_download_can_be_retried_from_the_transfers_panel() {
     let mut rt = searched();
-    let (i, file) = row_of(&rt, "marten_k", "Hollow Lights - Salt Roads.flac");
-    click(&mut rt, &format!("row-{i}/download"));
+    let (_, file) = row_of(&rt, "marten_k", "Hollow Lights - Salt Roads.flac");
+    rt.update(|s, _| s.download(&file));
     run(&mut rt, 20.0);
     let d = rt.state.download_of(&file).unwrap();
     assert!(matches!(d.state, TState::Failed(_)), "{:?}", d.state);
@@ -783,7 +779,7 @@ fn closing_tabs_and_the_last_tab_leaves_an_empty_search() {
 #[test]
 fn each_tab_keeps_its_query_filters_results_and_scroll() {
     let mut rt = searched();
-    click(&mut rt, "flac-only"); // off in tab 0
+    click(&mut rt, "free-slot"); // free slots only in tab 0
     let (x, y) = rt.find("row-0").unwrap();
     rt.wheel(x, y, -120.0);
     run(&mut rt, 0.3);
@@ -796,13 +792,18 @@ fn each_tab_keeps_its_query_filters_results_and_scroll() {
         s.search_for("salt roads");
     });
     run(&mut rt, 1.6);
-    assert!(rt.state.tab().search().unwrap().filters.flac_only);
+    assert!(
+        rt.state.tab().search().unwrap().filters.free_slot,
+        "a new tab starts with the last-used selection"
+    );
+    click(&mut rt, "free-slot"); // everyone in tab 1
 
     press(&mut rt, ctrl(Key::Tab)); // wraps to tab 0
     assert_eq!(rt.state.active, 0);
     let st = rt.state.tab().search().unwrap();
     assert_eq!(st.edit.text, "hollow lights");
-    assert!(!st.filters.flac_only, "tab 0 kept its own filters");
+    assert!(st.filters.free_slot, "tab 0 kept its own filters");
+    assert!(!rt.state.tabs[1].search().unwrap().filters.free_slot);
     assert_eq!(st.search.as_ref().unwrap().query, "hollow lights");
     assert_eq!(rt.state.tab().scroll.get(), scrolled, "scroll offset kept");
     assert_eq!(rt.state.tabs[1].search().unwrap().edit.text, "salt roads");
@@ -840,43 +841,158 @@ fn shortcuts_open_close_cycle_and_focus_search() {
 
 // ---- CP2: search tab ------------------------------------------------------------------------
 
+fn visible(rt: &Runtime<App>) -> usize {
+    let st = rt.state.tab().search().unwrap();
+    st.search.as_ref().unwrap().visible(&st.filters)
+}
+
+fn shown_formats(rt: &Runtime<App>) -> std::collections::BTreeSet<&'static str> {
+    let st = rt.state.tab().search().unwrap();
+    let v = st.search.as_ref().unwrap();
+    v.hits
+        .iter()
+        .filter(|h| st.filters.accepts(h))
+        .filter_map(|h| crate::tabs::format_of(&h.file.path))
+        .collect()
+}
+
 #[test]
-fn filter_chips_filter_the_results_in_place() {
+fn format_chips_come_from_the_results_with_counts_most_common_first() {
+    let rt = searched();
+    let st = rt.state.tab().search().unwrap();
+    let counts = st.search.as_ref().unwrap().format_counts(&st.filters);
+    // Demo results: 13 FLAC, 3 MP3, 2 WAV, 1 OGG, 1 Opus — no hardcoded FLAC default.
+    assert_eq!(
+        counts,
+        [
+            ("FLAC", 13),
+            ("MP3", 3),
+            ("WAV", 2),
+            ("OGG", 1),
+            ("Opus", 1)
+        ]
+    );
+    assert!(
+        st.filters.formats.is_empty(),
+        "none selected = every format"
+    );
+    assert_eq!(visible(&rt), sv(&rt).hits.len());
+    let n = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.path.ends_with("fmt-flac/n"))
+        .and_then(|e| e.text);
+    assert_eq!(n.as_deref(), Some("13"), "the chip reads \"FLAC 13\"");
+    assert!(
+        rt.find("fmt-wav").is_some() && rt.find("fmt-aac").is_none(),
+        "only formats present"
+    );
+    assert!(rt.find("fmt-more").is_none());
+    assert!(rt.find("flac-only").is_none() && rt.find("bit-16").is_none());
+}
+
+#[test]
+fn format_chips_multi_select_as_a_union_and_none_means_all() {
     let mut rt = searched();
     let searches = count_calls(&rt, |c| matches!(c, Call::Search(_)));
-    let all = sv(&rt).hits.len();
-    let visible = |rt: &Runtime<App>| {
-        let st = rt.state.tab().search().unwrap();
-        st.search.as_ref().unwrap().visible(&st.filters)
-    };
-    let flac = visible(&rt);
-    assert!(flac < all, "FLAC only is on by default");
-    assert!(rt.find("hidden").is_none());
-    click(&mut rt, "flac-only");
-    assert_eq!(visible(&rt), all);
-    click(&mut rt, "flac-only");
+    let all = visible(&rt);
+    click(&mut rt, "fmt-mp3");
+    assert_eq!(visible(&rt), 3);
+    assert_eq!(shown_formats(&rt), ["MP3"].into());
+    click(&mut rt, "fmt-wav");
+    assert_eq!(visible(&rt), 5, "MP3 ∪ WAV");
+    assert_eq!(shown_formats(&rt), ["MP3", "WAV"].into());
+    click(&mut rt, "fmt-mp3");
+    click(&mut rt, "fmt-wav");
+    assert_eq!(visible(&rt), all, "none selected again: everything");
+
+    // Free slot narrows the counts too (tomasz's WAVs and marten_k's FLAC are queued).
     click(&mut rt, "free-slot");
-    let free = visible(&rt);
-    assert!(free < flac, "marten_k (queued) is filtered out");
+    let st = rt.state.tab().search().unwrap();
+    let counts = st.search.as_ref().unwrap().format_counts(&st.filters);
     assert!(
-        !rt.state
-            .tab()
-            .search()
-            .unwrap()
-            .search
-            .as_ref()
-            .unwrap()
-            .groups(&rt.state.tab().search().unwrap().filters)
-            .iter()
-            .any(|g| g.username == "marten_k")
+        counts.contains(&("WAV", 0)) && counts.contains(&("FLAC", 12)),
+        "{counts:?}"
     );
-    click(&mut rt, "bit-16");
-    assert!(visible(&rt) <= free);
+    // A chip at 0 is dimmed but still clickable.
+    let (_, opacity) = rt.presented("fmt-wav").unwrap();
+    assert!(opacity < 0.6);
+    click(&mut rt, "fmt-wav");
+    assert!(rt.state.tab().search().unwrap().filters.has("WAV"));
+    assert_eq!(visible(&rt), 0);
+    assert!(rt.find("no-results").is_some() || rt.find("empty").is_some() || visible(&rt) == 0);
     assert_eq!(
         count_calls(&rt, |c| matches!(c, Call::Search(_))),
         searches,
         "filters never search again"
     );
+}
+
+#[test]
+fn format_groups_merge_aliases_and_overflow_into_a_menu() {
+    use crate::tabs::format_of;
+    assert_eq!(format_of(r"a\x.M4A"), Some("AAC/M4A"));
+    assert_eq!(format_of(r"a\x.aac"), Some("AAC/M4A"));
+    assert_eq!(format_of(r"a\x.aif"), Some("AIFF"));
+    assert_eq!(format_of(r"a\x.AIFF"), Some("AIFF"));
+    assert_eq!(format_of(r"a\x.wv"), Some("WavPack"));
+    assert_eq!(format_of(r"a\cover.jpg"), None);
+    for e in wholeseek_core::rank::AUDIO_EXTENSIONS {
+        assert!(format_of(&format!("a\\x.{e}")).is_some(), "{e} has a chip");
+    }
+    // Ten formats: seven chips, the rest under "+3".
+    let mut rt = signed_in();
+    let exts = [
+        "flac", "mp3", "wav", "m4a", "aiff", "ogg", "opus", "alac", "ape", "wv",
+    ];
+    let hits: Vec<wholeseek_core::SearchHit> = exts
+        .iter()
+        .enumerate()
+        .flat_map(|(i, e)| {
+            (0..(10 - i)).map(move |k| wholeseek_core::SearchHit {
+                file: wholeseek_core::RemoteFile {
+                    username: "u".into(),
+                    path: format!("m\\{k}.{e}"),
+                    size: 1,
+                    attrs: Default::default(),
+                },
+                free_slot: true,
+                speed: 1,
+            })
+        })
+        .collect();
+    rt.update(|s, _| {
+        s.new_search_tab();
+        let st = s.tab_mut().search_mut().unwrap();
+        st.search = Some(crate::tabs::SearchView {
+            id: wholeseek_core::SearchId(999),
+            query: "x".into(),
+            hits,
+            finished: true,
+        });
+    });
+    run(&mut rt, 0.05);
+    assert!(rt.find("fmt-opus").is_some() && rt.find("fmt-alac").is_none());
+    click(&mut rt, "fmt-more");
+    let m = rt.state.menu.as_ref().unwrap();
+    assert_eq!(m.ids(), ["fmt-alac", "fmt-ape", "fmt-wv"]);
+    assert_eq!(m.items[2].label, "WavPack 1");
+    click(&mut rt, "menu-fmt-ape");
+    assert!(rt.state.tab().search().unwrap().filters.has("APE"));
+    assert_eq!(visible(&rt), 2);
+    click(&mut rt, "fmt-more");
+    assert_eq!(rt.state.menu.as_ref().unwrap().items[1].label, "✓ APE 2");
+}
+
+#[test]
+fn a_new_search_tab_starts_with_the_last_used_filters() {
+    let mut rt = searched();
+    click(&mut rt, "fmt-flac");
+    click(&mut rt, "fmt-wav");
+    click(&mut rt, "free-slot");
+    click(&mut rt, "new-tab");
+    let f = &rt.state.tab().search().unwrap().filters;
+    assert!(f.has("FLAC") && f.has("WAV") && !f.has("MP3") && f.free_slot);
 }
 
 #[test]
@@ -1285,7 +1401,11 @@ fn finished_downloads_offer_play_show_open_and_copy() {
 
 #[test]
 fn show_item_asks_the_file_manager_then_falls_back_to_the_folder() {
-    let cmds = crate::desktop::show_item_commands(std::path::Path::new("/m/A b/01 ü.flac"));
+    use crate::desktop::Os;
+    let cmds = crate::desktop::show_item_commands(
+        Os::Freedesktop,
+        std::path::Path::new("/m/A b/01 ü.flac"),
+    );
     assert_eq!(cmds[0].0, "gdbus");
     assert!(
         cmds[0]
@@ -1301,6 +1421,29 @@ fn show_item_asks_the_file_manager_then_falls_back_to_the_folder() {
     assert_eq!(
         cmds.last().unwrap(),
         &("xdg-open", vec!["/m/A b".to_string()])
+    );
+}
+
+#[test]
+fn desktop_commands_per_os() {
+    use crate::desktop::{Os, open_commands, show_item_commands};
+    let f = std::path::Path::new("/Users/n/Music/A b/01.flac");
+    let p = f.display().to_string();
+    assert_eq!(open_commands(Os::MacOs, f), [("open", vec![p.clone()])]);
+    assert_eq!(
+        show_item_commands(Os::MacOs, f),
+        [("open", vec!["-R".to_string(), p.clone()])],
+        "Finder reveals and selects the file"
+    );
+    assert_eq!(open_commands(Os::Freedesktop, f), [("xdg-open", vec![p])]);
+    assert_eq!(show_item_commands(Os::Freedesktop, f)[0].0, "gdbus");
+    assert_eq!(
+        crate::desktop::OS,
+        if cfg!(target_os = "macos") {
+            Os::MacOs
+        } else {
+            Os::Freedesktop
+        }
     );
 }
 
@@ -1349,8 +1492,13 @@ fn menus_offer_what_each_place_needs() {
         "no ▶ for non-audio"
     );
     assert_eq!(
-        ids(crate::menu::folder_items("alice", COAST)),
+        ids(crate::menu::folder_items("alice", COAST, true)),
         ["open-folder", "download-folder", "play-folder", "copy-path"]
+    );
+    assert_eq!(
+        ids(crate::menu::folder_items("alice", COAST, false)),
+        ["open-folder", "download-folder", "copy-path"],
+        "nothing to play: no Play folder"
     );
 }
 
@@ -1872,4 +2020,377 @@ fn user_tab_downloads_the_open_folder_and_settings_forget_the_account() {
     assert_eq!(store_calls(&rt).last(), Some(&StoreCall::ForgetCredentials));
     assert_eq!(rt.state.screen, Screen::Onboarding);
     assert!(calls(&rt).contains(&Call::Logout));
+}
+
+// ---- window width: nothing may push the layout past the window -----------------------------
+
+/// Elements whose drawn box runs past the right edge of a `width`-wide window (ignoring
+/// content inside scroll areas, which may legitimately be wider).
+fn overflowing(rt: &Runtime<App>, width: f32) -> Vec<String> {
+    rt.elements()
+        .into_iter()
+        .filter(|e| e.rect[0] + e.rect[2] > width + 0.5 && e.key.is_some())
+        .map(|e| format!("{} [{:.0}+{:.0}]", e.path, e.rect[0], e.rect[2]))
+        .collect()
+}
+
+/// The strip's scene from the bug report, at a window `w`×`h` points: a long search tab
+/// and a user tab, plus `extra` more search tabs.
+fn strip_scene(w: f32, h: f32, scale: f32, extra: usize) -> Runtime<App> {
+    let mut rt = Runtime::new(
+        App::demo(),
+        view::view,
+        (w, h),
+        Env {
+            system_dark: true,
+            scale,
+        },
+    );
+    rt.poll = Some(poll);
+    rt.frame(0.0);
+    rt.state.demo_login();
+    run(&mut rt, 1.0);
+    rt.update(|s, _| s.search_for("roadblock iration 13"));
+    run(&mut rt, 1.6);
+    rt.update(|s, _| s.open_user("infectiphibian"));
+    for k in 0..extra {
+        rt.update(|s, _| {
+            s.new_search_tab();
+            s.search_for(&format!("a rather long search number {k}"));
+        });
+    }
+    run(&mut rt, 0.6);
+    rt
+}
+
+/// The right cluster is whole inside the window, and nothing in the strip runs past it.
+fn assert_strip_fits(rt: &Runtime<App>, w: f32, what: &str) {
+    for key in ["status", "transfers", "settings"] {
+        let ([x, _, kw, _], opacity) = rt
+            .presented(key)
+            .unwrap_or_else(|| panic!("{what}: no {key}"));
+        assert!(
+            x >= 0.0 && x + kw <= w + 0.5 && kw > 0.0,
+            "{what}: {key} at {x}+{kw} in {w}"
+        );
+        assert!(opacity > 0.99, "{what}: {key} visible");
+    }
+    let strip: Vec<_> = overflowing(rt, w)
+        .into_iter()
+        .filter(|p| p.contains("strip"))
+        .collect();
+    assert!(strip.is_empty(), "{what}: {strip:?}");
+}
+
+#[test]
+fn the_strip_right_cluster_is_always_whole_at_every_size_and_scale() {
+    for (pw, ph) in [
+        (800.0, 600.0),
+        (1100.0, 700.0),
+        (1280.0, 800.0),
+        (1920.0, 1080.0),
+    ] {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            // A window `pw` device pixels wide is `pw / scale` points: 1280 px at 2× is 640.
+            let (w, h) = (pw / scale, ph / scale);
+            for extra in [0, 6] {
+                let rt = strip_scene(w, h, scale, extra);
+                assert_strip_fits(&rt, w, &format!("{pw}x{ph}@{scale} +{extra} tabs"));
+                let active = format!("tab-{}", rt.state.active);
+                assert!(
+                    rt.find(&active).is_some(),
+                    "the active tab stays in the strip"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn tabs_shrink_to_a_minimum_then_fold_into_a_more_menu() {
+    use crate::view::strip_tab_split as split;
+    assert_eq!(split(3, 0, 1000.0), (vec![0, 1, 2], vec![]));
+    assert_eq!(split(8, 0, 300.0), (vec![0, 1, 2], vec![3, 4, 5, 6, 7]));
+    assert_eq!(
+        split(8, 6, 300.0),
+        (vec![4, 5, 6], vec![0, 1, 2, 3, 7]),
+        "active stays shown"
+    );
+    assert_eq!(
+        split(8, 7, 10.0),
+        (vec![7], (0..7).collect()),
+        "at least the active tab"
+    );
+
+    let mut rt = strip_scene(640.0, 400.0, 2.0, 6);
+    assert_eq!(rt.state.tabs.len(), 8);
+    let shown: Vec<_> = (0..8)
+        .filter(|i| rt.find(&format!("tab-{i}")).is_some())
+        .collect();
+    assert!(
+        shown.len() < 8 && shown.contains(&rt.state.active),
+        "{shown:?}"
+    );
+    for i in &shown {
+        let ([_, _, tw, _], _) = rt.presented(&format!("tab-{i}")).unwrap();
+        assert!(tw >= crate::view::TAB_MIN_W - 0.5, "tab-{i} is {tw} wide");
+    }
+    // The long title is cut with an ellipsis, not pushed out.
+    click(&mut rt, "tabs-more");
+    let menu = rt.state.menu.as_ref().unwrap();
+    assert_eq!(menu.items.len(), 8 - shown.len());
+    assert_eq!(menu.items[0].label, "roadblock iration 13");
+    click(&mut rt, "menu-tab-0");
+    assert_eq!(rt.state.active, 0);
+    assert!(
+        rt.find("tab-0").is_some(),
+        "the chosen tab comes into the strip"
+    );
+    assert_strip_fits(&rt, 640.0, "after choosing");
+
+    // Widening the window brings every tab back and drops "»".
+    rt.set_viewport((1920.0, 1080.0), 1.0);
+    run(&mut rt, 0.3);
+    assert!((0..8).all(|i| rt.find(&format!("tab-{i}")).is_some()));
+    assert!(rt.find("tabs-more").is_none());
+    assert_strip_fits(&rt, 1920.0, "wide");
+    // …and the content fills the new width (W/H in main.rs are only the opening size).
+    let ([_, _, sw, _], _) = rt.presented("strip").unwrap();
+    assert!((sw - 1920.0).abs() < 0.5, "strip is {sw} wide");
+}
+
+#[test]
+fn strip_proof_png_1280x800() {
+    let rt = strip_scene(1280.0, 800.0, 1.0, 0);
+    assert_strip_fits(&rt, 1280.0, "1280x800");
+}
+
+// ---- ▶ only for what the player decodes -------------------------------------------------------
+
+#[test]
+fn rows_the_player_cannot_decode_get_no_play_but_keep_download() {
+    let mut rt = searched();
+    let (opus, of) = row_of(&rt, "kassi", "low tide radio (live).opus");
+    let (ogg, _) = row_of(&rt, "kassi", "salt roads (demo).ogg");
+    let (wav, _) = row_of(&rt, "tomasz", "Hollow Lights - Salt Roads.wav");
+    assert!(
+        rt.find(&format!("row-{opus}/play")).is_none(),
+        "Opus: no decoder, no ▶"
+    );
+    assert!(
+        rt.find(&format!("row-{ogg}/play")).is_some()
+            && rt.find(&format!("row-{wav}/play")).is_some()
+    );
+    assert!(
+        rt.find(&format!("row-{opus}/download")).is_some(),
+        "↓ still offered"
+    );
+    let ids: Vec<_> = crate::menu::file_items(&of, false)
+        .iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "download",
+            "download-folder",
+            "open-folder",
+            "browse-user",
+            "copy-path"
+        ]
+    );
+    // Enter on it does nothing; play() refuses it outright.
+    let fetches = count_calls(&rt, |c| matches!(c, Call::PlayFetch(_)));
+    rt.update(|s, _| s.play(&of));
+    run(&mut rt, 0.05);
+    assert_eq!(
+        count_calls(&rt, |c| matches!(c, Call::PlayFetch(_))),
+        fetches
+    );
+    assert!(rt.state.playing.is_none());
+    // Downloading it works like any file.
+    rt.update(|s, _| s.download(&of));
+    assert!(calls(&rt).contains(&Call::Download(of)));
+}
+
+#[test]
+fn queues_alternates_and_folder_menus_skip_undecodable_files() {
+    let mut rt = searched();
+    // kassi's folder: an .ogg (plays) and an .opus (doesn't).
+    let (_, ogg) = row_of(&rt, "kassi", "salt roads (demo).ogg");
+    let folder = rt.state.folder_files("kassi", ogg.folder());
+    assert!(
+        folder.iter().any(|f| f.path.ends_with(".opus")),
+        "{folder:?}"
+    );
+    rt.update(|s, _| s.play_in(&ogg, &folder)); // what the row's ▶ does (row is off-screen)
+    run(&mut rt, 0.05);
+    let q = rt.state.queue.as_ref().unwrap();
+    assert_eq!(q.items.len(), 1, "the .opus is not queued");
+    assert_eq!(q.items[0].file, ogg);
+    // A silent source never falls back to an undecodable copy.
+    let (_, salt) = row_of(&rt, "alice", "02 Salt Roads.flac");
+    let alts = rt.state.alternates_for(&salt);
+    assert!(!alts.is_empty() && alts.iter().all(crate::tabs::is_playable));
+    // Folder menus: "Play folder" only where something plays.
+    let ids = |v: Vec<crate::menu::MenuItem>| v.iter().map(|i| i.id).collect::<Vec<_>>();
+    assert!(ids(rt.state.folder_menu("kassi", r"music\hollow lights")).contains(&"play-folder"));
+    let opus_only = wholeseek_core::RemoteFile {
+        username: "zed".into(),
+        path: r"x\only.opus".into(),
+        size: 1,
+        attrs: Default::default(),
+    };
+    rt.update(|s, _| {
+        s.tab_mut()
+            .search_mut()
+            .unwrap()
+            .search
+            .as_mut()
+            .unwrap()
+            .hits
+            .push(wholeseek_core::SearchHit {
+                file: opus_only.clone(),
+                free_slot: true,
+                speed: 1,
+            });
+    });
+    assert!(!ids(rt.state.folder_menu("zed", "x")).contains(&"play-folder"));
+}
+
+#[test]
+fn a_finished_undecodable_download_offers_no_play() {
+    let mut rt = searched();
+    let (_, of) = row_of(&rt, "kassi", "low tide radio (live).opus");
+    rt.update(|s, _| s.download(&of));
+    run(&mut rt, 60.0);
+    let d = rt.state.download_of(&of).unwrap().clone();
+    assert!(matches!(d.state, TState::Done(_)));
+    let ids: Vec<_> = rt.state.transfer_items(d.id).iter().map(|i| i.id).collect();
+    assert_eq!(ids, ["show-in-folder", "open-file", "copy-path"]);
+    click(&mut rt, "transfers");
+    assert!(rt.find("group-0/dl-0/show").is_some() && rt.find("group-0/dl-0/play").is_none());
+    rt.update(|s, _| s.play_local(d.id));
+    assert!(rt.state.playing.is_none());
+    // Its group offers no "Play album".
+    assert!(
+        rt.state
+            .group_items("kassi", r"music\hollow lights")
+            .iter()
+            .all(|i| i.id != "play-album")
+    );
+}
+
+// ---- macOS: ⌘ for every Ctrl shortcut, ⌘ in tooltips ------------------------------------------
+
+/// A key with ⌘ held, as Rune reports it on macOS (`cmd` with `logo`, Control up).
+fn cmd(key: Key) -> KeyEvent {
+    KeyEvent {
+        key,
+        mods: Mods {
+            cmd: true,
+            logo: true,
+            ..Mods::default()
+        },
+    }
+}
+
+#[test]
+fn command_key_drives_every_shortcut_as_on_macos() {
+    let mut rt = searched();
+    rt.update(|_, tx| tx.blur());
+    press(&mut rt, cmd(Key::Command('t')));
+    assert_eq!((rt.state.tabs.len(), rt.state.active), (2, 1), "⌘T");
+    press(&mut rt, cmd(Key::Tab));
+    assert_eq!(rt.state.active, 0, "⌘Tab cycles like Ctrl+Tab");
+    press(&mut rt, cmd(Key::Tab));
+    press(&mut rt, cmd(Key::Command('w'))); // the empty new tab
+    assert_eq!(rt.state.tabs.len(), 1, "⌘W");
+    rt.update(|s, _| s.open_user("alice"));
+    press(&mut rt, cmd(Key::Command('l')));
+    assert!(
+        rt.state.tab().search().is_some() && focused(&rt).as_deref() == Some("query"),
+        "⌘L"
+    );
+
+    let (i, _) = row_of(&rt, "alice", "02 Salt Roads.flac");
+    click(&mut rt, &format!("row-{i}/play"));
+    run(&mut rt, 1.0);
+    rt.update(|_, tx| tx.blur());
+    press(&mut rt, cmd(Key::Right));
+    assert_eq!(rt.state.queue_position(), Some((3, 6)), "⌘→ next");
+    press(&mut rt, cmd(Key::Left));
+    assert_eq!(rt.state.queue_position(), Some((2, 6)), "⌘← previous");
+}
+
+#[test]
+fn shortcut_labels_follow_the_platform() {
+    use crate::desktop::{Os, chord, shortcut};
+    assert_eq!(shortcut(Os::MacOs, "T"), "⌘T");
+    assert_eq!(shortcut(Os::MacOs, "→"), "⌘→");
+    assert_eq!(shortcut(Os::Freedesktop, "T"), "Ctrl+T");
+    assert_eq!(chord("W"), shortcut(crate::desktop::OS, "W"));
+}
+
+// ---- late player events for an abandoned queue -------------------------------------------------
+
+#[test]
+fn a_late_prefetch_for_an_abandoned_queue_fetches_nothing() {
+    use wholeseek_audio::PlayerEvent;
+    let mut rt = searched();
+    let fetches = |rt: &Runtime<App>| count_calls(rt, |c| matches!(c, Call::PlayFetch(_)));
+    // Coastline plays; the player is about to ask for track 2.
+    let album = |rt: &Runtime<App>, folder: &str| {
+        let files = rt.state.folder_files("alice", folder);
+        let first = files
+            .iter()
+            .find(|f| crate::tabs::is_playable(f))
+            .unwrap()
+            .clone();
+        (first, files)
+    };
+    let (first, files) = album(&rt, COAST);
+    rt.update(|s, _| s.play_in(&first, &files));
+    run(&mut rt, 0.05);
+    let old = rt.state.queue.as_ref().unwrap().generation;
+    let late = PlayerEvent::PrefetchNext {
+        index: 1,
+        id: crate::queue::item_id(old, 1),
+    };
+    // …but ▶ on another album comes first.
+    let (first, files) = album(&rt, FERRY);
+    rt.update(|s, _| s.play_in(&first, &files));
+    run(&mut rt, 0.05);
+    let q = rt.state.queue.as_ref().unwrap();
+    assert_ne!(q.generation, old);
+    assert!(
+        q.items[1].ticket.is_none(),
+        "Night Ferry's track 2 not asked for yet"
+    );
+    let before = fetches(&rt);
+    rt.update(|s, _| s.apply_player(late.clone()));
+    assert_eq!(fetches(&rt), before, "the old album's prefetch is dropped");
+    assert!(rt.state.queue.as_ref().unwrap().items[1].ticket.is_none());
+    // A stale TrackChanged doesn't move the new queue either.
+    rt.update(|s, _| {
+        s.apply_player(PlayerEvent::TrackChanged {
+            index: 3,
+            id: crate::queue::item_id(old, 3),
+        })
+    });
+    assert_eq!(rt.state.queue.as_ref().unwrap().index, 0);
+    // The current queue's own prefetch still works.
+    let gen_now = rt.state.queue.as_ref().unwrap().generation;
+    rt.update(|s, _| {
+        s.apply_player(PlayerEvent::PrefetchNext {
+            index: 1,
+            id: crate::queue::item_id(gen_now, 1),
+        })
+    });
+    assert_eq!(fetches(&rt), before + 1);
+    // With no queue at all (stopped), nothing happens.
+    rt.update(|s, _| s.stop_current());
+    let before = fetches(&rt);
+    rt.update(|s, _| s.apply_player(late));
+    assert_eq!(fetches(&rt), before);
 }

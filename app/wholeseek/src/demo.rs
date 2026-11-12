@@ -86,6 +86,11 @@ const PEERS: &[Peer] = &[
         free_slot: true,
         speed: 900_000,
     },
+    Peer {
+        name: "tomasz",
+        free_slot: false,
+        speed: 1_800_000,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -95,6 +100,7 @@ enum Q {
     Mp3,
     V0,
     Ogg,
+    Wav,
 }
 
 fn file(user: &str, folder: &str, name: &str, q: Q, secs: u32) -> RemoteFile {
@@ -128,6 +134,14 @@ fn file(user: &str, folder: &str, name: &str, q: Q, secs: u32) -> RemoteFile {
             AudioAttrs {
                 bitrate_kbps: Some(245),
                 vbr: Some(true),
+                ..AudioAttrs::default()
+            },
+        ),
+        Q::Wav => (
+            176_400,
+            AudioAttrs {
+                sample_rate_hz: Some(44_100),
+                bit_depth: Some(16),
                 ..AudioAttrs::default()
             },
         ),
@@ -283,6 +297,23 @@ pub fn catalog() -> Vec<RemoteFile> {
         Q::Ogg,
         219,
     ));
+    v.push(file(
+        "kassi",
+        r"music\hollow lights",
+        "low tide radio (live).opus",
+        Q::Ogg,
+        258,
+    ));
+    // Uncompressed rips: what the WAV chip finds.
+    for (name, secs) in [("Salt Roads", 224), ("Northern Glass", 250)] {
+        v.push(file(
+            "tomasz",
+            r"wav\Hollow Lights - Coastline",
+            &format!("Hollow Lights - {name}.wav"),
+            Q::Wav,
+            secs,
+        ));
+    }
     v
 }
 

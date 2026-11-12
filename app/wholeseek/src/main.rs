@@ -115,7 +115,8 @@ fn spawn_loader(tx: Sender<Booted>, wake: rune::Waker) {
     }
 }
 
-/// Window shortcuts: Ctrl+T new search tab, Ctrl+W close tab, Ctrl+(Shift+)Tab cycle tabs,
+/// Window shortcuts (Ctrl off macOS, ⌘ on it — Rune's `mods.cmd` / `is_command`; Ctrl also
+/// works for Tab and arrows there): Ctrl+T new search tab, Ctrl+W close tab, Ctrl+(Shift+)Tab cycle tabs,
 /// Ctrl+L / Ctrl+F the search field, Space play/pause, Ctrl+→ / Ctrl+← next / previous
 /// track, Escape closes a menu. Only keys the focused control left alone get here.
 pub fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
@@ -129,9 +130,9 @@ pub fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     let plain = !(ev.mods.ctrl || ev.mods.cmd || ev.mods.alt);
     match &ev.key {
         Key::Text(t) if t == " " && plain => s.toggle_pause(),
-        Key::Right if ev.mods.ctrl => s.next_track(),
-        Key::Left if ev.mods.ctrl => s.previous_track(),
-        Key::Tab if ev.mods.ctrl => {
+        Key::Right if ev.mods.cmd || ev.mods.ctrl => s.next_track(),
+        Key::Left if ev.mods.cmd || ev.mods.ctrl => s.previous_track(),
+        Key::Tab if ev.mods.cmd || ev.mods.ctrl => {
             s.cycle_tabs(if ev.mods.shift { -1 } else { 1 });
             s.restore_scroll(tx);
         }
@@ -244,6 +245,13 @@ fn scene_transfers(s: &mut App) {
     s.toggle_panel(Panel::Transfers);
 }
 
+/// The user's report: a search tab and a long-named user tab; the right cluster must show.
+fn scene_strip(s: &mut App) {
+    s.demo_login();
+    s.search_for("roadblock iration");
+    s.open_user("infectiphibian");
+}
+
 fn scene_settings(s: &mut App) {
     s.demo_search();
     s.play(&demo_file("alice", "02 Salt Roads.flac"));
@@ -301,6 +309,7 @@ fn main() {
             ("player-buffering", scene_player_buffering),
             ("displaced", scene_displaced),
             ("settings", scene_settings),
+            ("strip", scene_strip),
             ("onboarding-error", scene_onboarding_error),
             ("rejected", scene_rejected),
             ("uploads", scene_uploads),

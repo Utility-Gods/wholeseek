@@ -16,6 +16,9 @@ mod strip;
 mod user;
 #[cfg(test)]
 pub use files::more_key as files_more_key;
+pub use search::MAX_FORMAT_CHIPS;
+#[cfg(test)]
+pub use strip::{TAB_MIN_W, tab_split as strip_tab_split};
 
 use rune::tok::{TextStyle, Theme, type_};
 use rune::{Color, Cursor, Curve, Cx, El, TextEdit, col, el, row, text};

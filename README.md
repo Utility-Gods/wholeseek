@@ -7,7 +7,7 @@ Search, browse, press ▶ to hear a track instantly, and press ↓ only if you w
 
 - **Play before you download.** ▶ streams into a cache while the file arrives; nothing lands in
   your downloads folder unless you press ↓ Keep. Silent sources are skipped automatically.
-- **FLAC first.** Results are grouped by user and folder with length, size and quality.
+- **Any format.** Filter by FLAC, MP3, WAV or other; results are grouped by user and folder with length, size and quality, best-available sources first.
 - **Tabs.** Several searches and users open at once; click any username to browse their shares.
 - **Album playback.** Play a folder in order with the next track prefetched.
 - **A good network citizen.** Logs in, shares your folders, serves uploads, maps its port.
@@ -34,7 +34,7 @@ Your password is kept in the system keyring; settings live in `~/.config/wholese
 |---|---|
 | `app/wholeseek` | the desktop app (UI) |
 | `crates/wholeseek-core` | Soulseek session, search, browse, transfers, shares, config |
-| `crates/wholeseek-audio` | streaming FLAC/MP3 player that plays a file while it downloads |
+| `crates/wholeseek-audio` | streaming player (FLAC, MP3, WAV, OGG, AAC) that plays a file while it downloads |
 | `docs/` | MVP definition and core API |
 
 ## License

@@ -84,6 +84,7 @@ pub struct RowCtx {
 pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t: &Theme) -> El {
     let (playing, running) = now_playing(s, f);
     let audio = crate::tabs::is_audio(f);
+    let playable = crate::tabs::is_playable(f);
     let fg = if !audio {
         t.text_secondary.alpha(0.6)
     } else if playing {
@@ -91,7 +92,7 @@ pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t
     } else {
         t.text
     };
-    let play: El = if !audio {
+    let play: El = if !playable {
         el().w(PLAY_W)
     } else {
         let icon = if playing && running {
@@ -151,7 +152,7 @@ pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t
             }
             if e.mods.shift {
                 s.download(&file_k);
-            } else if crate::tabs::is_audio(&file_k) {
+            } else if crate::tabs::is_playable(&file_k) {
                 s.play_in(&file_k, &folder_k);
             }
             true

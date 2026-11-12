@@ -342,7 +342,7 @@ fn download_row(s: &App, i: usize, d: &Transfer, nested: bool, t: &Theme) -> El 
     let mut actions = row().gap(1.0).center_y().group_opacity(0.0, 1.0);
     match &d.state {
         TState::Done(path) => {
-            if crate::tabs::is_audio(&d.file) {
+            if crate::tabs::is_playable(&d.file) {
                 actions = actions.child(
                     small("play", icons::play(9.0, t.text), "Play", t)
                         .on_press(move |s: &mut App| s.play_local(id)),
