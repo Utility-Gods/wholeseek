@@ -127,7 +127,8 @@ impl App {
         crate::menu::folder_items(username, folder, playable)
     }
 
-    /// The files of a remote folder as far as the app knows them, in path order.
+    /// The files of a remote folder as far as the app knows them, in natural name order
+    /// ([`crate::tabs::natural_cmp`]), the order its rows are listed in.
     pub fn folder_files(&self, username: &str, folder: &str) -> Vec<RemoteFile> {
         let listed = self
             .tabs
@@ -137,7 +138,8 @@ impl App {
             .and_then(|b| b.dirs.as_ref())
             .and_then(|d| d.iter().find(|d| d.path == folder))
             .map(|d| d.files.clone());
-        if let Some(files) = listed {
+        if let Some(mut files) = listed {
+            crate::tabs::sort_files(&mut files);
             return files;
         }
         let mut seen = std::collections::HashSet::new();
@@ -148,7 +150,7 @@ impl App {
             .filter(|f| f.username == username && f.folder() == folder)
             .filter(|f| seen.insert(f.path.clone()))
             .collect();
-        files.sort_by(|a, b| a.path.cmp(&b.path));
+        crate::tabs::sort_files(&mut files);
         files
     }
 

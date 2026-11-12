@@ -529,7 +529,11 @@ impl App {
                     s.finished = true;
                 }
             }
-            CoreEvent::BrowseResult { username, dirs } => {
+            CoreEvent::BrowseResult { username, mut dirs } => {
+                // User tabs list a folder's files in the same natural order as search groups.
+                for d in &mut dirs {
+                    crate::tabs::sort_files(&mut d.files);
+                }
                 if let Some(b) = self.browse_of(&username) {
                     b.dirs = Some(dirs);
                     b.error = None;

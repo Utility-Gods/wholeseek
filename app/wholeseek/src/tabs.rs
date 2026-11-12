@@ -40,6 +40,49 @@ pub struct SearchView {
     pub finished: bool,
 }
 
+/// Natural filename order, the one order for files inside a folder (search groups, user
+/// tabs, album queues): case-insensitive, digit runs compared as numbers, so "2" < "10" and
+/// disc prefixes "1-02" < "1-10" < "2-01". Ties fall back to the raw strings.
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (x.peek().copied(), y.peek().copied()) {
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(c), Some(d)) if c.is_ascii_digit() && d.is_ascii_digit() => {
+                let run = |it: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut s = String::new();
+                    while let Some(c) = it.next_if(char::is_ascii_digit) {
+                        s.push(c);
+                    }
+                    s
+                };
+                let (m, n) = (run(&mut x), run(&mut y));
+                let (mt, nt) = (m.trim_start_matches('0'), n.trim_start_matches('0'));
+                let o = mt.len().cmp(&nt.len()).then_with(|| mt.cmp(nt));
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            (Some(c), Some(d)) => {
+                let o = c.to_lowercase().cmp(d.to_lowercase());
+                if o != Ordering::Equal {
+                    return o;
+                }
+                x.next();
+                y.next();
+            }
+        }
+    }
+}
+
+/// Sorts a folder's files by [`natural_cmp`] on their names.
+pub fn sort_files(files: &mut [RemoteFile]) {
+    files.sort_by(|a, b| natural_cmp(a.basename(), b.basename()));
+}
+
 /// The format chip a file counts under, by extension, with aliases grouped (m4a/aac →
 /// "AAC/M4A", aif/aiff → "AIFF"). `None` for non-audio. Every audio extension the core
 /// knows (`rank::AUDIO_EXTENSIONS`) has a group.
@@ -143,6 +186,14 @@ impl SearchView {
             match g.folders.iter_mut().find(|(f, _)| f == folder) {
                 Some((_, v)) => v.push(i),
                 None => g.folders.push((folder.to_string(), vec![i])),
+            }
+        }
+        // Ranking orders users and their folders; inside a folder, files go by name.
+        for g in &mut groups {
+            for (_, v) in &mut g.folders {
+                v.sort_by(|&a, &b| {
+                    natural_cmp(self.hits[a].file.basename(), self.hits[b].file.basename())
+                });
             }
         }
         groups

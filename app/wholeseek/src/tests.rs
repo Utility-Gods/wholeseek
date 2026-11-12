@@ -1004,7 +1004,7 @@ fn results_are_grouped_by_user_then_folder() {
     assert_eq!(groups[0].folders.len(), 2, "Coastline and Night Ferry");
     assert!(rt.find("group-0/user").is_some() && rt.find("group-0/meta").is_some());
     assert!(rt.find("folder-0-0").is_some() && rt.find("folder-0-1").is_some());
-    // Rows under a folder are that folder's files, in rank order.
+    // Rows under a folder are that folder's files, in natural name order.
     let first = &groups[0].folders[0];
     for i in &first.1 {
         assert_eq!(sv(&rt).hits[*i].file.folder(), first.0);
@@ -2393,4 +2393,169 @@ fn a_late_prefetch_for_an_abandoned_queue_fetches_nothing() {
     let before = fetches(&rt);
     rt.update(|s, _| s.apply_player(late));
     assert_eq!(fetches(&rt), before);
+}
+
+// ---- natural file order inside a folder ---------------------------------------------------------
+
+#[test]
+fn natural_order_by_number_disc_and_case() {
+    use crate::tabs::natural_cmp;
+    let mut v = vec![
+        "10 Ten.flac",
+        "2 Two.flac",
+        "1-10 x.flac",
+        "2-01 y.flac",
+        "1-02 z.flac",
+        "b.flac",
+        "A.flac",
+        "01 One.flac",
+        "track9.mp3",
+        "Track10.mp3",
+    ];
+    v.sort_by(|a, b| natural_cmp(a, b));
+    assert_eq!(
+        v,
+        [
+            "01 One.flac",
+            "1-02 z.flac",
+            "1-10 x.flac",
+            "2 Two.flac",
+            "2-01 y.flac",
+            "10 Ten.flac",
+            "A.flac",
+            "b.flac",
+            "track9.mp3",
+            "Track10.mp3",
+        ]
+    );
+    assert!(natural_cmp("2", "10").is_lt() && natural_cmp("1-02", "2-01").is_lt());
+    assert!(natural_cmp("abc", "ABD").is_lt(), "case-insensitive");
+    assert!(
+        natural_cmp("02 a", "2 a").is_ne(),
+        "a total order: ties fall back to bytes"
+    );
+}
+
+/// Hit indices of a search folder group's rows, top to bottom as drawn.
+fn drawn_rows(rt: &Runtime<App>, idx: &[usize]) -> Vec<usize> {
+    let mut v: Vec<(f32, usize)> = idx
+        .iter()
+        .map(|&i| {
+            (
+                rt.presented(&format!("row-{i}")).expect("row drawn").0[1],
+                i,
+            )
+        })
+        .collect();
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    v.into_iter().map(|(_, i)| i).collect()
+}
+
+#[test]
+fn files_in_a_search_folder_are_in_track_order_and_groups_keep_rank_order() {
+    let rt = searched();
+    let st = rt.state.tab().search().unwrap();
+    let v = st.search.as_ref().unwrap();
+    let groups = v.groups(&st.filters);
+    // Groups still follow ranking: users by availability, alice's folders as they arrived.
+    let users: Vec<_> = groups.iter().map(|g| g.username.as_str()).collect();
+    assert_eq!(&users[..3], ["alice", "vinyl_rips", "dj_ivo"]);
+    assert_eq!(groups[0].folders[0].0, COAST);
+    assert_eq!(groups[0].folders[1].0, FERRY);
+    // The hits arrive out of track order (03, 06, 01, …); the rows read 01…06.
+    let coast = &groups[0].folders[0].1;
+    let arrival: Vec<_> = {
+        let mut a = coast.clone();
+        a.sort();
+        a.iter()
+            .map(|&i| v.hits[i].file.basename().to_string())
+            .collect()
+    };
+    assert_ne!(
+        arrival[0], "01 Northern Glass.flac",
+        "the demo really arrives shuffled"
+    );
+    let names: Vec<_> = drawn_rows(&rt, coast)
+        .into_iter()
+        .map(|i| v.hits[i].file.basename().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "01 Northern Glass.flac",
+            "02 Salt Roads.flac",
+            "03 Low Tide Radio.flac",
+            "04 Breakwater.flac",
+            "05 A Lamp in the Dunes.flac",
+            "06 Coastline.flac",
+        ]
+    );
+}
+
+#[test]
+fn the_album_queue_from_a_search_group_plays_in_the_rows_order() {
+    let mut rt = searched();
+    let st = rt.state.tab().search().unwrap();
+    let v = st.search.as_ref().unwrap();
+    let coast = v.groups(&st.filters)[0].folders[0].1.clone();
+    let rows: Vec<_> = drawn_rows(&rt, &coast)
+        .into_iter()
+        .map(|i| v.hits[i].file.clone())
+        .collect();
+    // ▶ on the row drawn 3rd: the queue is the rows in order, starting there.
+    let third = rows[2].clone();
+    let (i, _) = row_of(&rt, "alice", third.basename());
+    click(&mut rt, &format!("row-{i}/play"));
+    let q = rt.state.queue.as_ref().unwrap();
+    let queued: Vec<_> = q.items.iter().map(|it| it.file.clone()).collect();
+    assert_eq!(
+        queued, rows,
+        "same order as the rows, the .jpg/.log left out"
+    );
+    assert_eq!(q.index, 2);
+    // "Play folder" builds the same queue.
+    rt.update(|s, _| s.play_folder("alice", COAST));
+    let q = rt.state.queue.as_ref().unwrap();
+    assert_eq!(
+        q.items.iter().map(|it| it.file.clone()).collect::<Vec<_>>(),
+        rows
+    );
+}
+
+#[test]
+fn user_tabs_list_files_in_the_same_natural_order() {
+    let mut rt = signed_in();
+    let mk = |n: &str| wholeseek_core::RemoteFile {
+        username: "zed".into(),
+        path: format!("A\\{n}"),
+        size: 1,
+        attrs: Default::default(),
+    };
+    rt.update(|s, _| {
+        s.open_user("zed");
+        s.apply(wholeseek_core::CoreEvent::BrowseResult {
+            username: "zed".into(),
+            dirs: vec![wholeseek_core::BrowseDir {
+                path: "A".into(),
+                files: ["10 c.flac", "2 b.flac", "1 A.flac", "cover.JPG"]
+                    .map(mk)
+                    .to_vec(),
+            }],
+        });
+    });
+    run(&mut rt, 0.3);
+    let b = rt.state.tab().browse().unwrap();
+    let names: Vec<_> = b.dirs.as_ref().unwrap()[0]
+        .files
+        .iter()
+        .map(|f| f.basename())
+        .collect();
+    assert_eq!(names, ["1 A.flac", "2 b.flac", "10 c.flac", "cover.JPG"]);
+    let q: Vec<_> = rt
+        .state
+        .folder_files("zed", "A")
+        .iter()
+        .map(|f| f.basename().to_string())
+        .collect();
+    assert_eq!(q, names, "the queue uses the listing's order");
 }
