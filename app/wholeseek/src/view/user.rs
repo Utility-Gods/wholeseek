@@ -94,11 +94,20 @@ fn tree(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
     let filter = field_box(
         "tree-filter",
         input(&b.filter, "Filter folders", t)
-            .on_edit(|s: &mut App| &mut s.active_browse_mut().expect("user tab is shown").filter),
+            .key("tree-find")
+            .on_edit(|s: &mut App| &mut s.active_browse_mut().expect("user tab is shown").filter)
+            .on_input_change(|s: &mut App, _| {
+                // Cleared: back to the whole tree, at the selected folder.
+                if let Some(b) = s.active_browse_mut()
+                    && b.filter.text.trim().is_empty()
+                {
+                    b.reveal_tree = true;
+                }
+            }),
         t,
     )
     .w_full();
-    let mut list = col().w_full().py(4.0);
+    let mut list = col().w_full().py(crate::tabs::TREE_PAD);
     for (i, (path, depth, has_children, open)) in b.visible_tree().into_iter().enumerate() {
         let selected = b.selected.as_deref() == Some(path.as_str());
         let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
@@ -110,7 +119,7 @@ fn tree(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
         let p = path.clone();
         let mut r = row()
             .key(format!("dir-{i}"))
-            .h(24.0)
+            .h(crate::tabs::TREE_ROW_H)
             .w_full()
             .pl(8.0 + 12.0 * depth as f32)
             .pr(8.0)
@@ -149,7 +158,7 @@ fn tree(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
         };
         list = list.child(r);
     }
-    let saved = tab.tree_scroll.clone();
+    let (saved, view_h) = (tab.tree_scroll.clone(), tab.tree_view_h.clone());
     col()
         .key("tree")
         .w(TREE_W)
@@ -161,7 +170,10 @@ fn tree(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
                 .scroll(ScrollSpec {
                     stick_bottom: false,
                 })
-                .on_scroll_offset(move |at: ScrollPos| saved.set(at.offset[1]))
+                .on_scroll_offset(move |at: ScrollPos| {
+                    saved.set(at.offset[1]);
+                    view_h.set(at.viewport[1]);
+                })
                 .shrink()
                 .min_h(0.0),
         )

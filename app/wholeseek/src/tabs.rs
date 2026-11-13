@@ -18,6 +18,8 @@ pub struct Tab {
     pub scroll: Rc<Cell<f32>>,
     /// Folder tree scroll offset (user tabs).
     pub tree_scroll: Rc<Cell<f32>>,
+    /// The folder tree viewport's height, as last laid out (0 until then).
+    pub tree_view_h: Rc<Cell<f32>>,
     /// The selected file row (remote path): Enter plays it, its ⋯ stays visible.
     pub selected: Option<String>,
     /// A search tab's selected folder group (user, folder): what the inspector shows. `None`:
@@ -703,7 +705,13 @@ pub struct BrowseView {
     pub filter: TextEdit,
     /// A file (remote path) to mark in the selected folder (deep links from search).
     pub highlight: Option<String>,
+    /// The tree should scroll to the selected folder once it's listed ([`Tab::take_tree_reveal`]).
+    pub reveal_tree: bool,
 }
+
+/// A folder tree row's height, and the list's padding above the first one.
+pub const TREE_ROW_H: f32 = 24.0;
+pub const TREE_PAD: f32 = 4.0;
 
 impl BrowseView {
     pub fn new(username: &str) -> Self {
@@ -715,11 +723,33 @@ impl BrowseView {
             expanded: BTreeSet::new(),
             filter: TextEdit::new(""),
             highlight: None,
+            reveal_tree: false,
         }
     }
 
-    /// Select a folder and expand its ancestors so it is visible in the tree.
+    /// The selected folder's row in [`BrowseView::visible_tree`], without building it: one
+    /// pass over the folders (5–80k), counting the rows drawn above it.
+    pub fn tree_row_of_selected(&self) -> Option<usize> {
+        let sel = self.selected.as_deref()?;
+        let (all, keep) = self.tree_sets();
+        let mut row = 0;
+        for p in &all {
+            if !self.shown(p, keep.as_ref()) {
+                continue;
+            }
+            if p == sel {
+                return Some(row);
+            }
+            row += 1;
+        }
+        None
+    }
+
+    /// Select a folder and expand its ancestors so it is visible in the tree, which then
+    /// scrolls to it ([`Tab::take_tree_reveal`]). A click in the tree uses
+    /// [`BrowseView::press_dir`] instead, which never scrolls.
     pub fn select(&mut self, path: &str) {
+        self.reveal_tree = true;
         let mut prefix = String::new();
         for part in path.split('\\') {
             if !prefix.is_empty() {
@@ -754,6 +784,25 @@ impl BrowseView {
     /// Folder tree rows to draw: (path, depth, has children, expanded), in order. With a
     /// filter, only folders whose name matches (and their ancestors) show, all open.
     pub fn visible_tree(&self) -> Vec<(String, usize, bool, bool)> {
+        let (all, keep) = self.tree_sets();
+        let mut out = Vec::new();
+        for p in &all {
+            if !self.shown(p, keep.as_ref()) {
+                continue;
+            }
+            let open = keep.is_some() || self.expanded.contains(p);
+            let child_prefix = format!("{p}\\");
+            let has_children = all
+                .range(child_prefix.clone()..)
+                .next()
+                .is_some_and(|n| n.starts_with(&child_prefix));
+            out.push((p.clone(), p.matches('\\').count(), has_children, open));
+        }
+        out
+    }
+
+    /// Every folder path (with its ancestors), and with a filter the ones it keeps.
+    fn tree_sets(&self) -> (BTreeSet<String>, Option<BTreeSet<String>>) {
         let mut all = BTreeSet::new();
         for d in self.dirs.iter().flatten() {
             let mut prefix = String::new();
@@ -781,32 +830,22 @@ impl BrowseView {
             }
             keep
         });
-        let mut out = Vec::new();
-        for p in &all {
-            if keep.as_ref().is_some_and(|k| !k.contains(p)) {
-                continue;
-            }
-            let open = |a: &str| keep.is_some() || self.expanded.contains(a);
-            let mut visible = true;
-            let mut anc = p.as_str();
-            while let Some(i) = anc.rfind('\\') {
-                anc = &anc[..i];
-                if !open(anc) {
-                    visible = false;
-                    break;
-                }
-            }
-            if !visible {
-                continue;
-            }
-            let child_prefix = format!("{p}\\");
-            let has_children = all
-                .range(child_prefix.clone()..)
-                .next()
-                .is_some_and(|n| n.starts_with(&child_prefix));
-            out.push((p.clone(), p.matches('\\').count(), has_children, open(p)));
+        (all, keep)
+    }
+
+    /// Whether folder `p` has a tree row: kept by the filter, every ancestor open.
+    fn shown(&self, p: &str, keep: Option<&BTreeSet<String>>) -> bool {
+        if let Some(k) = keep {
+            return k.contains(p); // a filter keeps ancestors and shows them all open
         }
-        out
+        let mut anc = p;
+        while let Some(i) = anc.rfind('\\') {
+            anc = &anc[..i];
+            if !self.expanded.contains(anc) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -817,10 +856,36 @@ impl Tab {
             kind,
             scroll: Rc::default(),
             tree_scroll: Rc::default(),
+            tree_view_h: Rc::default(),
             selected: None,
             group: None,
             restore: false,
         }
+    }
+
+    /// A user tab's folder selected other than by a click in the tree (a deep link, "Show
+    /// in list", a restored session, the filter cleared): once the share list is in, the
+    /// tree row to centre, as (tree key, row key). `None` while it's still loading, and when
+    /// the row is already in view (nothing moves).
+    pub fn take_tree_reveal(&mut self) -> Option<(String, String)> {
+        let key = self.tree_key();
+        let (off, h) = (self.tree_scroll.get(), self.tree_view_h.get());
+        let b = self.browse_mut()?;
+        if !b.reveal_tree {
+            return None;
+        }
+        if b.error.is_some() {
+            b.reveal_tree = false;
+            return None;
+        }
+        b.dirs.as_ref()?;
+        b.reveal_tree = false;
+        let i = b.tree_row_of_selected()?;
+        let top = TREE_PAD + TREE_ROW_H * i as f32;
+        if h > 0.0 && top >= off && top + TREE_ROW_H <= off + h {
+            return None;
+        }
+        Some((key, format!("dir-{i}")))
     }
 
     /// × / Esc on the search inspector: close it (the selection goes with it). False when
