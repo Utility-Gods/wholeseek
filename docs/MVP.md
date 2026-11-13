@@ -24,11 +24,12 @@ A minimal native desktop Soulseek client for music: **search, browse a user, pla
 | Player | Small bottom strip: play/pause, seek (within buffered range), volume, track/user. One track at a time. |
 | Download | File or whole folder; keeps folder name. |
 | Transfers | Compact expandable panel: downloads + uploads, progress, cancel, retry. |
-| Settings | Account, shares, download folder, listen port, slots/speed limit. |
+| Library | Your own music, played in place (never copied): choose folders (default: Music + Downloads); background incremental scan; Albums and Songs views; instant search; star songs/albums; play song/album as queue. |
+| Settings | Account, shares, download folder, library folders, listen port, slots/speed limit. |
 
 ## Out of scope
 
-Chat/rooms, private messages, wishlist, buddies, playlists/queue, library, tags, artwork, themes, Windows/macOS builds.
+Chat/rooms, private messages, wishlist, buddies, playlists, tag editing, artist pages, themes, Windows builds.
 
 ## Layout
 
