@@ -222,6 +222,8 @@ pub struct App {
     waker: Option<rune::Waker>,
     /// Saved tabs: restored at sign-in, saved as they change ([`restore`]).
     session: restore::SessionState,
+    /// System media keys / now playing ([`crate::media`]); started in setup, None in tests.
+    pub media: Option<crate::media::Media>,
 }
 
 /// What the startup load found, and how to start the session with it.
@@ -316,6 +318,7 @@ impl App {
             boot: None,
             waker: None,
             session: Default::default(),
+            media: None,
         };
         app.new_search_tab();
         app.begin(startup);
@@ -471,6 +474,7 @@ impl App {
         for e in player_events {
             self.apply_player(e);
         }
+        changed |= self.media_tick();
         let mut wake = self.backend.next_tick();
         let downloaded = self.backend.downloaded_keys();
         if !std::sync::Arc::ptr_eq(&downloaded, &self.downloaded) && *downloaded != *self.downloaded

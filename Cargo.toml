@@ -14,6 +14,13 @@ soulseek-rs-lib = { git = "https://github.com/michel/soulseek-rs", rev = "434dcc
 rune = { git = "https://github.com/anomalyco/rune", rev = "01349dbf2dd01a4e0e1cf3e5aa6e9dc0521291a1" }
 wholeseek-core = { path = "crates/wholeseek-core" }
 wholeseek-audio = { path = "crates/wholeseek-audio" }
+# System media keys (app/wholeseek/src/media.rs). Linux: MPRIS over zbus, already in the lock via
+# rune/accesskit (pure Rust, no libdbus). macOS: MediaPlayer bindings, same objc2 family as winit.
+zbus = { version = "5.19.0", default-features = false }
+objc2 = { version = "0.6.2", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3.2", default-features = false }
+block2 = { version = "0.6.2", default-features = false }
+objc2-media-player = { version = "0.3.2", default-features = false }
 
 # Rune requires its consumers to patch these from its vendor/ dir (a dependency's [patch] does not
 # apply to the workspace that depends on it). Same pinned rev as the `rune` dependency above.

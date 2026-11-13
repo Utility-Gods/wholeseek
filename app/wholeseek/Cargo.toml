@@ -12,3 +12,13 @@ wholeseek-audio = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
+
+# System media keys (src/media.rs); each platform pulls only its own.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { workspace = true, features = ["async-io", "blocking-api"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true, features = ["std", "NSString", "NSDictionary", "NSValue", "NSObject"] }
+block2 = { workspace = true, features = ["std"] }
+objc2-media-player = { workspace = true, features = ["std", "block2", "MPRemoteCommandCenter", "MPRemoteCommand", "MPRemoteCommandEvent", "MPNowPlayingInfoCenter", "MPMediaItem"] }

@@ -17,6 +17,7 @@ mod demo_history;
 mod desktop;
 mod fmt;
 mod history;
+mod media;
 mod menu;
 mod playback;
 mod profile;
@@ -81,6 +82,7 @@ pub fn poll(s: &mut App, t: f64, tx: &mut Tx) -> bool {
 }
 
 fn setup(s: &mut App, wake: rune::Waker) {
+    s.media = media::Media::start(wake.clone());
     s.set_waker(wake.clone());
     let tx = BOOT_TX.lock().ok().and_then(|mut t| t.take());
     if let Some(tx) = tx {
