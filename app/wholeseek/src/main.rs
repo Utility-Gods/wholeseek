@@ -13,6 +13,7 @@ mod actions;
 mod app;
 mod backend;
 mod demo;
+mod demo_big;
 mod demo_history;
 mod desktop;
 mod fmt;
@@ -30,6 +31,8 @@ mod transfers;
 mod update;
 mod view;
 
+#[cfg(test)]
+mod perf_tests;
 #[cfg(test)]
 mod session_tests;
 #[cfg(test)]
@@ -399,6 +402,12 @@ fn scene_tree_reveal(s: &mut App) {
     s.open_folder_at(demo::DEEP_USER, demo::DEEP_FOLDER, None);
 }
 
+/// The long-list share (5,001 folders, 60,000 files) at an album deep in it.
+fn scene_big_share(s: &mut App) {
+    s.demo_search();
+    s.open_folder_at(demo_big::BIG_USER, demo_big::BIG_FOLDER, None);
+}
+
 /// Context menus as a right-click opens them (at the pointer), for review.
 fn scene_menu_tree(s: &mut App) {
     scene_tree_reveal(s);
@@ -584,6 +593,7 @@ fn main() {
             ("nothing-matches", scene_nothing_matches),
             ("user-tab", scene_browse),
             ("tree-reveal", scene_tree_reveal),
+            ("big-share", scene_big_share),
             ("menu-tree", scene_menu_tree),
             ("menu-tree-parent", scene_menu_tree_parent),
             ("menu-user-file", scene_menu_user_file),

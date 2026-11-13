@@ -729,6 +729,9 @@ impl DemoBackend {
         if username == DEEP_USER {
             return deep_share();
         }
+        if username == crate::demo_big::BIG_USER {
+            return crate::demo_big::share();
+        }
         if username == "alice" {
             dirs.push(BrowseDir {
                 path: r"Music\Unsorted".into(),

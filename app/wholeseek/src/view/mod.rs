@@ -19,6 +19,7 @@ mod search;
 mod strip;
 pub(crate) mod update;
 mod user;
+pub(crate) mod virtual_list;
 #[cfg(test)]
 pub use details::{INSPECTOR_W, RESULTS_MAX_W};
 pub use search::sort_items;

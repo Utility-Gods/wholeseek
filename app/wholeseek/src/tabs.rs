@@ -1,7 +1,7 @@
 //! Tabs: each search and each browsed user is a tab that owns its own state, so switching
 //! tabs keeps the query, results, filters, selected folder and scroll position.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
@@ -707,7 +707,17 @@ pub struct BrowseView {
     pub highlight: Option<String>,
     /// The tree should scroll to the selected folder once it's listed ([`Tab::take_tree_reveal`]).
     pub reveal_tree: bool,
+    /// [`BrowseView::visible_tree`] as last derived, with its inputs' fingerprint.
+    tree_cache: RefCell<Option<(u64, TreeRows)>>,
+    /// [`BrowseView::selected_files`] as last shared, by (folder, file count, buffer).
+    files_cache: RefCell<Option<FilesCache>>,
 }
+
+type FilesCache = ((String, usize, usize), Rc<[RemoteFile]>);
+
+/// Folder tree rows: (path, depth, has children, expanded), in order.
+pub type TreeRows = Rc<[TreeRow]>;
+pub type TreeRow = (String, usize, bool, bool);
 
 /// A folder tree row's height, and the list's padding above the first one.
 pub const TREE_ROW_H: f32 = 24.0;
@@ -724,6 +734,8 @@ impl BrowseView {
             filter: TextEdit::new(""),
             highlight: None,
             reveal_tree: false,
+            tree_cache: RefCell::default(),
+            files_cache: RefCell::default(),
         }
     }
 
@@ -731,18 +743,7 @@ impl BrowseView {
     /// pass over the folders (5–80k), counting the rows drawn above it.
     pub fn tree_row_of_selected(&self) -> Option<usize> {
         let sel = self.selected.as_deref()?;
-        let (all, keep) = self.tree_sets();
-        let mut row = 0;
-        for p in &all {
-            if !self.shown(p, keep.as_ref()) {
-                continue;
-            }
-            if p == sel {
-                return Some(row);
-            }
-            row += 1;
-        }
-        None
+        self.visible_tree().iter().position(|r| r.0 == sel)
     }
 
     /// Select a folder and expand its ancestors so it is visible in the tree, which then
@@ -801,7 +802,53 @@ impl BrowseView {
 
     /// Folder tree rows to draw: (path, depth, has children, expanded), in order. With a
     /// filter, only folders whose name matches (and their ancestors) show, all open.
-    pub fn visible_tree(&self) -> Vec<(String, usize, bool, bool)> {
+    ///
+    /// Derived again only when the folders, the open ones or the filter change: the view asks
+    /// every run, and a 5k-folder share takes milliseconds to walk.
+    pub fn visible_tree(&self) -> TreeRows {
+        self.tree_rows().1
+    }
+
+    /// [`BrowseView::visible_tree`] with its revision, which changes whenever the rows do.
+    pub fn tree_rows(&self) -> (u64, TreeRows) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        for d in self.dirs.iter().flatten() {
+            d.path.hash(&mut h);
+        }
+        self.expanded.hash(&mut h);
+        self.filter.text.trim().to_lowercase().hash(&mut h);
+        let fp = h.finish();
+        if let Some((at, rows)) = &*self.tree_cache.borrow()
+            && *at == fp
+        {
+            return (fp, rows.clone());
+        }
+        let rows: TreeRows = self.derive_tree().into();
+        *self.tree_cache.borrow_mut() = Some((fp, rows.clone()));
+        (fp, rows)
+    }
+
+    /// The selected folder's files, shared (rows hand them to ▶ as the play queue): the same
+    /// `Rc` while the folder and its listing stay.
+    pub fn selected_files(&self) -> Option<Rc<[RemoteFile]>> {
+        let dir = self.selected_dir()?;
+        let id = (
+            dir.path.clone(),
+            dir.files.len(),
+            dir.files.as_ptr() as usize,
+        );
+        if let Some((at, files)) = &*self.files_cache.borrow()
+            && *at == id
+        {
+            return Some(files.clone());
+        }
+        let files: Rc<[RemoteFile]> = dir.files.clone().into();
+        *self.files_cache.borrow_mut() = Some((id, files.clone()));
+        Some(files)
+    }
+
+    fn derive_tree(&self) -> Vec<(String, usize, bool, bool)> {
         let (all, keep) = self.tree_sets();
         let mut out = Vec::new();
         for p in &all {

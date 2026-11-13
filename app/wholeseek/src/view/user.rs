@@ -2,14 +2,15 @@
 //! selected folder's files on the right.
 
 use rune::tok::{Theme, type_};
-use rune::{Cursor, El, ScrollPos, ScrollSpec, col, el, row, text};
+use rune::{Cursor, El, col, el, row, text};
 
 use std::rc::Rc;
 
 use wholeseek_core::RemoteFile;
 
 use super::album_header::{self, Actions, AlbumHeader, UserStatus};
-use super::files::{RowCtx, columns, file_row, more_key};
+use super::files::{ROW_H, RowCtx, columns, file_row, more_key};
+use super::virtual_list::{ListScroll, virtual_list};
 use super::{field_box, hairline, icons, input, red, vline};
 use crate::app::App;
 use crate::tabs::{BrowseView, Tab};
@@ -83,7 +84,7 @@ pub fn page(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
             .w_full()
             .grow(1.0)
             .min_h(0.0)
-            .child(tree(s, tab, b, t))
+            .child(tree(tab, b, t))
             .child(vline(t))
             .child(folder(s, tab, b, t))
     };
@@ -95,7 +96,7 @@ fn tree_more_key(i: usize) -> String {
     format!("dir-more-{i}")
 }
 
-fn tree(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
+fn tree(tab: &Tab, b: &BrowseView, t: &Theme) -> El {
     let filter = field_box(
         "tree-filter",
         input(&b.filter, "Filter folders", t)
@@ -112,10 +113,46 @@ fn tree(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
         t,
     )
     .w_full();
-    let mut list = col().w_full().py(crate::tabs::TREE_PAD);
-    for (i, (path, depth, has_children, open)) in b.visible_tree().into_iter().enumerate() {
+    // Only the rows in view are built (a share can have tens of thousands of folders); each
+    // keeps its `dir-{i}` key, which reveals and tests address.
+    let (rev, rows) = b.tree_rows();
+    let scroll = ListScroll::sharing(
+        tab.tree_key(),
+        tab.tree_scroll.clone(),
+        tab.tree_view_h.clone(),
+    );
+    let (id, theme) = (tab.id, *t);
+    let list = virtual_list(
+        &scroll,
+        rows.len(),
+        crate::tabs::TREE_ROW_H,
+        move |s: &App, i| {
+            let b = s.tabs.iter().find(|t| t.id == id).and_then(|t| t.browse());
+            match b.zip(rows.get(i)) {
+                Some((b, r)) => tree_row(s, b, i, r, &theme),
+                None => el(),
+            }
+        },
+    )
+    .row_key(|_: &App, i| format!("dir-{i}").into())
+    .version((rev, b.selected.as_deref()))
+    .pad(crate::tabs::TREE_PAD)
+    .build();
+    col()
+        .key("tree")
+        .w(TREE_W)
+        .h_full()
+        .min_h(0.0)
+        .child(row().w_full().px(8.0).py(8.0).child(filter))
+        .child(list)
+}
+
+/// Tree row `i`: `(path, depth, has children, open)`.
+fn tree_row(s: &App, b: &BrowseView, i: usize, r: &crate::tabs::TreeRow, t: &Theme) -> El {
+    let (path, depth, has_children, open) = (&r.0, r.1, r.2, r.3);
+    {
         let selected = b.selected.as_deref() == Some(path.as_str());
-        let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
+        let name = path.rsplit('\\').next().unwrap_or(path).to_string();
         let chevron: El = if has_children {
             icons::chevron(icons::SM, open, t.text_secondary)
         } else {
@@ -159,7 +196,7 @@ fn tree(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
                     .shrink(),
             );
         // Cached covers only, at the row's end (the name never moves).
-        if let Some(th) = super::art::row_thumb(s, "thumb", &b.username, &path, super::art::SMALL) {
+        if let Some(th) = super::art::row_thumb(s, "thumb", &b.username, path, super::art::SMALL) {
             r = r.child(rune::el().grow(1.0)).child(th);
         }
         // ⋯ at the row's right edge, over the end of a long name: on the selected row, and on
@@ -189,27 +226,8 @@ fn tree(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
         } else {
             r.hover(t.hover)
         };
-        list = list.child(r);
+        r
     }
-    let (saved, view_h) = (tab.tree_scroll.clone(), tab.tree_view_h.clone());
-    col()
-        .key("tree")
-        .w(TREE_W)
-        .h_full()
-        .min_h(0.0)
-        .child(row().w_full().px(8.0).py(8.0).child(filter))
-        .child(
-            list.key(tab.tree_key())
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                })
-                .on_scroll_offset(move |at: ScrollPos| {
-                    saved.set(at.offset[1]);
-                    view_h.set(at.viewport[1]);
-                })
-                .shrink()
-                .min_h(0.0),
-        )
 }
 
 fn folder(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
@@ -237,29 +255,40 @@ fn folder(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
         t,
     );
     let head = super::art::beside(s, &b.username, &dir.path, NAME_X, head, t);
-    let mut list = col().w_full().pb(8.0);
-    let files: Rc<[RemoteFile]> = dir.files.clone().into();
-    for (i, f) in dir.files.iter().enumerate() {
-        let ctx = RowCtx {
-            folder: files.clone(),
-            in_user_tab: true,
-            selected: tab.selected.as_deref() == Some(f.path.as_str()),
-            highlighted: b.highlight.as_deref() == Some(f.path.as_str()),
-            more_key: more_key(tab.id, &f.path),
-            find: None,
-        };
-        list = list.child(file_row(s, &format!("file-{i}"), f, 0.0, &ctx, t));
-    }
-    if dir.files.is_empty() {
-        list = list.child(
+    // Only the files in view are built (a folder can hold thousands).
+    let files: Rc<[RemoteFile]> = b.selected_files().unwrap_or_else(|| Rc::from([]));
+    let list: El = if files.is_empty() {
+        col().key(tab.list_key()).grow(1.0).child(
             text("No files")
                 .font(type_::BODY)
                 .color(t.text_secondary)
                 .px(12.0)
                 .pt(12.0),
-        );
-    }
-    let saved = tab.scroll.clone();
+        )
+    } else {
+        let scroll = ListScroll::sharing(tab.list_key(), tab.scroll.clone(), Rc::default());
+        let (id, theme, n) = (tab.id, *t, files.len());
+        let rev = (n, Rc::as_ptr(&files) as *const () as usize);
+        virtual_list(&scroll, n, ROW_H, move |s: &App, i| {
+            let Some(tab) = s.tabs.iter().find(|t| t.id == id) else {
+                return el();
+            };
+            let (b, f) = (tab.browse(), &files[i]);
+            let ctx = RowCtx {
+                folder: files.clone(),
+                in_user_tab: true,
+                selected: tab.selected.as_deref() == Some(f.path.as_str()),
+                highlighted: b.and_then(|b| b.highlight.as_deref()) == Some(f.path.as_str()),
+                more_key: more_key(id, &f.path),
+                find: None,
+            };
+            file_row(s, &format!("file-{i}"), f, 0.0, &ctx, &theme)
+        })
+        .row_key(|_: &App, i| format!("file-{i}").into())
+        .version(rev)
+        .build()
+        .pb(8.0)
+    };
     col()
         .grow(1.0)
         .min_w(0.0)
@@ -269,13 +298,5 @@ fn folder(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
         .child(hairline(t))
         .child(columns(s, 0.0, t))
         .child(hairline(t))
-        .child(
-            list.key(tab.list_key())
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                })
-                .on_scroll_offset(move |at: ScrollPos| saved.set(at.offset[1]))
-                .shrink()
-                .min_h(0.0),
-        )
+        .child(list)
 }
