@@ -4,7 +4,11 @@
 
 const REPO = "Utility-Gods/wholeseek";
 const API = `https://api.github.com/repos/${REPO}/releases?per_page=30`;
+// The API's anonymous limit is per IP, and Cloudflare's outbound IPs are shared, so it often
+// answers 403. The releases Atom feed isn't API-limited; its dates are last-edit times.
+const FEED = `https://github.com/${REPO}/releases.atom`;
 const FRESH_SECONDS = 600; // Re-ask GitHub at most every 10 minutes.
+const BACKUP_SECONDS = 30 * 24 * 3600; // Last good page, served if GitHub can't be reached.
 
 export default {
   async fetch(request, env, ctx) {
@@ -16,28 +20,74 @@ export default {
   },
 };
 
+async function fromApi() {
+  const res = await fetch(API, {
+    headers: {
+      Accept: "application/vnd.github.html+json",
+      "User-Agent": "wholeseek-site",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  if (!res.ok) return null;
+  const list = await res.json();
+  return Array.isArray(list) ? list.filter((r) => !r.draft) : null;
+}
+
+function unescapeXml(s) {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+async function fromFeed() {
+  const res = await fetch(FEED, { headers: { "User-Agent": "wholeseek-site" } });
+  if (!res.ok) return null;
+  const xml = await res.text();
+  const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map((m) => m[1]);
+  const list = entries
+    .map((e) => {
+      const tag = (e.match(/<id>[^<]*\/([^/<]+)<\/id>/) || [])[1];
+      const href = (e.match(/<link[^>]*href="([^"]+)"/) || [])[1];
+      const updated = (e.match(/<updated>([^<]+)<\/updated>/) || [])[1];
+      const content = (e.match(/<content type="html">([\s\S]*?)<\/content>/) || [])[1] || "";
+      return tag && href && updated
+        ? { tag_name: unescapeXml(tag), html_url: unescapeXml(href), published_at: updated, body_html: unescapeXml(content) }
+        : null;
+    })
+    .filter(Boolean);
+  return entries.length === list.length ? list : null;
+}
+
+async function releases() {
+  for (const source of [fromApi, fromFeed]) {
+    try {
+      const list = await source();
+      if (list) return list;
+    } catch (_) {
+      // Try the next source.
+    }
+  }
+  return null;
+}
+
 async function changelog(request, ctx) {
   const cache = caches.default;
   const key = new Request(new URL("/changelog", request.url).toString());
+  const backupKey = new Request(new URL("/changelog?backup", request.url).toString());
   const hit = await cache.match(key);
   if (hit) return hit;
 
-  let releases = null;
-  try {
-    const res = await fetch(API, {
-      headers: {
-        Accept: "application/vnd.github.html+json",
-        "User-Agent": "wholeseek-site",
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
-    });
-    if (res.ok) releases = await res.json();
-  } catch (_) {
-    releases = null;
+  const list = await releases();
+  if (!list) {
+    const backup = await cache.match(backupKey);
+    if (backup) return new Response(backup.body, { status: 200, headers: withCache(backup.headers, 60) });
   }
 
-  const ok = Array.isArray(releases);
-  const html = page(ok ? releases.filter((r) => !r.draft) : null);
+  const ok = list !== null;
+  const html = page(list);
   const response = new Response(html, {
     status: ok ? 200 : 503,
     headers: {
@@ -51,8 +101,18 @@ async function changelog(request, ctx) {
         "default-src 'self'; img-src 'self' https://*.githubusercontent.com https://github.com; style-src 'unsafe-inline'; script-src 'none'; frame-ancestors 'none'",
     },
   });
-  if (ok) ctx.waitUntil(cache.put(key, response.clone()));
+  if (ok) {
+    ctx.waitUntil(cache.put(key, response.clone()));
+    const backup = response.clone();
+    ctx.waitUntil(cache.put(backupKey, new Response(backup.body, { headers: withCache(backup.headers, BACKUP_SECONDS) })));
+  }
   return response;
+}
+
+function withCache(headers, seconds) {
+  const h = new Headers(headers);
+  h.set("Cache-Control", `public, max-age=${seconds}`);
+  return h;
 }
 
 function esc(s) {
