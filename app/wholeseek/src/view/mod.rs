@@ -17,6 +17,7 @@ mod player;
 mod profile;
 mod search;
 mod strip;
+pub(crate) mod update;
 mod user;
 #[cfg(test)]
 pub use details::{INSPECTOR_W, RESULTS_MAX_W};

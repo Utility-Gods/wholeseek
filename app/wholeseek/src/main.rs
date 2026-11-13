@@ -27,6 +27,7 @@ mod session;
 mod store;
 mod tabs;
 mod transfers;
+mod update;
 mod view;
 
 #[cfg(test)]
@@ -452,6 +453,12 @@ fn scene_history(s: &mut App) {
 }
 
 /// The user's report: a search tab and a long-named user tab; the right cluster must show.
+/// A newer release is out: the strip's update notice.
+fn scene_update_available(s: &mut App) {
+    s.demo_search();
+    s.demo_update_offer();
+}
+
 fn scene_strip(s: &mut App) {
     s.demo_login();
     s.search_for("roadblock iration");
@@ -530,6 +537,7 @@ fn main() {
             ("displaced", scene_displaced),
             ("settings", scene_settings),
             ("strip", scene_strip),
+            ("update-available", scene_update_available),
             ("onboarding-error", scene_onboarding_error),
             ("rejected", scene_rejected),
             ("uploads", scene_uploads),

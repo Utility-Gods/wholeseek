@@ -499,6 +499,8 @@ pub(crate) mod tests {
             recent_download_dirs: vec!["/elsewhere".into()],
             single_file_subfolder: true,
             data_dir: "/data".into(),
+            check_updates: false,
+            dismissed_update: Some("0.1.4".into()),
         }
     }
 

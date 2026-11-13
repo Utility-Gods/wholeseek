@@ -217,6 +217,10 @@ pub struct Settings {
     /// Where persistent app data lives (download history,
     /// `history::HISTORY_FILE`). Read once at `Core::start`.
     pub data_dir: PathBuf,
+    /// Look for a newer wholeseek release at start and daily (the app's update notice).
+    pub check_updates: bool,
+    /// The release ("x.y.z") whose update notice was dismissed; a newer one shows again.
+    pub dismissed_update: Option<String>,
 }
 
 impl Settings {
@@ -259,6 +263,8 @@ impl Default for Settings {
             data_dir: dirs::data_dir()
                 .unwrap_or_else(|| home.join(".local").join("share"))
                 .join(crate::config::APP_NAME),
+            check_updates: true,
+            dismissed_update: None,
         }
     }
 }

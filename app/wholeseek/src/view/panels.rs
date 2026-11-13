@@ -1207,6 +1207,22 @@ pub fn settings(s: &App, t: &Theme) -> El {
                 ),
         );
     }
+
+    // Updates
+    body = body.child(
+        block("Updates", &super::update::CIRCLE_ARROW_UP, t).child(
+            line("check-updates", label("Check for updates", t)).child(
+                super::switch(
+                    "set-check-updates",
+                    cfg.check_updates,
+                    "Check for updates",
+                    t,
+                )
+                .on_press(|s: &mut App| s.toggle_update_checks()),
+            ),
+        ),
+    );
+    body = body.child(super::update::version(t));
     panel("settings-panel", "Settings", saved, body, t)
 }
 

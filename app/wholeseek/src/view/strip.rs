@@ -124,15 +124,17 @@ pub fn view(s: &App, t: &Theme) -> El {
     if settings_open {
         settings = settings.fill(t.hover);
     }
-    let right = row()
+    let mut right = row()
         .key("strip-right")
         .gap(4.0)
         .center_y()
         .on_layout(|s: &mut App, r: [f32; 4]| s.strip_right_w = r[2])
         .child(status)
-        .child(el().w(8.0))
-        .child(transfers)
-        .child(settings);
+        .child(el().w(8.0));
+    if let Some(u) = super::update::pill(s, t) {
+        right = right.child(u);
+    }
+    let right = right.child(transfers).child(settings);
     let mut strip = row()
         .key("strip")
         .h(TAB_H)

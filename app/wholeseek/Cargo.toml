@@ -12,6 +12,8 @@ wholeseek-audio = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
+# Update check (update.rs).
+ureq = { workspace = true }
 
 # System media keys (src/media.rs); each platform pulls only its own.
 [target.'cfg(target_os = "linux")'.dependencies]
