@@ -49,7 +49,9 @@ jobs:
         run: |
           # Race-safe with the linux job: whoever loses the create sees it exists.
           # Draft until both builds are attached, so /releases/latest never points at a half release.
-          gh release create "$TAG" --draft --title "wholeseek $TAG" --generate-notes 2>/dev/null \
+          # Notes come from CHANGELOG.md (also shown on wholeseek.utilitygods.com/changelog).
+          .github/scripts/release-notes.sh "$TAG" > notes.md
+          gh release create "$TAG" --draft --title "wholeseek $TAG" --notes-file notes.md 2>/dev/null \
             || gh release view "$TAG" >/dev/null
           # Stable name so websites can link to
           # https://github.com/Utility-Gods/wholeseek/releases/latest/download/wholeseek-macos-apple-silicon.dmg
@@ -104,7 +106,9 @@ jobs:
           TARBALL: ${{ steps.tar.outputs.tarball }}
         run: |
           # Draft until both builds are attached, so /releases/latest never points at a half release.
-          gh release create "$TAG" --draft --title "wholeseek $TAG" --generate-notes 2>/dev/null \
+          # Notes come from CHANGELOG.md (also shown on wholeseek.utilitygods.com/changelog).
+          .github/scripts/release-notes.sh "$TAG" > notes.md
+          gh release create "$TAG" --draft --title "wholeseek $TAG" --notes-file notes.md 2>/dev/null \
             || gh release view "$TAG" >/dev/null
           # Stable name: .../releases/latest/download/wholeseek-linux-x86_64.tar.gz
           stable="$(dirname "$TARBALL")/wholeseek-linux-x86_64.tar.gz"

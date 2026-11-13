@@ -20,6 +20,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: CHANGELOG.md has notes for this version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          .github/scripts/release-notes.sh "$version" >/dev/null
+
       - name: Rust toolchain (rust-toolchain.toml)
         run: |
           rustup show active-toolchain || rustup toolchain install
