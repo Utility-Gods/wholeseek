@@ -82,8 +82,106 @@ impl App {
             MenuAction::PlayAlbum { username, folder } => self.play_album(&username, &folder),
             MenuAction::Cancel(id) => self.cancel(id),
             MenuAction::Retry(id) => self.retry(id),
+            MenuAction::OpenInNewTab { username, folder } => {
+                self.open_in_new_tab(&username, folder.as_deref());
+            }
+            MenuAction::ExpandAll(d) => {
+                if let Some(b) = self.active_browse_mut() {
+                    b.expand_all(&d, true);
+                }
+            }
+            MenuAction::CollapseAll(d) => {
+                if let Some(b) = self.active_browse_mut() {
+                    b.expand_all(&d, false);
+                }
+            }
+            MenuAction::DuplicateTab(i) => self.duplicate_tab(i),
+            MenuAction::CloseTab(i) => self.close_tab(i),
+            MenuAction::CloseOtherTabs(i) => self.close_other_tabs(i),
+            MenuAction::CloseTabsRight(i) => self.close_tabs_right(i),
         }
         None
+    }
+
+    // ---- tabs ----------------------------------------------------------------------------
+
+    /// "Open in new tab" / middle-click: a user tab beside the shown one, at `folder`, left
+    /// in the background. It reuses the user's listing if a tab already has it, else browses
+    /// when first shown.
+    pub fn open_in_new_tab(&mut self, username: &str, folder: Option<&str>) {
+        let mut browse = crate::tabs::BrowseView::new(username);
+        let listed = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.browse())
+            .find(|b| b.username == username && b.dirs.is_some())
+            .and_then(|b| b.dirs.clone());
+        let fetch = listed.is_none();
+        browse.dirs = listed;
+        if let Some(f) = folder {
+            browse.select(f);
+        }
+        let at = self.active + 1;
+        let kind = crate::tabs::TabKind::User(crate::tabs::UserTab { browse });
+        self.insert_tab(at, kind).restore = fetch;
+    }
+
+    /// The strip's "Duplicate tab": a copy right after tab `i`, shown. A search runs again
+    /// (its query, chips, filter and selection kept); a user tab keeps its listing and folder.
+    pub fn duplicate_tab(&mut self, i: usize) {
+        use crate::tabs::{BrowseView, SearchTab, TabKind, UserTab};
+        let Some(src) = self.tabs.get(i) else {
+            return;
+        };
+        let group = src.group.clone();
+        let (kind, fetch) = match &src.kind {
+            TabKind::Search(st) => {
+                let mut copy = SearchTab::new(st.filters.clone());
+                let query = st.search.as_ref().map_or(&st.edit.text, |v| &v.query);
+                copy.edit.replace_text(query.clone());
+                copy.find.replace_text(st.find.text.clone());
+                let fetch = st.search.is_some();
+                (TabKind::Search(copy), fetch)
+            }
+            TabKind::User(u) => {
+                let b = &u.browse;
+                let mut copy = BrowseView::new(&b.username);
+                copy.dirs = b.dirs.clone();
+                copy.expanded = b.expanded.clone();
+                if let Some(sel) = &b.selected {
+                    copy.select(sel);
+                }
+                let fetch = copy.dirs.is_none();
+                (TabKind::User(UserTab { browse: copy }), fetch)
+            }
+        };
+        let tab = self.insert_tab(i + 1, kind);
+        tab.group = group;
+        tab.restore = fetch;
+        self.active = i + 1;
+    }
+
+    /// The strip's "Close other tabs": only tab `i` stays, shown.
+    pub fn close_other_tabs(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        self.close_tabs_right(i);
+        for j in (0..i).rev() {
+            self.close_tab(j);
+        }
+        self.active = 0;
+    }
+
+    /// The strip's "Close tabs to the right" of tab `i`; a closed tab that was shown leaves
+    /// tab `i` shown.
+    pub fn close_tabs_right(&mut self, i: usize) {
+        while self.tabs.len() > i + 1 {
+            self.close_tab(self.tabs.len() - 1);
+        }
+        if self.active > i {
+            self.active = i;
+        }
     }
 
     // ---- folders -------------------------------------------------------------------------

@@ -56,19 +56,23 @@ pub mod pal {
     use super::hex;
     use rune::Color;
     pub fn bg() -> Color {
-        hex(0x0f172a)
+        hex(0x0a0e1a)
+    }
+    /// The tab strip's chrome behind inactive tabs, a step darker than [`bg`].
+    pub fn chrome() -> Color {
+        hex(0x070a13)
     }
     pub fn raised() -> Color {
-        hex(0x111a2c)
+        hex(0x0e1424)
     }
     pub fn hover() -> Color {
-        hex(0x1e293b)
+        hex(0x182033)
     }
     pub fn line() -> Color {
-        hex(0x1e293b)
+        hex(0x182033)
     }
     pub fn line_strong() -> Color {
-        hex(0x334155)
+        hex(0x2a3447)
     }
     pub fn text() -> Color {
         hex(0xe2e8f0)
@@ -153,8 +157,8 @@ fn main(s: &App, t: &Theme) -> El {
         .w_full()
         .h_full()
         .fill(t.bg)
-        .child(strip::view(s, t))
-        .child(hairline(t));
+        // The strip draws its own bottom line, open under the active tab.
+        .child(strip::view(s, t));
     if let Some(b) = banner(s, t) {
         page = page.child(b);
     }

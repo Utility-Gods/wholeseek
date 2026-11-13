@@ -593,8 +593,8 @@ impl App {
                 for d in &mut dirs {
                     crate::tabs::sort_files(&mut d.files);
                 }
-                if let Some(b) = self.browse_of(&username) {
-                    b.dirs = Some(dirs);
+                for b in self.browses_of(&username) {
+                    b.dirs = Some(dirs.clone());
                     b.error = None;
                     let first = b.selected.clone().or_else(|| {
                         let d = b.dirs.as_ref()?;
@@ -608,9 +608,9 @@ impl App {
                 }
             }
             CoreEvent::FolderContents { username, dirs, .. } => {
-                if let Some(b) = self.browse_of(&username) {
+                for b in self.browses_of(&username) {
                     let have = b.dirs.get_or_insert_with(Vec::new);
-                    for d in dirs {
+                    for d in dirs.iter().cloned() {
                         match have.iter_mut().find(|h| h.path == d.path) {
                             Some(h) => *h = d,
                             None => have.push(d),
@@ -625,8 +625,8 @@ impl App {
                 self.profiles.failed(&username, reason);
             }
             CoreEvent::BrowseFailed { username, reason } => {
-                if let Some(b) = self.browse_of(&username) {
-                    b.error = Some(reason);
+                for b in self.browses_of(&username) {
+                    b.error = Some(reason.clone());
                 }
             }
             CoreEvent::TransferQueued {
@@ -936,6 +936,26 @@ impl App {
         self.active = at;
     }
 
+    /// A tab inserted at `at` without showing it (the shown tab stays shown).
+    pub(crate) fn insert_tab(&mut self, at: usize, kind: TabKind) -> &mut Tab {
+        let id = self.next_tab;
+        self.next_tab += 1;
+        let at = at.min(self.tabs.len());
+        self.tabs.insert(at, Tab::new(id, kind));
+        if at <= self.active && self.tabs.len() > 1 {
+            self.active += 1;
+        }
+        &mut self.tabs[at]
+    }
+
+    /// Every open tab of `username` (one user can have several).
+    fn browses_of<'a>(&'a mut self, username: &'a str) -> impl Iterator<Item = &'a mut BrowseView> {
+        self.tabs
+            .iter_mut()
+            .filter_map(Tab::browse_mut)
+            .filter(move |b| b.username == username)
+    }
+
     /// "Search again" on an empty result: the same query once more.
     pub fn search_again(&mut self) {
         let Some(st) = self.tabs.get_mut(self.active).and_then(Tab::search_mut) else {
@@ -1059,7 +1079,12 @@ impl App {
                     self.backend.cancel_search(v.id);
                 }
             }
-            TabKind::User(u) => self.profiles.forget(&u.browse.username),
+            TabKind::User(u) => {
+                let name = &u.browse.username;
+                if !self.tabs.iter().any(|t| t.username() == Some(name)) {
+                    self.profiles.forget(name);
+                }
+            }
         }
         if self.tabs.is_empty() {
             self.new_search_tab();
@@ -1101,13 +1126,6 @@ impl App {
             .iter_mut()
             .filter_map(|t| t.search_mut()?.search.as_mut())
             .find(|s| s.id == id)
-    }
-
-    fn browse_of(&mut self, username: &str) -> Option<&mut BrowseView> {
-        self.tabs
-            .iter_mut()
-            .filter_map(Tab::browse_mut)
-            .find(|b| b.username == username)
     }
 
     /// After a tab switch: put the shown tab's lists back where they were scrolled to.

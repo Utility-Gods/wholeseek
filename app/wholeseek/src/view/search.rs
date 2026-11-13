@@ -795,7 +795,15 @@ fn folder_line(
         .w_full()
         .max_w(max_w)
         .cursor(Cursor::Pointer)
-        .on_press(move |s: &mut App| s.tab_mut().group = Some(pick.clone()))
+        .pointer_buttons([rune::PointerButton::Primary, rune::PointerButton::Middle])
+        .on_press_tx(move |s: &mut App, tx| {
+            // Middle-click: the folder in a new tab, as in a browser.
+            if tx.button() == rune::PointerButton::Middle {
+                s.open_in_new_tab(&pick.0, Some(&pick.1));
+            } else {
+                s.tab_mut().group = Some(pick.clone());
+            }
+        })
         .pl(12.0 + FOLDER_INDENT)
         .pr(6.0)
         .gap(4.0)

@@ -62,6 +62,20 @@ pub enum MenuAction {
     SetSort(crate::tabs::SortBy),
     /// A tab folded under the strip's "»": show it.
     ShowTab(usize),
+    /// A new user tab beside the shown one, at `folder` (none: the user's share), left in
+    /// the background like a browser's.
+    OpenInNewTab {
+        username: String,
+        folder: Option<String>,
+    },
+    /// A user tab's tree: open (or close) a folder and every folder under it.
+    ExpandAll(String),
+    CollapseAll(String),
+    /// The tab strip, on tab `i`.
+    DuplicateTab(usize),
+    CloseTab(usize),
+    CloseOtherTabs(usize),
+    CloseTabsRight(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -121,7 +135,15 @@ fn icon_for(id: &str) -> Option<&'static Icon> {
         }
         "open-folder" | "show-in-folder" => &icons::FOLDER_OPEN,
         "browse-user" => &icons::USER,
-        "copy-path" => &icons::COPY,
+        "copy-path" | "copy-name" => &icons::COPY,
+        "open-in-new-tab" | "open-folder-new-tab" => &icons::APP_WINDOW,
+        "browse-user-new-tab" => &icons::USER_PLUS,
+        "expand-all" => &icons::CHEVRONS_UP_DOWN,
+        "collapse-all" => &icons::CHEVRONS_DOWN_UP,
+        "duplicate-tab" => &icons::COPY_PLUS,
+        "close-tab" => &icons::X,
+        "close-other-tabs" => &icons::SQUARE_X,
+        "close-tabs-right" => &icons::ARROW_RIGHT_TO_LINE,
         "open-file" => &icons::EXTERNAL_LINK,
         "retry" => &icons::REFRESH_CW,
         "cancel" => &icons::X,
@@ -242,39 +264,196 @@ pub fn file_items(f: &RemoteFile, in_user_tab: bool, recent: &[PathBuf]) -> Vec<
         MenuAction::Download(f.clone()),
     ));
     v.extend(download_to_items(&DlTarget::File(f.clone()), recent));
-    v.push(MenuItem {
-        // The recent folders end where they began: at a line.
-        sep: !recent.is_empty(),
-        ..item(
+    let mut common = Vec::new();
+    // In a user tab the folder is already open, and its header downloads it.
+    if !in_user_tab {
+        v.push(item(
             "download-folder",
             "Download folder",
             MenuAction::DownloadFolder {
                 username: username.clone(),
                 folder: folder.clone(),
             },
-        )
-    });
-    v.push(item(
-        "open-folder",
-        "Open folder",
-        MenuAction::OpenFolder {
-            username: username.clone(),
-            folder,
-            file: Some(f.path.clone()),
-        },
-    ));
-    if !in_user_tab {
+        ));
+        v.push(item(
+            "open-folder",
+            "Open folder",
+            MenuAction::OpenFolder {
+                username: username.clone(),
+                folder: folder.clone(),
+                file: Some(f.path.clone()),
+            },
+        ));
         v.push(item(
             "browse-user",
             "Browse user",
-            MenuAction::BrowseUser(username),
+            MenuAction::BrowseUser(username.clone()),
         ));
+        common.extend(new_tab_items(&username, &folder));
     }
-    v.push(item(
+    common.push(item(
+        "copy-name",
+        if in_user_tab {
+            "Copy file name"
+        } else {
+            "Copy name"
+        },
+        MenuAction::CopyPath(f.basename().to_string()),
+    ));
+    common.push(item(
         "copy-path",
         "Copy path",
         MenuAction::CopyPath(f.path.clone()),
     ));
+    finish(v, common)
+}
+
+/// A row menu in two parts: what this row does, then under a line the group that's the
+/// same everywhere (new tabs, copying). The recent "Download to…" folders end at a line
+/// too.
+fn finish(mut v: Vec<MenuItem>, common: Vec<MenuItem>) -> Vec<MenuItem> {
+    let first_common = v.len();
+    v.extend(common);
+    if let Some(c) = v.get_mut(first_common) {
+        c.sep = true;
+    }
+    if let Some(last_recent) = v.iter().rposition(|i| i.help.is_some())
+        && let Some(after) = v.get_mut(last_recent + 1)
+    {
+        after.sep = true;
+    }
+    v
+}
+
+/// Where a menu's common group starts (after [`finish`]'s line); its end if none.
+fn common_start(v: &[MenuItem]) -> usize {
+    v.iter()
+        .position(|i| {
+            matches!(
+                i.id,
+                "open-in-new-tab" | "open-folder-new-tab" | "browse-user-new-tab" | "copy-name"
+            )
+        })
+        .unwrap_or(v.len())
+}
+
+/// A search result's "Open folder in new tab" and "Browse user in new tab".
+fn new_tab_items(username: &str, folder: &str) -> [MenuItem; 2] {
+    [
+        item(
+            "open-folder-new-tab",
+            "Open folder in new tab",
+            MenuAction::OpenInNewTab {
+                username: username.to_string(),
+                folder: Some(folder.to_string()),
+            },
+        ),
+        item(
+            "browse-user-new-tab",
+            "Browse user in new tab",
+            MenuAction::OpenInNewTab {
+                username: username.to_string(),
+                folder: None,
+            },
+        ),
+    ]
+}
+
+/// The last part of a remote path (a folder's or file's name).
+fn name_of(path: &str) -> String {
+    path.rsplit('\\').next().unwrap_or(path).to_string()
+}
+
+/// A user tab's folder tree row: play, download, a new tab there, open or close everything
+/// under it (`has_children`), copy its path.
+pub fn tree_items(
+    username: &str,
+    folder: &str,
+    playable: bool,
+    has_children: bool,
+    recent: &[PathBuf],
+) -> Vec<MenuItem> {
+    let (u, d) = (username.to_string(), folder.to_string());
+    let mut v = Vec::new();
+    if playable {
+        v.push(item(
+            "play-folder",
+            "Play folder",
+            MenuAction::PlayFolder {
+                username: u.clone(),
+                folder: d.clone(),
+            },
+        ));
+    }
+    v.push(item(
+        "download-folder",
+        "Download folder",
+        MenuAction::DownloadFolder {
+            username: u.clone(),
+            folder: d.clone(),
+        },
+    ));
+    v.extend(download_to_items(
+        &DlTarget::Folder {
+            username: u.clone(),
+            folder: d.clone(),
+        },
+        recent,
+    ));
+    if has_children {
+        v.push(item(
+            "expand-all",
+            "Expand all",
+            MenuAction::ExpandAll(d.clone()),
+        ));
+        v.push(item(
+            "collapse-all",
+            "Collapse all",
+            MenuAction::CollapseAll(d.clone()),
+        ));
+    }
+    let common = vec![
+        item(
+            "open-in-new-tab",
+            "Open in new tab",
+            MenuAction::OpenInNewTab {
+                username: u,
+                folder: Some(d.clone()),
+            },
+        ),
+        item("copy-path", "Copy folder path", MenuAction::CopyPath(d)),
+    ];
+    finish(v, common)
+}
+
+/// The tab strip's menu on tab `i` of `n`: duplicate, then close it (as × does), the others
+/// (with others) and those to its right (when some are).
+pub fn tab_items(i: usize, n: usize) -> Vec<MenuItem> {
+    let mut v = vec![
+        item(
+            "duplicate-tab",
+            "Duplicate tab",
+            MenuAction::DuplicateTab(i),
+        ),
+        MenuItem {
+            sep: true,
+            ..item("close-tab", "Close tab", MenuAction::CloseTab(i))
+        },
+    ];
+    if n > 1 {
+        v.push(item(
+            "close-other-tabs",
+            "Close other tabs",
+            MenuAction::CloseOtherTabs(i),
+        ));
+    }
+    if i + 1 < n {
+        v.push(item(
+            "close-tabs-right",
+            "Close tabs to the right",
+            MenuAction::CloseTabsRight(i),
+        ));
+    }
     v
 }
 
@@ -287,25 +466,25 @@ pub fn folder_items(
     recent: &[PathBuf],
 ) -> Vec<MenuItem> {
     let (u, d) = (username.to_string(), folder.to_string());
-    let mut v = vec![
-        item(
-            "open-folder",
-            "Open folder",
-            MenuAction::OpenFolder {
-                username: u.clone(),
-                folder: d.clone(),
-                file: None,
-            },
-        ),
-        item(
-            "download-folder",
-            "Download folder",
-            MenuAction::DownloadFolder {
+    let mut v = Vec::new();
+    if playable {
+        v.push(item(
+            "play-folder",
+            "Play folder",
+            MenuAction::PlayFolder {
                 username: u.clone(),
                 folder: d.clone(),
             },
-        ),
-    ];
+        ));
+    }
+    v.push(item(
+        "download-folder",
+        "Download folder",
+        MenuAction::DownloadFolder {
+            username: u.clone(),
+            folder: d.clone(),
+        },
+    ));
     v.extend(download_to_items(
         &DlTarget::Folder {
             username: u.clone(),
@@ -313,30 +492,89 @@ pub fn folder_items(
         },
         recent,
     ));
-    if playable {
-        v.push(item(
-            "play-folder",
-            "Play folder",
-            MenuAction::PlayFolder {
-                username: u,
-                folder: d.clone(),
-            },
-        ));
-    }
-    v.push(item("copy-path", "Copy path", MenuAction::CopyPath(d)));
-    // The recent folders end where they began: at a line.
-    if !recent.is_empty()
-        && let Some(after) = v
-            .iter_mut()
-            .skip_while(|i| i.id != "download-folder-to")
-            .find(|i| i.help.is_none() && i.id != "download-folder-to")
-    {
-        after.sep = true;
-    }
-    v
+    v.push(item(
+        "open-folder",
+        "Open folder",
+        MenuAction::OpenFolder {
+            username: u.clone(),
+            folder: d.clone(),
+            file: None,
+        },
+    ));
+    v.push(item(
+        "browse-user",
+        "Browse user",
+        MenuAction::BrowseUser(u.clone()),
+    ));
+    let mut common = new_tab_items(&u, &d).to_vec();
+    common.push(item(
+        "copy-name",
+        "Copy name",
+        MenuAction::CopyPath(name_of(&d)),
+    ));
+    common.push(item("copy-path", "Copy path", MenuAction::CopyPath(d)));
+    finish(v, common)
 }
 
 impl App {
+    /// A file row's menu (⋯ and right-click alike). In a user tab, a file downloaded
+    /// before also gets "Show in folder" (from the download history, else this run's
+    /// transfers).
+    pub fn file_menu(&self, f: &RemoteFile, in_user_tab: bool) -> Vec<MenuItem> {
+        let mut v = file_items(
+            f,
+            in_user_tab,
+            &self.backend.settings().recent_download_dirs,
+        );
+        if in_user_tab && let Some(path) = self.downloaded_path(f) {
+            // A contextual action: last before the common group's line.
+            let at = common_start(&v);
+            v.insert(
+                at,
+                item(
+                    "show-in-folder",
+                    "Show in folder",
+                    MenuAction::ShowInFolder(path),
+                ),
+            );
+        }
+        v
+    }
+
+    /// Where `f` was saved, if a finished download of it is still on disk.
+    fn downloaded_path(&self, f: &RemoteFile) -> Option<PathBuf> {
+        if let Some(p) = self.local_path_of(f) {
+            return Some(p);
+        }
+        if !self
+            .downloaded
+            .contains(&(f.username.clone(), f.path.clone()))
+        {
+            return None;
+        }
+        let q = wholeseek_core::HistoryQuery {
+            text: f.path.clone(),
+            limit: 50,
+            offset: 0,
+        };
+        self.backend
+            .history(&q)
+            .into_iter()
+            .filter(|e| e.username == f.username && e.remote_path == f.path)
+            .find(|e| self.backend.history_on_disk(e))
+            .and_then(|e| e.local_path)
+    }
+
+    /// A user tab's folder tree row.
+    pub fn tree_menu(&self, username: &str, folder: &str, has_children: bool) -> Vec<MenuItem> {
+        let playable = self
+            .folder_files(username, folder)
+            .iter()
+            .any(crate::tabs::is_playable);
+        let recent = &self.backend.settings().recent_download_dirs;
+        tree_items(username, folder, playable, has_children, recent)
+    }
+
     /// One download in the drawer.
     pub fn transfer_items(&self, id: TransferId) -> Vec<MenuItem> {
         let Some(t) = self.transfers.iter().find(|t| t.id == id) else {

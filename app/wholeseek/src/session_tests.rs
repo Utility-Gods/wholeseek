@@ -284,3 +284,33 @@ fn a_restored_user_tab_scrolls_its_tree_to_the_open_folder() {
         "row {r:?} inside the tree {v:?}"
     );
 }
+
+#[test]
+fn tabs_opened_in_new_tabs_or_duplicated_are_restored() {
+    let d = dir("new-tabs");
+    let path = d.0.join("session.json");
+    let pale = r"Music\Hollow Lights\Pale Harbour";
+    {
+        let mut rt = launch(&path, false);
+        rt.state.demo_login();
+        run(&mut rt, 1.0);
+        rt.state.open_folder_at("alice", COAST, None);
+        run(&mut rt, 1.0);
+        // Beside it, in the background: never shown before the quit.
+        rt.state.open_in_new_tab("alice", Some(pale));
+        rt.state.duplicate_tab(1);
+        run(&mut rt, 0.5);
+        rt.state.flush_session();
+    }
+    let mut rt = launch(&path, true);
+    run(&mut rt, 1.5);
+    let tabs: Vec<_> = rt
+        .state
+        .tabs
+        .iter()
+        .filter_map(|t| t.browse())
+        .map(|b| (b.username.clone(), b.selected.clone()))
+        .collect();
+    let at = |f: &str| ("alice".to_string(), Some(f.to_string()));
+    assert_eq!(tabs, [at(COAST), at(COAST), at(pale)]);
+}

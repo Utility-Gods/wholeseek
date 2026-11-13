@@ -5,7 +5,7 @@
 use std::rc::Rc;
 
 use rune::tok::{Theme, type_};
-use rune::{Cursor, El, Key, KeyEvent, col, el, row, text};
+use rune::{Cursor, El, Key, KeyEvent, PointerButton, col, el, row, text};
 use wholeseek_core::RemoteFile;
 use wholeseek_core::group::{Album, Edition, Grouped, Source, Track};
 
@@ -129,18 +129,21 @@ fn selected(tab: &Tab, editions: &[Edition]) -> bool {
     })
 }
 
+/// A row's menu, the same from its ⋯ and a right-click.
+type MenuFn = Rc<dyn Fn(&App) -> Vec<crate::menu::MenuItem>>;
+
 /// A row's frame: hover, selection, click selects `src` (the inspector shows it), Enter
-/// plays, right-click the folder menu.
+/// plays, right-click opens `menu`, middle-click opens its folder in a new tab.
 fn frame(
     key: String,
     h: f32,
     src: &Source,
     sel: bool,
     play: Rc<dyn Fn(&mut App)>,
+    menu: MenuFn,
     t: &Theme,
 ) -> El {
     let pick = (src.username.clone(), source_folder(src));
-    let menu = pick.clone();
     let mut r = row()
         .key(key)
         .h(h)
@@ -155,7 +158,12 @@ fn frame(
         .cursor(Cursor::Pointer)
         .focusable(true)
         .focus_ring(1.0, -1.0, accent().alpha(0.6))
-        .on_press(move |s: &mut App| {
+        .pointer_buttons([PointerButton::Primary, PointerButton::Middle])
+        .on_press_tx(move |s: &mut App, tx| {
+            if tx.button() == PointerButton::Middle {
+                s.open_in_new_tab(&pick.0, Some(&pick.1));
+                return;
+            }
             let tab = s.tab_mut();
             tab.group = Some(pick.clone());
             tab.selected = None;
@@ -168,7 +176,7 @@ fn frame(
             true
         })
         .on_secondary_press(move |s: &mut App, p, _| {
-            let items = s.folder_menu(&menu.0, &menu.1);
+            let items = menu(s);
             super::menu::at_point(s, p, items);
         });
     if sel {
@@ -243,7 +251,11 @@ fn album_row(
                 });
             })
     };
-    let r = frame(format!("album-{i}"), 48.0, best, sel, play, t)
+    let menu: MenuFn = {
+        let (u, d) = (u.clone(), d.clone());
+        Rc::new(move |s: &App| s.album_menu(&u, &d))
+    };
+    let r = frame(format!("album-{i}"), 48.0, best, sel, play, menu.clone(), t)
         .help(fmt::crumbs(&d))
         .child(play_button(s, &files, "Play album", t))
         .child(super::art::row_slot(s, "thumb", &u, &d, super::art::ROW))
@@ -271,15 +283,12 @@ fn album_row(
         )
         .child(who(best, find, t))
         .child(row().w(DL_W).h(28.0).center().child(download))
-        .child({
-            let (u, d) = (u.clone(), d.clone());
-            more_button(
-                format!("album-more-{i}"),
-                sel,
-                move |s: &App| s.folder_menu(&u, &d),
-                t,
-            )
-        });
+        .child(more_button(
+            format!("album-more-{i}"),
+            sel,
+            move |s: &App| menu(s),
+            t,
+        ));
     Some(r)
 }
 
@@ -313,46 +322,53 @@ fn track_row(
     let play: Rc<dyn Fn(&mut App)> = Rc::new(move |s: &mut App| {
         s.play_in(&f2, std::slice::from_ref(&f2));
     });
-    let r = frame(format!("single-{i}"), 30.0, best, sel, play, t)
-        .help(fmt::crumbs(&file.path))
-        .child(play_button(s, &one, "Play", t))
-        .child(
-            text(name.clone())
-                .key("title")
-                .font(type_::BODY)
-                .color(if playing { accent() } else { t.text })
-                .spans(super::files::match_spans(find, &name))
-                .truncate()
-                .grow(1.0)
-                .shrink(),
-        )
-        .child(
-            text(facts.join(" · "))
-                .key("meta")
-                .font(tnum(META))
-                .color(t.text_secondary)
-                .truncate()
-                .shrink(),
-        )
-        .child(who(best, find, t))
-        .child(
-            row()
-                .w(DL_W)
-                .h(28.0)
-                .center()
-                .child(download_cell(s, &file, false, t)),
-        )
-        .child({
-            let f = file.clone();
-            more_button(
-                format!("single-more-{i}"),
-                sel,
-                move |s: &App| {
-                    crate::menu::file_items(&f, false, &s.backend.settings().recent_download_dirs)
-                },
-                t,
-            )
-        });
+    let menu: MenuFn = {
+        let f = file.clone();
+        Rc::new(move |s: &App| s.file_menu(&f, false))
+    };
+    let r = frame(
+        format!("single-{i}"),
+        30.0,
+        best,
+        sel,
+        play,
+        menu.clone(),
+        t,
+    )
+    .help(fmt::crumbs(&file.path))
+    .child(play_button(s, &one, "Play", t))
+    .child(
+        text(name.clone())
+            .key("title")
+            .font(type_::BODY)
+            .color(if playing { accent() } else { t.text })
+            .spans(super::files::match_spans(find, &name))
+            .truncate()
+            .grow(1.0)
+            .shrink(),
+    )
+    .child(
+        text(facts.join(" · "))
+            .key("meta")
+            .font(tnum(META))
+            .color(t.text_secondary)
+            .truncate()
+            .shrink(),
+    )
+    .child(who(best, find, t))
+    .child(
+        row()
+            .w(DL_W)
+            .h(28.0)
+            .center()
+            .child(download_cell(s, &file, false, t)),
+    )
+    .child(more_button(
+        format!("single-more-{i}"),
+        sel,
+        move |s: &App| menu(s),
+        t,
+    ));
     Some(r)
 }
 

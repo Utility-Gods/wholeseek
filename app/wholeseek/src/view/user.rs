@@ -90,6 +90,11 @@ pub fn page(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
     page.child(body)
 }
 
+/// The ⋯ on tree row `i` (`dir-{i}`), its folder menu's anchor.
+fn tree_more_key(i: usize) -> String {
+    format!("dir-more-{i}")
+}
+
 fn tree(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
     let filter = field_box(
         "tree-filter",
@@ -116,7 +121,7 @@ fn tree(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
         } else {
             el().size(9.0, 9.0)
         };
-        let p = path.clone();
+        let (p, menu_p, user) = (path.clone(), path.clone(), b.username.clone());
         let mut r = row()
             .key(format!("dir-{i}"))
             .h(crate::tabs::TREE_ROW_H)
@@ -129,10 +134,21 @@ fn tree(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
             .role("treeitem")
             .label(name.clone())
             .expanded(open)
-            .on_press(move |s: &mut App| {
-                if let Some(b) = s.active_browse_mut() {
+            .pointer_buttons([rune::PointerButton::Primary, rune::PointerButton::Middle])
+            .on_press_tx(move |s: &mut App, tx| {
+                // Middle-click: this folder in a new tab, as in a browser.
+                if tx.button() == rune::PointerButton::Middle {
+                    let user = s.active_browse().map(|b| b.username.clone());
+                    if let Some(u) = user {
+                        s.open_in_new_tab(&u, Some(&p));
+                    }
+                } else if let Some(b) = s.active_browse_mut() {
                     b.press_dir(&p);
                 }
+            })
+            .on_secondary_press(move |s: &mut App, at, _| {
+                let items = s.tree_menu(&user, &menu_p, has_children);
+                super::menu::at_point(s, at, items);
             })
             .child(chevron)
             .child(
@@ -146,9 +162,26 @@ fn tree(s: &App, tab: &Tab, b: &BrowseView, t: &Theme) -> El {
         if let Some(th) = super::art::row_thumb(s, "thumb", &b.username, &path, super::art::SMALL) {
             r = r.child(rune::el().grow(1.0)).child(th);
         }
+        // ⋯ at the row's right edge, over the end of a long name: on the selected row, and on
+        // the others while hovered. The same menu as a right-click.
+        let more_key = tree_more_key(i);
+        let (more_user, more_path) = (b.username.clone(), path.clone());
+        let more = super::icon_button(&more_key, icons::more(icons::MD, t.text_secondary), t)
+            .pin(None, Some(1.0), Some(4.0), None)
+            .size(22.0, 22.0)
+            .fill(t.hover)
+            .label("More")
+            .help("Folder options")
+            .group_opacity(if selected { 1.0 } else { 0.0 }, 1.0)
+            .on_press(move |s: &mut App| {
+                let items = s.tree_menu(&more_user, &more_path, has_children);
+                s.open_menu(crate::menu::MenuAnchor::Key(more_key.clone()), items);
+            });
+        r = r.hover_group().child(more);
         r = if selected {
             r.fill(t.hover).child(
                 rune::el()
+                    .key("marker")
                     .pin(Some(0.0), Some(0.0), None, Some(0.0))
                     .w(2.0)
                     .fill(super::accent()),

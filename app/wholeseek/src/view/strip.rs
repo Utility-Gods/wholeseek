@@ -3,18 +3,30 @@
 //! The right cluster never shrinks and is always whole. Tabs share what is left, each
 //! shrinking (title ellipsized) to [`TAB_MIN_W`]; tabs that still don't fit fold into a "»"
 //! menu, the active one always staying in the strip.
+//!
+//! As a browser's: the strip sits on a darker chrome, the active tab is filled with the page
+//! surface and joins the content below (no line under it), and the hairline between two tabs
+//! hides beside the active one and the hovered one. Nothing animates: a switch lands in one
+//! frame, and hover comes at once and leaves within 80 ms.
 
-use rune::tok::{Theme, type_};
-use rune::{Cursor, El, PointerButton, el, row, text};
+use rune::tok::{TextStyle, Theme, type_};
+use rune::{Anim, Cursor, Curve, El, PointerButton, Spring, el, row, text};
 
 use super::{META, accent, amber, green, icon_button, icons, pal, red, tnum};
 use crate::app::{App, Conn, Panel};
 use crate::tabs::{Tab, TabKind};
 
-const TAB_H: f32 = 34.0;
-const TAB_MAX_W: f32 = 200.0;
-/// Narrowest a tab gets: icon, a few letters of title, its count and ×.
-pub const TAB_MIN_W: f32 = 96.0;
+const TAB_H: f32 = 40.0;
+const TAB_MAX_W: f32 = 240.0;
+/// Narrowest a tab gets: icon, a few letters of title, its count, ⋯ and ×.
+pub const TAB_MIN_W: f32 = 120.0;
+/// The ⋯ and × hit targets on a tab.
+const TAB_BUTTON: f32 = 22.0;
+
+/// The ⋯ button on tab `i`, the tab menu's anchor.
+pub fn tab_more_key(i: usize) -> String {
+    format!("tab-more-{i}")
+}
 /// Fixed parts of the strip besides tabs and the right cluster: ＋, "»", gaps, padding.
 const STRIP_FIXED_W: f32 = 28.0 + 28.0 + 8.0 * 4.0 + 8.0;
 
@@ -142,11 +154,18 @@ pub fn view(s: &App, t: &Theme) -> El {
         .pr(8.0)
         .gap(4.0)
         .center_y()
-        .fill(t.bg)
+        .fill(pal::chrome())
         .on_layout(|s: &mut App, r: [f32; 4]| {
             s.strip_w = r[2];
             s.window_w = r[2];
         })
+        // The line under the strip, drawn first: the active tab covers it.
+        .child(
+            el().key("strip-line")
+                .pin(Some(0.0), None, Some(0.0), Some(0.0))
+                .h(1.0)
+                .fill(t.separator),
+        )
         .child(tabs);
     if let Some(more) = more {
         strip = strip.child(more);
@@ -169,17 +188,23 @@ fn badge(key: &str, n: usize, t: &Theme) -> El {
         .child(text(n.to_string()).font(tnum(META)).color(t.text))
 }
 
+/// A tab's hover group, shared with the separator on its left (drawn by the tab before it), so
+/// hovering a tab hides the hairlines on both its sides.
+fn hover_key(i: usize) -> String {
+    format!("tab-hover-{i}")
+}
+
 fn tab_el(s: &App, i: usize, tab: &Tab, t: &Theme) -> El {
     let active = i == s.active;
     let (icon, count) = match &tab.kind {
         TabKind::Search(st) => (
-            icons::search(icons::SM, t.text_secondary),
+            icons::search(icons::MD, t.text_secondary),
             st.search.as_ref().map(|v| v.visible(&st.filters)),
         ),
-        TabKind::User(_) => (icons::user(icons::SM, t.text_secondary), None),
+        TabKind::User(_) => (icons::user(icons::MD, t.text_secondary), None),
     };
     let mut label = row()
-        .gap(6.0)
+        .gap(8.0)
         .center_y()
         .min_w(0.0)
         .shrink()
@@ -187,7 +212,11 @@ fn tab_el(s: &App, i: usize, tab: &Tab, t: &Theme) -> El {
         .child(
             text(tab.title())
                 .key("title")
-                .font(type_::LABEL)
+                .font(if active {
+                    TextStyle::new(type_::BODY.size, 500.0)
+                } else {
+                    type_::BODY
+                })
                 .color(if active { t.text } else { t.text_secondary })
                 .truncate()
                 .shrink(),
@@ -195,10 +224,22 @@ fn tab_el(s: &App, i: usize, tab: &Tab, t: &Theme) -> El {
     if let Some(n) = count {
         label = label.child(badge("count", n, t));
     }
+    let more_key = tab_more_key(i);
+    let more = icon_button(&more_key, icons::more(icons::MD, t.text_secondary), t)
+        .size(TAB_BUTTON, TAB_BUTTON)
+        .label("Tab options")
+        .help("Tab options")
+        // On the active tab, and on the others while hovered.
+        .group_opacity(if active { 1.0 } else { 0.0 }, 1.0)
+        .on_press(move |s: &mut App| {
+            let items = crate::menu::tab_items(i, s.tabs.len());
+            s.open_menu(crate::menu::MenuAnchor::Key(more_key.clone()), items);
+        });
     let close = icon_button("close", icons::close(icons::SM, t.text_secondary), t)
-        .size(18.0, 18.0)
+        .size(TAB_BUTTON, TAB_BUTTON)
         .label("Close tab")
         .on_press_tx(move |s: &mut App, tx| {
+            tx.instant();
             s.close_tab(i);
             s.restore_scroll(tx);
         });
@@ -208,16 +249,21 @@ fn tab_el(s: &App, i: usize, tab: &Tab, t: &Theme) -> El {
         .max_w(TAB_MAX_W)
         .shrink()
         .min_w(TAB_MIN_W)
-        .pl(10.0)
-        .pr(6.0)
-        .gap(6.0)
+        .pl(14.0)
+        .pr(8.0)
+        .gap(4.0)
         .center_y()
         .cursor(Cursor::Pointer)
         .role("tab")
         .label(tab.title())
         .checked(active)
+        // A switch lands in the frame it's clicked: no fill or marker fades between tabs.
+        .motion(Spring::NONE)
+        .hover_group_shared(hover_key(i))
+        .hover_motion_within(Anim::INSTANT, Curve::linear(0.08))
         .pointer_buttons([PointerButton::Primary, PointerButton::Middle])
         .on_press_tx(move |s: &mut App, tx| {
+            tx.instant();
             if tx.button() == PointerButton::Middle {
                 s.close_tab(i);
             } else {
@@ -225,12 +271,21 @@ fn tab_el(s: &App, i: usize, tab: &Tab, t: &Theme) -> El {
             }
             s.restore_scroll(tx);
         })
+        .on_secondary_press(move |s: &mut App, p, _| {
+            let items = crate::menu::tab_items(i, s.tabs.len());
+            super::menu::at_point(s, p, items);
+        })
         .child(label)
+        .child(el().grow(1.0).min_w(0.0).shrink())
+        .child(more)
         .child(close);
-    // Active: raised surface and an orange marker on top; others only hover.
+    // Active: the page's surface (it covers the strip's bottom line) and an orange marker on
+    // top; the others sit on the chrome and only hover. Keyed, so neither part ever turns
+    // into the other when the active tab changes.
     el = if active {
-        el.fill(pal::raised()).child(
+        el.fill(t.bg).child(
             rune::el()
+                .key("marker")
                 .pin(Some(0.0), Some(0.0), Some(0.0), None)
                 .h(2.0)
                 .fill(accent()),
@@ -238,10 +293,31 @@ fn tab_el(s: &App, i: usize, tab: &Tab, t: &Theme) -> El {
     } else {
         el.hover(t.hover)
     };
-    el.child(
-        rune::el()
-            .pin(None, Some(8.0), Some(0.0), Some(8.0))
-            .w(1.0)
-            .fill(t.separator),
-    )
+    // The hairline to the next tab, only between two inactive tabs, and hidden while either
+    // is hovered: this tab's group fades the outer part, the next tab's the inner.
+    let next_active = i + 1 == s.active;
+    if !active && !next_active {
+        el = el.child(
+            rune::el()
+                .key("sep")
+                .pin(None, Some(11.0), Some(0.0), Some(11.0))
+                .w(1.0)
+                .group_opacity(1.0, 0.0)
+                .child(
+                    rune::el()
+                        .w_full()
+                        .h_full()
+                        .hover_group_shared(hover_key(i + 1))
+                        .child(
+                            rune::el()
+                                .key("sep-line")
+                                .w_full()
+                                .h_full()
+                                .fill(t.separator)
+                                .group_opacity(1.0, 0.0),
+                        ),
+                ),
+        );
+    }
+    el
 }

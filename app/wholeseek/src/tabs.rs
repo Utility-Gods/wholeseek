@@ -761,6 +761,24 @@ impl BrowseView {
         self.selected = Some(path.to_string());
     }
 
+    /// "Expand all" (`open`) / "Collapse all" on `folder`: it and every folder under it.
+    pub fn expand_all(&mut self, folder: &str, open: bool) {
+        let under = format!("{folder}\\");
+        let (all, _) = self.tree_sets();
+        // Paths starting with `folder` sort together ("Jungle 2" among them, so filter).
+        let mine = all
+            .range(folder.to_string()..)
+            .take_while(|p| p.starts_with(folder))
+            .filter(|p| *p == folder || p.starts_with(&under));
+        for p in mine {
+            if open {
+                self.expanded.insert(p.clone());
+            } else {
+                self.expanded.remove(p);
+            }
+        }
+    }
+
     pub fn toggle(&mut self, path: &str) {
         if !self.expanded.remove(path) {
             self.expanded.insert(path.to_string());

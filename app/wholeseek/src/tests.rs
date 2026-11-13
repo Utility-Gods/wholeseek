@@ -1489,20 +1489,21 @@ fn menus_offer_what_each_place_needs() {
             "download-folder",
             "open-folder",
             "browse-user",
+            "open-folder-new-tab",
+            "browse-user-new-tab",
+            "copy-name",
             "copy-path"
         ]
     );
+    // In a user tab the folder is open already and its header downloads it.
     assert_eq!(
         ids(crate::menu::file_items(&f, true, &[])),
-        [
-            "play",
-            "download",
-            "download-to",
-            "download-folder",
-            "open-folder",
-            "copy-path"
-        ]
+        ["play", "download", "download-to", "copy-name", "copy-path"]
     );
+    // Two parts: this row's actions, then (under a line) the common group.
+    let v = crate::menu::file_items(&f, false, &[]);
+    let lines: Vec<_> = v.iter().filter(|i| i.sep).map(|i| i.id).collect();
+    assert_eq!(lines, ["open-folder-new-tab"]);
     let cover = wholeseek_core::RemoteFile {
         path: format!("{COAST}\\cover.jpg"),
         ..f.clone()
@@ -1515,19 +1516,27 @@ fn menus_offer_what_each_place_needs() {
     assert_eq!(
         ids(crate::menu::folder_items("alice", COAST, true, &[])),
         [
-            "open-folder",
+            "play-folder",
             "download-folder",
             "download-folder-to",
-            "play-folder",
+            "open-folder",
+            "browse-user",
+            "open-folder-new-tab",
+            "browse-user-new-tab",
+            "copy-name",
             "copy-path"
         ]
     );
     assert_eq!(
         ids(crate::menu::folder_items("alice", COAST, false, &[])),
         [
-            "open-folder",
             "download-folder",
             "download-folder-to",
+            "open-folder",
+            "browse-user",
+            "open-folder-new-tab",
+            "browse-user-new-tab",
+            "copy-name",
             "copy-path"
         ],
         "nothing to play: no Play folder"
@@ -2142,9 +2151,10 @@ fn the_strip_right_cluster_is_always_whole_at_every_size_and_scale() {
 fn tabs_shrink_to_a_minimum_then_fold_into_a_more_menu() {
     use crate::view::strip_tab_split as split;
     assert_eq!(split(3, 0, 1000.0), (vec![0, 1, 2], vec![]));
-    assert_eq!(split(8, 0, 300.0), (vec![0, 1, 2], vec![3, 4, 5, 6, 7]));
+    let three = 3.0 * crate::view::TAB_MIN_W + 10.0;
+    assert_eq!(split(8, 0, three), (vec![0, 1, 2], vec![3, 4, 5, 6, 7]));
     assert_eq!(
-        split(8, 6, 300.0),
+        split(8, 6, three),
         (vec![4, 5, 6], vec![0, 1, 2, 3, 7]),
         "active stays shown"
     );
@@ -2229,6 +2239,9 @@ fn rows_the_player_cannot_decode_get_no_play_but_keep_download() {
             "download-folder",
             "open-folder",
             "browse-user",
+            "open-folder-new-tab",
+            "browse-user-new-tab",
+            "copy-name",
             "copy-path"
         ]
     );
@@ -4427,4 +4440,564 @@ fn clearing_the_tree_filter_reveals_the_selected_folder() {
     assert!(rt.state.active_browse().unwrap().filter.text.is_empty());
     let (k, inside) = tree_row_in_view(&rt);
     assert!(inside, "{k} back in view");
+}
+
+// ---- context menus: tree, user files, tabs, new tabs -----------------------------------------
+
+fn press_button(rt: &mut Runtime<App>, key: &str, b: PointerButton) {
+    let (x, y) = rt.find(key).unwrap_or_else(|| panic!("no element {key}"));
+    rt.button_down(x, y, b);
+    rt.button_up(x, y, b);
+    run(rt, 0.05);
+}
+
+fn menu_ids(rt: &Runtime<App>) -> Vec<&'static str> {
+    rt.state.menu.as_ref().expect("a menu is open").ids()
+}
+
+/// The tree row of `path` in the shown user tab.
+fn dir_row(rt: &Runtime<App>, path: &str) -> String {
+    let b = rt.state.active_browse().unwrap();
+    let i = b
+        .visible_tree()
+        .iter()
+        .position(|r| r.0 == path)
+        .expect("a row");
+    format!("dir-{i}")
+}
+
+/// Press the tree row of `path`, scrolling it into the tree's view first if it's out.
+fn press_dir(rt: &mut Runtime<App>, path: &str, b: PointerButton) {
+    let k = dir_row(rt, path);
+    let tree = rt.state.tab().tree_key();
+    let (r, v) = (rect_of(rt, &k), rect_of(rt, &tree));
+    if r[1] < v[1] || r[1] + r[3] > v[1] + v[3] {
+        let i: f32 = k[4..].parse().unwrap();
+        rt.update(|_, tx| tx.scroll_to_instant(tree, 0.0, i * crate::tabs::TREE_ROW_H));
+        run(rt, 0.05);
+    }
+    press_button(rt, &k, b);
+}
+
+#[test]
+fn tree_rows_right_click_to_their_folder_menu() {
+    use crate::demo::DEEP_FOLDER;
+    let mut rt = deep_tab();
+    press_dir(&mut rt, DEEP_FOLDER, PointerButton::Secondary);
+    assert_eq!(
+        menu_ids(&rt),
+        [
+            "play-folder",
+            "download-folder",
+            "download-folder-to",
+            "open-in-new-tab",
+            "copy-path"
+        ],
+        "an album folder: no Expand/Collapse all"
+    );
+    assert!(rt.find("menu").is_some());
+    esc(&mut rt);
+    // A folder with subfolders (and no files of its own: nothing to play).
+    let jungle = r"Music\Jungle";
+    press_dir(&mut rt, jungle, PointerButton::Secondary);
+    assert_eq!(
+        menu_ids(&rt),
+        [
+            "download-folder",
+            "download-folder-to",
+            "expand-all",
+            "collapse-all",
+            "open-in-new-tab",
+            "copy-path"
+        ]
+    );
+    click(&mut rt, "menu-expand-all");
+    let b = rt.state.active_browse().unwrap();
+    assert!(
+        b.expanded.contains(r"Music\Jungle\Acid Collective"),
+        "every subfolder opens"
+    );
+    assert!(!b.expanded.contains(r"Music\Techno"), "only under it");
+    press_dir(&mut rt, jungle, PointerButton::Secondary);
+    click(&mut rt, "menu-collapse-all");
+    let b = rt.state.active_browse().unwrap();
+    assert!(
+        !b.expanded.iter().any(|p| p.starts_with(jungle)),
+        "all closed"
+    );
+    assert!(b.expanded.contains("Music"), "above it stays");
+    // Copy folder path.
+    let board = rune::clipboard::memory();
+    rt.use_clipboard(&board);
+    press_dir(&mut rt, jungle, PointerButton::Secondary);
+    click(&mut rt, "menu-copy-path");
+    assert_eq!(board.text().as_deref().map(|s| s.as_str()), Some(jungle));
+}
+
+/// Open in new tab (menu or middle-click) from the deep tab's tree: a background tab at that
+/// folder, the shown tab untouched, no new browse (the listing is reused).
+fn assert_opened_beside(rt: &mut Runtime<App>, before: usize, folder: &str) {
+    use crate::demo::{DEEP_FOLDER, DEEP_USER};
+    assert_eq!(rt.state.tabs.len(), before + 1);
+    assert_eq!(rt.state.active, 1, "the source tab stays shown");
+    let src = rt.state.active_browse().unwrap();
+    assert_eq!(
+        src.selected.as_deref(),
+        Some(DEEP_FOLDER),
+        "source unchanged"
+    );
+    let new = rt.state.tabs[2].browse().expect("a user tab beside it");
+    assert_eq!(
+        (new.username.as_str(), new.selected.as_deref()),
+        (DEEP_USER, Some(folder))
+    );
+    assert!(new.dirs.is_some(), "the listing is reused");
+    let browses = count_calls(rt, |c| matches!(c, Call::Browse(u) if u == DEEP_USER));
+    rt.update(|s, _| s.activate(2));
+    run(rt, 0.5);
+    assert_eq!(
+        count_calls(rt, |c| matches!(c, Call::Browse(u) if u == DEEP_USER)),
+        browses,
+        "shown without fetching again"
+    );
+    let (k, inside) = tree_row_in_view(rt);
+    assert!(inside, "{k}: the new tab's tree shows its folder");
+}
+
+#[test]
+fn open_in_new_tab_and_middle_click_open_a_tree_folder_beside() {
+    let mut rt = deep_tab();
+    let n = rt.state.tabs.len();
+    let folder = r"Music\Jungle\Iration Steppas";
+    press_dir(&mut rt, folder, PointerButton::Secondary);
+    click(&mut rt, "menu-open-in-new-tab");
+    assert_opened_beside(&mut rt, n, folder);
+
+    let mut rt = deep_tab();
+    let n = rt.state.tabs.len();
+    let scroll = rt.state.tab().tree_scroll.get();
+    press_dir(&mut rt, folder, PointerButton::Middle);
+    assert_eq!(
+        rt.state.tab().tree_scroll.get(),
+        scroll,
+        "the source tree stays put"
+    );
+    assert_opened_beside(&mut rt, n, folder);
+}
+
+#[test]
+fn search_folders_open_in_new_tabs_from_the_menu_and_middle_click() {
+    let mut rt = searched_at(W);
+    let folder = r"Music\Hollow Lights\Night Ferry EP (2021)";
+    let line = rt
+        .elements()
+        .into_iter()
+        .filter(|e| e.text.as_deref() == Some("Night Ferry EP (2021)"))
+        .find_map(|e| {
+            e.path
+                .split('/')
+                .find(|p| p.starts_with("folder-"))
+                .map(str::to_string)
+        })
+        .expect("the folder line");
+    let query = rt.state.active_search().unwrap().query.clone();
+    press_button(&mut rt, &line, PointerButton::Middle);
+    assert_eq!(rt.state.tabs.len(), 2);
+    assert_eq!(rt.state.active, 0, "still on the results");
+    assert_eq!(rt.state.active_search().unwrap().query, query);
+    let b = rt.state.tabs[1].browse().unwrap();
+    assert_eq!(
+        (b.username.as_str(), b.selected.as_deref()),
+        ("alice", Some(folder))
+    );
+    assert!(
+        !calls(&rt).iter().any(|c| matches!(c, Call::Browse(_))),
+        "nothing fetched until it's shown"
+    );
+    rt.update(|s, _| s.activate(1));
+    run(&mut rt, 1.0);
+    assert!(calls(&rt).contains(&Call::Browse("alice".into())));
+    let b = rt.state.active_browse().unwrap();
+    assert!(b.dirs.is_some() && b.selected.as_deref() == Some(folder));
+
+    // The folder menu's "Browse user in new tab": the user's share, beside.
+    rt.update(|s, _| s.activate(0));
+    run(&mut rt, 0.1);
+    press_button(&mut rt, &line, PointerButton::Secondary);
+    assert!(menu_ids(&rt).contains(&"open-folder-new-tab"));
+    click(&mut rt, "menu-browse-user-new-tab");
+    assert_eq!(rt.state.tabs.len(), 3);
+    assert_eq!(rt.state.active, 0);
+    assert_eq!(rt.state.tabs[1].browse().unwrap().username, "alice");
+}
+
+#[test]
+fn user_tab_files_offer_copy_name_and_show_in_folder_when_downloaded() {
+    let mut rt = signed_in();
+    rt.state
+        .open_folder_at("dj_ivo", r"mp3\H\Hollow Lights", None);
+    run(&mut rt, 1.0);
+    let files = rt
+        .state
+        .active_browse()
+        .unwrap()
+        .selected_dir()
+        .unwrap()
+        .files
+        .clone();
+    let got = files
+        .iter()
+        .position(|f| f.basename() == "Hollow Lights - Low Tide Radio.mp3")
+        .unwrap();
+    let other = 1 - got;
+    press_button(&mut rt, &format!("file-{got}"), PointerButton::Secondary);
+    let ids = menu_ids(&rt);
+    assert_eq!(
+        ids,
+        [
+            "play",
+            "download",
+            "download-to",
+            "show-in-folder",
+            "copy-name",
+            "copy-path"
+        ],
+        "downloaded before (history): Show in folder, last of this row's actions"
+    );
+    click(&mut rt, "menu-show-in-folder");
+    assert!(matches!(
+        rt.state.desktop_log.borrow().last(),
+        Some(DesktopCall::ShowItem(p)) if p.ends_with("Hollow Lights - Low Tide Radio.mp3")
+    ));
+    press_button(&mut rt, &format!("file-{other}"), PointerButton::Secondary);
+    assert!(
+        !menu_ids(&rt).contains(&"show-in-folder"),
+        "never downloaded"
+    );
+    // The ⋯ menu is the same one.
+    let ids = menu_ids(&rt);
+    esc(&mut rt);
+    let more = crate::view::files_more_key(rt.state.tab().id, &files[other].path);
+    rt.update(|s, _| s.tab_mut().selected = Some(files[other].path.clone()));
+    run(&mut rt, 0.05);
+    click(&mut rt, &more);
+    assert_eq!(menu_ids(&rt), ids);
+    let board = rune::clipboard::memory();
+    rt.use_clipboard(&board);
+    click(&mut rt, "menu-copy-name");
+    assert_eq!(
+        board.text().as_deref().map(|s| s.as_str()),
+        Some(files[other].basename())
+    );
+}
+
+#[test]
+fn the_tab_strip_menu_duplicates_and_closes_tabs() {
+    let mut rt = searched();
+    rt.update(|s, _| {
+        s.open_folder_at("alice", COAST, None);
+        s.open_user("vinyl_rips");
+    });
+    run(&mut rt, 1.0);
+    let titles = |rt: &Runtime<App>| rt.state.tabs.iter().map(|t| t.title()).collect::<Vec<_>>();
+    assert_eq!(titles(&rt), ["hollow lights", "alice", "vinyl_rips"]);
+    press_button(&mut rt, "tab-1", PointerButton::Secondary);
+    assert_eq!(
+        menu_ids(&rt),
+        [
+            "duplicate-tab",
+            "close-tab",
+            "close-other-tabs",
+            "close-tabs-right"
+        ]
+    );
+    esc(&mut rt);
+    press_button(&mut rt, "tab-2", PointerButton::Secondary);
+    assert_eq!(
+        menu_ids(&rt),
+        ["duplicate-tab", "close-tab", "close-other-tabs"],
+        "nothing to its right"
+    );
+    esc(&mut rt);
+
+    // Duplicate a user tab: beside it, shown, same folder, the listing kept.
+    press_button(&mut rt, "tab-1", PointerButton::Secondary);
+    click(&mut rt, "menu-duplicate-tab");
+    assert_eq!(
+        titles(&rt),
+        ["hollow lights", "alice", "alice", "vinyl_rips"]
+    );
+    assert_eq!(rt.state.active, 2);
+    let b = rt.state.active_browse().unwrap();
+    assert!(b.dirs.is_some() && b.selected.as_deref() == Some(COAST));
+    // Duplicate the search: the same query, run again once shown.
+    press_button(&mut rt, "tab-0", PointerButton::Secondary);
+    click(&mut rt, "menu-duplicate-tab");
+    run(&mut rt, 1.0);
+    assert_eq!(rt.state.active, 1);
+    assert_eq!(rt.state.active_search().unwrap().query, "hollow lights");
+    assert_eq!(count_calls(&rt, |c| matches!(c, Call::Search(_))), 2);
+
+    // Close tabs to the right of the 2nd, then the others.
+    press_button(&mut rt, "tab-1", PointerButton::Secondary);
+    click(&mut rt, "menu-close-tabs-right");
+    assert_eq!(titles(&rt), ["hollow lights", "hollow lights"]);
+    assert_eq!(rt.state.active, 1);
+    rt.update(|s, _| s.open_user("alice"));
+    run(&mut rt, 0.5);
+    let alice = rt.state.active;
+    press_button(&mut rt, &format!("tab-{alice}"), PointerButton::Secondary);
+    click(&mut rt, "menu-close-other-tabs");
+    assert_eq!(titles(&rt), ["alice"]);
+    assert_eq!(rt.state.active, 0);
+    assert!(
+        rt.state.active_browse().unwrap().dirs.is_some(),
+        "its listing kept"
+    );
+    press_button(&mut rt, "tab-0", PointerButton::Secondary);
+    assert_eq!(
+        menu_ids(&rt),
+        ["duplicate-tab", "close-tab"],
+        "the only tab"
+    );
+    // Close tab: as × does (the last one leaves an empty search tab).
+    click(&mut rt, "menu-close-tab");
+    assert_eq!(rt.state.tabs.len(), 1);
+    assert!(rt.state.tab().search().is_some());
+}
+
+// ---- tab strip: switching, hairlines, ⋯ ----------------------------------------------------
+
+/// What the strip paints this frame (hover overlays aside): path, rect, fill, opacity.
+fn strip_paint(rt: &Runtime<App>) -> Vec<(String, [i32; 4], [i32; 4], i32)> {
+    let q = |v: f32| (v * 1000.0).round() as i32;
+    rt.elements()
+        .into_iter()
+        .filter(|e| e.path.contains("/strip/"))
+        .map(|e| {
+            (
+                e.path.clone(),
+                e.rect.map(|v| v.round() as i32),
+                [q(e.fill.r), q(e.fill.g), q(e.fill.b), q(e.fill.a)],
+                q(e.opacity),
+            )
+        })
+        .collect()
+}
+
+fn three_tabs() -> Runtime<App> {
+    let mut rt = searched();
+    rt.update(|s, _| {
+        s.open_user("alice");
+        s.open_user("vinyl_rips");
+    });
+    run(&mut rt, 1.0);
+    rt
+}
+
+/// The reported "blinking left border": the marker and hairline were unkeyed children, so on
+/// a switch the old tab's orange marker turned into its hairline and faded across, and the
+/// fills cross-faded. Now a switch lands whole in the frame of the click.
+#[test]
+fn switching_tabs_lands_in_one_frame_with_no_stray_border() {
+    let mut rt = three_tabs();
+    assert_eq!(rt.state.active, 2);
+    for target in [0, 1, 2, 0] {
+        let (x, y) = rt.find(&format!("tab-{target}/title")).unwrap();
+        rt.pointer_move(x, y);
+        // Hover may fade out of the tab the pointer left (≤ 80 ms); let it, then click.
+        run(&mut rt, 0.15);
+        rt.pointer_down(x, y);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_up(x, y);
+        let frames: Vec<_> = (0..12)
+            .map(|_| {
+                rt.frame(1.0 / 60.0);
+                strip_paint(&rt)
+            })
+            .collect();
+        assert_eq!(rt.state.active, target);
+        for (n, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f,
+                frames.last().unwrap(),
+                "frame {n} after the click to tab-{target} differs from the settled strip"
+            );
+            let thin: Vec<_> = f
+                .iter()
+                .filter(|(_, r, c, o)| r[2] <= 2 && r[3] >= 8 && c[3] > 0 && *o > 0)
+                .map(|(p, ..)| p.clone())
+                .collect();
+            for p in &thin {
+                assert!(p.ends_with("/sep-line"), "a stray vertical line: {p}");
+                for beside in [target, target.wrapping_sub(1)] {
+                    assert!(
+                        !p.contains(&format!("/tab-{beside}/")),
+                        "a hairline beside the active tab-{target}: {p}"
+                    );
+                }
+            }
+            // The orange top marker, by its shape: on the active tab only.
+            let markers: Vec<_> = f
+                .iter()
+                .filter(|(_, r, c, o)| r[1] == 0 && r[3] == 2 && r[2] > 20 && c[3] > 0 && *o > 0)
+                .collect();
+            assert_eq!(markers.len(), 1, "{markers:?}");
+            assert!(markers[0].0.contains(&format!("/tab-{target}/")));
+        }
+    }
+    // A switch no click caused (a shortcut, a restore) lands the same way.
+    rt.update(|s, _| s.activate(1));
+    rt.frame(1.0 / 60.0);
+    let first = strip_paint(&rt);
+    run(&mut rt, 0.3);
+    assert_eq!(first, strip_paint(&rt));
+}
+
+#[test]
+fn the_hairlines_hide_beside_the_active_and_the_hovered_tab() {
+    let mut rt = three_tabs();
+    rt.update(|s, _| {
+        s.open_user("dj_ivo");
+        s.activate(0);
+    });
+    run(&mut rt, 1.0);
+    let line = |rt: &Runtime<App>, i: usize| {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.path.contains(&format!("/tab-{i}/sep")) && e.path.ends_with("/sep-line"))
+            .map(|e| e.opacity)
+    };
+    assert_eq!(line(&rt, 0), None, "none right of the active tab");
+    assert_eq!([line(&rt, 1), line(&rt, 2), line(&rt, 3)], [Some(1.0); 3]);
+    let (x, y) = rt.find("tab-2/title").unwrap();
+    rt.pointer_move(x, y);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(
+        [line(&rt, 1), line(&rt, 2), line(&rt, 3)],
+        [Some(0.0), Some(0.0), Some(1.0)],
+        "both sides of the hovered tab, at once"
+    );
+    rt.pointer_move(600.0, 400.0);
+    for _ in 0..5 {
+        rt.frame(1.0 / 60.0);
+    }
+    assert_eq!(
+        [line(&rt, 1), line(&rt, 2), line(&rt, 3)],
+        [Some(1.0); 3],
+        "back within 80 ms"
+    );
+    rt.update(|s, _| s.activate(2));
+    run(&mut rt, 0.1);
+    assert_eq!(
+        [line(&rt, 1), line(&rt, 2)],
+        [None, None],
+        "none beside the active tab"
+    );
+}
+
+#[test]
+fn the_tab_more_button_opens_the_tab_menu() {
+    let mut rt = three_tabs();
+    let opacity = |rt: &Runtime<App>, k: &str| {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(k))
+            .map(|e| e.opacity)
+    };
+    assert_eq!(opacity(&rt, "tab-more-2"), Some(1.0), "on the active tab");
+    assert_eq!(opacity(&rt, "tab-more-1"), Some(0.0), "others: on hover");
+    let r = rect_of(&rt, "tab-1");
+    rt.pointer_move(r[0] + 20.0, r[1] + 20.0);
+    run(&mut rt, 0.05);
+    assert_eq!(opacity(&rt, "tab-more-1"), Some(1.0));
+    let m = rect_of(&rt, "tab-more-1");
+    assert!(m[2] >= 22.0 && m[3] >= 22.0, "a 22 pt target: {m:?}");
+    let x = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.path.ends_with("/tab-1/close"))
+        .unwrap()
+        .rect;
+    assert!(m[0] + m[2] <= x[0] && x[2] >= 22.0, "left of ×, both 22 pt");
+    click(&mut rt, "tab-more-1");
+    assert_eq!(rt.state.active, 2, "⋯ doesn't switch");
+    assert_eq!(
+        menu_ids(&rt),
+        [
+            "duplicate-tab",
+            "close-tab",
+            "close-other-tabs",
+            "close-tabs-right"
+        ]
+    );
+    assert!(
+        matches!(rt.state.menu.as_ref().unwrap().anchor, MenuAnchor::Key(ref k) if k == "tab-more-1")
+    );
+    click(&mut rt, "menu-close-tabs-right");
+    assert_eq!(rt.state.tabs.len(), 2);
+}
+
+#[test]
+fn the_tree_more_button_opens_the_folder_menu() {
+    use crate::demo::{DEEP_FOLDER, DEEP_USER};
+    let mut rt = deep_tab();
+    let sel = dir_row(&rt, DEEP_FOLDER);
+    let more = sel.replace("dir-", "dir-more-");
+    click(&mut rt, &more);
+    let want: Vec<_> = rt
+        .state
+        .tree_menu(DEEP_USER, DEEP_FOLDER, false)
+        .iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(menu_ids(&rt), want);
+    assert!(matches!(rt.state.menu.as_ref().unwrap().anchor, MenuAnchor::Key(ref k) if *k == more));
+    esc(&mut rt);
+    // Another row: ⋯ shows on hover, over the end of its name; its parent has subfolders.
+    let parent = r"Music\Jungle\Iration Steppas";
+    let k = dir_row(&rt, parent);
+    let r = rect_of(&rt, &k);
+    rt.pointer_move(r[0] + 40.0, r[1] + 10.0);
+    run(&mut rt, 0.05);
+    let more = k.replace("dir-", "dir-more-");
+    let m = rect_of(&rt, &more);
+    assert!(
+        m[0] + m[2] <= r[0] + r[2] && m[0] > r[0] + r[2] - 40.0,
+        "at the row's right edge"
+    );
+    click(&mut rt, &more);
+    assert!(menu_ids(&rt).contains(&"expand-all"));
+    assert_eq!(
+        rt.state.active_browse().unwrap().selected.as_deref(),
+        Some(DEEP_FOLDER),
+        "⋯ doesn't select"
+    );
+}
+
+#[test]
+fn context_menus_stay_inside_the_window_near_its_edges() {
+    let mut rt = deep_tab();
+    let items = rt
+        .state
+        .tree_menu(crate::demo::DEEP_USER, r"Music\Jungle", true);
+    for (x, y) in [
+        (W - 4.0, H - 4.0),
+        (W - 4.0, 40.0),
+        (4.0, H - 4.0),
+        (2.0, 2.0),
+    ] {
+        rt.update(|s, _| s.open_menu(MenuAnchor::Point(x, y), items.clone()));
+        run(&mut rt, 0.05);
+        let m = rect_of(&rt, "menu");
+        assert!(
+            m[0] >= 0.0 && m[1] >= 0.0 && m[0] + m[2] <= W && m[1] + m[3] <= H,
+            "menu {m:?} at ({x}, {y}) leaves the {W}x{H} window"
+        );
+        assert!(
+            (m[0] - x).abs() < m[2] + 8.0 && (m[1] - y).abs() < m[3] + 8.0,
+            "menu {m:?} stays by the pointer ({x}, {y})"
+        );
+        esc(&mut rt);
+    }
 }

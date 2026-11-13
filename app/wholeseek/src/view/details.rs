@@ -445,15 +445,16 @@ fn tracks(s: &App, tab: &Tab, files: &[RemoteFile], t: &Theme) -> El {
                 super::albums::more_button(
                     format!("track-more-{i}"),
                     playing,
-                    move |s: &App| {
-                        crate::menu::file_items(
-                            &f,
-                            false,
-                            &s.backend.settings().recent_download_dirs,
-                        )
-                    },
+                    move |s: &App| s.file_menu(&f, false),
                     t,
                 )
+            })
+            .on_secondary_press({
+                let f = f.clone();
+                move |s: &mut App, p, _| {
+                    let items = s.file_menu(&f, false);
+                    super::menu::at_point(s, p, items);
+                }
             });
         if playing {
             r = r.fill(accent().alpha(0.07));

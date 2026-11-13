@@ -128,6 +128,15 @@ impl App {
         crate::menu::folder_items(username, folder, playable, recent)
     }
 
+    /// An album row's menu: the folder menu, its play item named for the row.
+    pub fn album_menu(&self, username: &str, folder: &str) -> Vec<crate::menu::MenuItem> {
+        let mut v = self.folder_menu(username, folder);
+        if let Some(p) = v.iter_mut().find(|i| i.id == "play-folder") {
+            p.label = "Play album".into();
+        }
+        v
+    }
+
     /// The files of a remote folder as far as the app knows them, in natural name order
     /// ([`crate::tabs::natural_cmp`]), the order its rows are listed in.
     pub fn folder_files(&self, username: &str, folder: &str) -> Vec<RemoteFile> {
@@ -135,7 +144,7 @@ impl App {
             .tabs
             .iter()
             .filter_map(|t| t.browse())
-            .find(|b| b.username == username)
+            .find(|b| b.username == username && b.dirs.is_some())
             .and_then(|b| b.dirs.as_ref())
             .and_then(|d| d.iter().find(|d| d.path == folder))
             .map(|d| d.files.clone());

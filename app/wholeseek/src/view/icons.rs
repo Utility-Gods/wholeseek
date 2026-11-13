@@ -258,6 +258,36 @@ pub static SKIP_FORWARD_SOLID: Icon = lucide_solid!(
     r#"<path d="M21 4v16"/><path d="M6.029 4.285A2 2 0 0 0 3 6v12a2 2 0 0 0 3.029 1.715l9.997-5.998a2 2 0 0 0 .003-3.432z"/>"#
 );
 
+// Context menus: open in a new tab, duplicate, expand/collapse all, close others/right.
+pub static APP_WINDOW: Icon = lucide!(
+    "app-window",
+    r#"<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M10 4v4"/><path d="M2 8h20"/><path d="M6 4v4"/>"#
+);
+pub static USER_PLUS: Icon = lucide!(
+    "user-plus",
+    r#"<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" x2="19" y1="8" y2="14"/><line x1="22" x2="16" y1="11" y2="11"/>"#
+);
+pub static COPY_PLUS: Icon = lucide!(
+    "copy-plus",
+    r#"<line x1="15" x2="15" y1="12" y2="18"/><line x1="12" x2="18" y1="15" y2="15"/><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>"#
+);
+pub static CHEVRONS_UP_DOWN: Icon = lucide!(
+    "chevrons-up-down",
+    r#"<path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/>"#
+);
+pub static CHEVRONS_DOWN_UP: Icon = lucide!(
+    "chevrons-down-up",
+    r#"<path d="m7 20 5-5 5 5"/><path d="m7 4 5 5 5-5"/>"#
+);
+pub static SQUARE_X: Icon = lucide!(
+    "square-x",
+    r#"<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/>"#
+);
+pub static ARROW_RIGHT_TO_LINE: Icon = lucide!(
+    "arrow-right-to-line",
+    r#"<path d="M17 12H3"/><path d="m11 18 6-6-6-6"/><path d="M21 5v14"/>"#
+);
+
 /// Every vendored icon (tests draw each one).
 #[cfg(test)]
 pub static ALL: &[&Icon] = &[
@@ -311,6 +341,13 @@ pub static ALL: &[&Icon] = &[
     &PAUSE_SOLID,
     &SKIP_BACK_SOLID,
     &SKIP_FORWARD_SOLID,
+    &APP_WINDOW,
+    &USER_PLUS,
+    &COPY_PLUS,
+    &CHEVRONS_UP_DOWN,
+    &CHEVRONS_DOWN_UP,
+    &SQUARE_X,
+    &ARROW_RIGHT_TO_LINE,
 ];
 
 /// `i` at `size`, tinted `c`.

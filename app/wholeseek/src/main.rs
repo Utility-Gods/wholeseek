@@ -399,6 +399,60 @@ fn scene_tree_reveal(s: &mut App) {
     s.open_folder_at(demo::DEEP_USER, demo::DEEP_FOLDER, None);
 }
 
+/// Context menus as a right-click opens them (at the pointer), for review.
+fn scene_menu_tree(s: &mut App) {
+    scene_tree_reveal(s);
+    demo_recent_dirs(s);
+    let items = crate::menu::tree_items(demo::DEEP_USER, demo::DEEP_FOLDER, true, false, &[]);
+    s.open_menu(crate::menu::MenuAnchor::Point(130.0, 420.0), items);
+}
+
+/// The tree menu on a folder with subfolders: Expand all / Collapse all.
+fn scene_menu_tree_parent(s: &mut App) {
+    scene_tree_reveal(s);
+    let items = s.tree_menu(demo::DEEP_USER, r"Music\Jungle\Iration Steppas", true);
+    s.open_menu(crate::menu::MenuAnchor::Point(130.0, 396.0), items);
+}
+
+fn scene_menu_user_file(s: &mut App) {
+    s.demo_search();
+    s.open_folder_at("dj_ivo", r"mp3\H\Hollow Lights", None);
+    s.downloaded = s.backend.downloaded_keys();
+    let f = demo_file("dj_ivo", "Hollow Lights - Low Tide Radio.mp3");
+    let items = s.file_menu(&f, true);
+    s.open_menu(crate::menu::MenuAnchor::Point(420.0, 244.0), items);
+}
+
+fn scene_menu_search_album(s: &mut App) {
+    scene_results(s);
+    demo_recent_dirs(s);
+    let f = demo_file("alice", "01 Night Ferry.flac");
+    // Built before the demo results arrive: as `album_menu` makes it once they have.
+    let recent = s.backend.settings().recent_download_dirs.clone();
+    let mut items = crate::menu::folder_items(&f.username, f.folder(), true, &recent);
+    items[0].label = "Play album".into();
+    s.open_menu(crate::menu::MenuAnchor::Point(300.0, 266.0), items);
+}
+
+fn scene_menu_search_file(s: &mut App) {
+    scene_results(s);
+    folders_layout(s);
+    demo_recent_dirs(s);
+    let f = demo_file("dj_ivo", "Hollow Lights - Salt Roads.mp3");
+    s.tab_mut().selected = Some(f.path.clone());
+    let items = s.file_menu(&f, false);
+    s.open_menu(crate::menu::MenuAnchor::Point(300.0, 232.0), items);
+}
+
+fn scene_menu_tab(s: &mut App) {
+    s.demo_search();
+    s.open_user("alice");
+    s.open_user("vinyl_rips");
+    s.activate(1);
+    let items = crate::menu::tab_items(1, s.tabs.len());
+    s.open_menu(crate::menu::MenuAnchor::Key("tab-more-1".into()), items);
+}
+
 /// Results tab, then alice's and vinyl_rips' tabs; vinyl_rips is shown.
 fn scene_three_tabs(s: &mut App) {
     s.demo_search();
@@ -530,6 +584,12 @@ fn main() {
             ("nothing-matches", scene_nothing_matches),
             ("user-tab", scene_browse),
             ("tree-reveal", scene_tree_reveal),
+            ("menu-tree", scene_menu_tree),
+            ("menu-tree-parent", scene_menu_tree_parent),
+            ("menu-user-file", scene_menu_user_file),
+            ("menu-search-album", scene_menu_search_album),
+            ("menu-search-file", scene_menu_search_file),
+            ("menu-tab", scene_menu_tab),
             ("three-tabs", scene_three_tabs),
             ("transfers-drawer", scene_transfers),
             ("history", scene_history),

@@ -142,11 +142,7 @@ pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t
         .size(24.0, 22.0)
         .label("More")
         .on_press(move |s: &mut App| {
-            let items = crate::menu::file_items(
-                &file_m,
-                in_user,
-                &s.backend.settings().recent_download_dirs,
-            );
+            let items = s.file_menu(&file_m, in_user);
             let key = more_key_of(s, &file_m);
             s.open_menu(MenuAnchor::Key(key), items);
         });
@@ -189,11 +185,7 @@ pub fn file_row(s: &App, key: &str, f: &RemoteFile, indent: f32, ctx: &RowCtx, t
         })
         .on_secondary_press(move |s: &mut App, p, _| {
             s.tab_mut().selected = Some(file_s.path.clone());
-            let items = crate::menu::file_items(
-                &file_s,
-                in_user,
-                &s.backend.settings().recent_download_dirs,
-            );
+            let items = s.file_menu(&file_s, in_user);
             super::menu::at_point(s, p, items);
         })
         .child(play)
