@@ -189,7 +189,16 @@ fn play_replaces_previous_track_cleanly() {
             .all(|e| matches!(e, PlayerEvent::Playing | PlayerEvent::Buffering)),
         "only A state flips may precede Stopped"
     );
-    assert_eq!(ev_b[stopped + 1], PlayerEvent::Buffering, "B's first event");
+    // B is a complete file: on a fast machine it can start before the ticker ever sees it
+    // buffering, so `Buffering` is optional; either way B's events begin right after Stopped.
+    assert!(
+        matches!(
+            ev_b[stopped + 1],
+            PlayerEvent::Buffering | PlayerEvent::Started { .. }
+        ),
+        "B's first event: {:?}",
+        ev_b[stopped + 1]
+    );
     assert_eq!(ev_b.last(), Some(&PlayerEvent::Ended));
     let b_started: Vec<_> = ev_b[stopped..]
         .iter()
