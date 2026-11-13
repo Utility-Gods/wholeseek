@@ -172,6 +172,68 @@ fn file(user: &str, folder: &str, name: &str, q: Q, secs: u32) -> RemoteFile {
 }
 
 /// Every file every fake peer shares.
+/// A user with a big, deep share (browse only): the folder tree scrolls.
+pub const DEEP_USER: &str = "crate_digger";
+/// A folder far down [`DEEP_USER`]'s tree.
+pub const DEEP_FOLDER: &str = r"Music\Jungle\Iration Steppas\Iration Steppas - 1994 - Scud Missile";
+
+/// [`DEEP_USER`]'s share: 12 genres × 48 artists × 3 albums of 2 tracks, plus
+/// [`DEEP_FOLDER`].
+fn deep_share() -> Vec<BrowseDir> {
+    const GENRES: [&str; 12] = [
+        "Ambient",
+        "Breakbeat",
+        "Dub",
+        "Electro",
+        "Footwork",
+        "Garage",
+        "House",
+        "Jungle",
+        "Reggae",
+        "Soul",
+        "Techno",
+        "Trip Hop",
+    ];
+    const FIRST: [&str; 12] = [
+        "Acid", "Bass", "Blue", "Cold", "Dark", "Echo", "Free", "Ghost", "Hazy", "Low", "Night",
+        "Silver",
+    ];
+    const SECOND: [&str; 4] = ["Signals", "Harbour", "Collective", "Static"];
+    let user = DEEP_USER;
+    let mut dirs = Vec::new();
+    let mut album = |folder: String| {
+        let files = (1..=2)
+            .map(|n| {
+                file(
+                    user,
+                    &folder,
+                    &format!("0{n} Track {n}.flac"),
+                    Q::Flac16,
+                    240 + n,
+                )
+            })
+            .collect();
+        dirs.push(BrowseDir {
+            path: folder,
+            files,
+        });
+    };
+    for g in GENRES {
+        for (i, a) in FIRST
+            .iter()
+            .flat_map(|f| SECOND.map(|s| format!("{f} {s}")))
+            .enumerate()
+        {
+            for y in 0..3 {
+                let year = 1990 + (i + y * 7) % 30;
+                album(format!(r"Music\{g}\{a}\{a} - {year} - Volume {}", y + 1));
+            }
+        }
+    }
+    album(DEEP_FOLDER.to_string());
+    dirs
+}
+
 pub fn catalog() -> Vec<RemoteFile> {
     let coast = r"Music\Hollow Lights\Coastline (2019)";
     let ferry = r"Music\Hollow Lights\Night Ferry EP (2021)";
@@ -663,6 +725,9 @@ impl DemoBackend {
                     files: vec![f],
                 }),
             }
+        }
+        if username == DEEP_USER {
+            return deep_share();
         }
         if username == "alice" {
             dirs.push(BrowseDir {

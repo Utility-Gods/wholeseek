@@ -4332,3 +4332,99 @@ fn every_more_menu_opens_by_its_button_in_both_layouts() {
         run(&mut rt, 0.05);
     }
 }
+
+/// The selected folder's tree row, and whether it lies inside the tree's viewport.
+fn tree_row_in_view(rt: &Runtime<App>) -> (String, bool) {
+    let tab = rt.state.tab();
+    let i = tab
+        .browse()
+        .and_then(|b| b.tree_row_of_selected())
+        .expect("the selected folder has a row");
+    let key = format!("dir-{i}");
+    let (r, v) = (rect_of(rt, &key), rect_of(rt, &tab.tree_key()));
+    let inside = r[1] >= v[1] - 0.5 && r[1] + r[3] <= v[1] + v[3] + 0.5;
+    (key, inside)
+}
+
+fn deep_tab() -> Runtime<App> {
+    use crate::demo::{DEEP_FOLDER, DEEP_USER};
+    let mut rt = signed_in();
+    rt.state.open_folder_at(DEEP_USER, DEEP_FOLDER, None);
+    run(&mut rt, 1.0);
+    rt
+}
+
+#[test]
+fn opening_a_user_tab_at_a_deep_folder_reveals_it_in_the_tree() {
+    use crate::demo::DEEP_FOLDER;
+    let rt = deep_tab();
+    let b = rt.state.active_browse().unwrap();
+    for anc in [r"Music", r"Music\Jungle", r"Music\Jungle\Iration Steppas"] {
+        assert!(b.expanded.contains(anc), "{anc} expanded");
+    }
+    let i = b.tree_row_of_selected().unwrap();
+    assert!(i > 40, "far down the tree (row {i})");
+    assert_eq!(
+        b.visible_tree()[i].0,
+        DEEP_FOLDER,
+        "the computed row is the drawn one"
+    );
+    let (key, inside) = tree_row_in_view(&rt);
+    assert!(inside, "{key} is scrolled into the tree's view");
+    assert!(rt.state.tab().tree_scroll.get() > 0.0, "the tree scrolled");
+}
+
+#[test]
+fn clicking_a_tree_row_never_scrolls_the_tree() {
+    let mut rt = deep_tab();
+    let before = rt.state.tab().tree_scroll.get();
+    let i = rt
+        .state
+        .active_browse()
+        .unwrap()
+        .tree_row_of_selected()
+        .unwrap();
+    for k in [i - 3, i + 2, i - 3] {
+        click(&mut rt, &format!("dir-{k}"));
+        run(&mut rt, 0.3);
+        assert_eq!(rt.state.tab().tree_scroll.get(), before, "click on dir-{k}");
+    }
+}
+
+#[test]
+fn reselecting_a_folder_already_in_view_keeps_the_tree_still() {
+    let mut rt = deep_tab();
+    let before = rt.state.tab().tree_scroll.get();
+    let p = {
+        let b = rt.state.active_browse().unwrap();
+        b.visible_tree()[b.tree_row_of_selected().unwrap() - 2]
+            .0
+            .clone()
+    };
+    rt.update(|s, _| s.active_browse_mut().unwrap().select(&p));
+    run(&mut rt, 0.3);
+    assert_eq!(rt.state.tab().tree_scroll.get(), before);
+    assert!(!rt.state.active_browse().unwrap().reveal_tree, "handled");
+}
+
+#[test]
+fn clearing_the_tree_filter_reveals_the_selected_folder() {
+    let mut rt = deep_tab();
+    rt.update(|s, _| s.active_browse_mut().unwrap().filter.replace_text("techno"));
+    run(&mut rt, 0.2);
+    // Cleared from the box, as typing would: the change handler asks for the reveal.
+    rt.update(|s, tx| {
+        let key = s.tab().tree_key();
+        tx.scroll_to_instant(key, 0.0, 0.0);
+    });
+    rt.update(|_, tx| tx.focus("tree-find", true));
+    run(&mut rt, 0.1);
+    press(&mut rt, key(Key::End));
+    for _ in 0.."techno".len() {
+        press(&mut rt, key(Key::Backspace));
+    }
+    run(&mut rt, 0.3);
+    assert!(rt.state.active_browse().unwrap().filter.text.is_empty());
+    let (k, inside) = tree_row_in_view(&rt);
+    assert!(inside, "{k} back in view");
+}

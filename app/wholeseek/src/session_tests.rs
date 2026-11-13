@@ -251,3 +251,36 @@ fn demo_without_a_path_never_writes() {
     rt.state.flush_session();
     assert_eq!(rt.state.tabs.len(), 1);
 }
+
+#[test]
+fn a_restored_user_tab_scrolls_its_tree_to_the_open_folder() {
+    use crate::demo::{DEEP_FOLDER, DEEP_USER};
+    let d = dir("tree-reveal");
+    let path = d.0.join("session.json");
+    {
+        let mut rt = launch(&path, false);
+        rt.state.demo_login();
+        run(&mut rt, 1.0);
+        rt.state.open_folder_at(DEEP_USER, DEEP_FOLDER, None);
+        run(&mut rt, 1.0);
+        rt.state.flush_session();
+    }
+    let mut rt = launch(&path, true);
+    run(&mut rt, 1.5);
+    let tab = rt.state.tab();
+    let b = tab.browse().expect("the user tab is shown");
+    assert_eq!(b.selected.as_deref(), Some(DEEP_FOLDER));
+    let i = b.tree_row_of_selected().unwrap();
+    let rect = |k: &str| {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(k))
+            .unwrap_or_else(|| panic!("no {k}"))
+            .rect
+    };
+    let (r, v) = (rect(&format!("dir-{i}")), rect(&tab.tree_key()));
+    assert!(
+        r[1] >= v[1] && r[1] + r[3] <= v[1] + v[3],
+        "row {r:?} inside the tree {v:?}"
+    );
+}

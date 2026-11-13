@@ -70,6 +70,10 @@ pub fn poll(s: &mut App, t: f64, tx: &mut Tx) -> bool {
     if let Some((list, row)) = s.take_reveal() {
         tx.scroll_into_view_in(list, row);
     }
+    // A user tab's folder picked other than in its tree: centre its tree row.
+    if let Some((tree, row)) = s.tab_mut().take_tree_reveal() {
+        tx.scroll_center_in_instant(tree, row);
+    }
     if let Some(w) = wake {
         tx.wake_after(Duration::from_secs_f64(w.max(1.0 / 60.0)));
     }
@@ -385,6 +389,13 @@ fn scene_browse(s: &mut App) {
     s.open_folder_of(&f);
 }
 
+/// A big share opened at a folder far down its tree (as from "Browse user"): the tree
+/// scrolls to it.
+fn scene_tree_reveal(s: &mut App) {
+    s.demo_search();
+    s.open_folder_at(demo::DEEP_USER, demo::DEEP_FOLDER, None);
+}
+
 /// Results tab, then alice's and vinyl_rips' tabs; vinyl_rips is shown.
 fn scene_three_tabs(s: &mut App) {
     s.demo_search();
@@ -509,6 +520,7 @@ fn main() {
             ("filtered", scene_filtered),
             ("nothing-matches", scene_nothing_matches),
             ("user-tab", scene_browse),
+            ("tree-reveal", scene_tree_reveal),
             ("three-tabs", scene_three_tabs),
             ("transfers-drawer", scene_transfers),
             ("history", scene_history),
