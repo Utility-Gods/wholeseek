@@ -15,9 +15,11 @@ mod backend;
 mod demo;
 mod demo_big;
 mod demo_history;
+mod demo_library;
 mod desktop;
 mod fmt;
 mod history;
+mod library;
 mod media;
 mod menu;
 mod playback;
@@ -614,6 +616,13 @@ fn main() {
             ("browse-profile", scene_browse_profile),
             ("browse-profile-minimal", scene_browse_profile_minimal),
             ("no-keyring", scene_no_keyring),
+            ("library", demo_library::scene_albums),
+            ("library-songs", demo_library::scene_songs),
+            ("library-search", demo_library::scene_search),
+            ("library-starred", demo_library::scene_starred),
+            ("library-album", demo_library::scene_album),
+            ("library-menu", demo_library::scene_menu),
+            ("library-empty", demo_library::scene_empty),
         ],
         min_size: Some((820.0, 520.0)),
         setup: Some(setup),

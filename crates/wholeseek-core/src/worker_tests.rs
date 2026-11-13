@@ -2484,3 +2484,57 @@ fn folder_reply_reaches_waiters_with_another_spelling() {
     }
     assert!(s.st().browse_requests.is_empty(), "no browse fallback");
 }
+
+// ------------------------------------------------------------------- library backstop
+
+#[test]
+fn library_files_never_reach_the_network() {
+    let mut h = harness();
+    let s = h.online();
+    let local = RemoteFile {
+        username: crate::LOCAL_USER.into(),
+        path: "/music/Artist/Album/01 Song.flac".into(),
+        size: 4,
+        attrs: AudioAttrs::default(),
+    };
+    assert!(local.is_local());
+    let play = h.core.play_fetch(&local);
+    let down = h.core.download(&local);
+    let dir = h.tmp.path().join("elsewhere");
+    let to = h.core.download_to(&local, &dir);
+    let album = h.core.download_album_file(&local, None);
+    h.core.browse(crate::LOCAL_USER);
+    h.core.user_profile(crate::LOCAL_USER);
+    h.core
+        .download_folder(crate::LOCAL_USER, "/music/Artist/Album");
+    h.core
+        .download_folder_to(crate::LOCAL_USER, "/music/Artist/Album", &dir);
+    h.core.cancel_upload(crate::LOCAL_USER, &local.path);
+    h.core
+        .fetch_cover(crate::LOCAL_USER, "/music/Artist/Album", None);
+    // Each refused transfer fails at once, so no row waits forever.
+    for id in [play.id, down, to, album] {
+        h.want(
+            "refused",
+            |e| matches!(e, CoreEvent::TransferFailed { id: i, .. } if *i == id),
+        );
+    }
+    // A peer request after them goes out: the worker is fine and saw them all first.
+    h.core.browse("alice");
+    wait_until("alice browsed", || {
+        s.st().browse_requests.contains(&"alice".to_string())
+    });
+    h.none_within(Duration::from_millis(100), |e| {
+        matches!(e, CoreEvent::TransferQueued { .. })
+    });
+    let st = s.st();
+    assert_eq!(st.browse_requests, ["alice"]);
+    assert!(st.downloads.is_empty(), "no download sent");
+    assert!(st.folder_requests.is_empty(), "no folder request sent");
+    assert!(st.profile_requests.is_empty(), "no user info asked");
+    assert!(st.upload_cancels.is_empty());
+    drop(st);
+    assert!(h.core.history(&Default::default()).is_empty());
+    assert!(files_under(&h.downloads_dir()).is_empty());
+    assert!(files_under(&h.cache_dir()).is_empty());
+}

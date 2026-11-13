@@ -125,6 +125,7 @@ pub static SETTINGS: Icon = lucide!(
 );
 pub static CHEVRON_DOWN: Icon = lucide!("chevron-down", r#"<path d="m6 9 6 6 6-6"/>"#);
 pub static CHEVRON_RIGHT: Icon = lucide!("chevron-right", r#"<path d="m9 18 6-6-6-6"/>"#);
+pub static CHEVRON_LEFT: Icon = lucide!("chevron-left", r#"<path d="m15 18-6-6 6-6"/>"#);
 pub static CHECK: Icon = lucide!("check", r#"<path d="M20 6 9 17l-5-5"/>"#);
 pub static CIRCLE_ALERT: Icon = lucide!(
     "circle-alert",
@@ -192,6 +193,10 @@ pub static DISC_3: Icon = lucide!(
 pub static STAR: Icon = lucide!(
     "star",
     r#"<path d="M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.906l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z"/>"#
+);
+pub static LIBRARY: Icon = lucide!(
+    "library",
+    r#"<path d="m16 6 4 14"/><path d="M12 6v14"/><path d="M8 8v12"/><path d="M4 4v16"/>"#
 );
 pub static ARROW_UP_DOWN: Icon = lucide!(
     "arrow-up-down",
@@ -326,6 +331,8 @@ pub static ALL: &[&Icon] = &[
     &PAUSE,
     &DISC_3,
     &STAR,
+    &LIBRARY,
+    &CHEVRON_LEFT,
     &ARROW_UP_DOWN,
     &UNDO_2,
     &PENCIL,

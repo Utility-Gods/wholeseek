@@ -501,7 +501,40 @@ pub(crate) mod tests {
             data_dir: "/data".into(),
             check_updates: false,
             dismissed_update: Some("0.1.4".into()),
+            library_dirs: vec!["/music".into()],
         }
+    }
+
+    #[test]
+    fn config_without_library_dirs_loads_with_the_default_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A 0.1.4 config: no `library_dirs`.
+        std::fs::write(
+            tmp.path().join(CONFIG_FILE),
+            "username = \"alice\"\n[settings]\nlisten_port = 2240\ncheck_updates = false\n",
+        )
+        .unwrap();
+        let l = load_in(tmp.path(), &mem()).unwrap();
+        assert_eq!(l.settings.listen_port, 2240);
+        assert!(!l.settings.check_updates);
+        assert_eq!(l.settings.library_dirs, Settings::default().library_dirs);
+        assert!(
+            l.settings
+                .library_dirs
+                .contains(&Settings::default().download_dir),
+            "the downloads folder is a library folder by default"
+        );
+        // Removing every folder sticks.
+        let mut s = l.settings;
+        s.library_dirs.clear();
+        save_settings_in(tmp.path(), &s).unwrap();
+        assert!(
+            load_in(tmp.path(), &mem())
+                .unwrap()
+                .settings
+                .library_dirs
+                .is_empty()
+        );
     }
 
     #[test]

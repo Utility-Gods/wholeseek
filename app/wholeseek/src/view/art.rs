@@ -155,6 +155,14 @@ fn demo_covers() -> Option<Covers> {
             covers.store_embedded(u, d, &png).ok()?;
         }
     }
+    // The demo Library's albums: most have a cover.
+    for (i, d) in crate::demo_library::album_folders().iter().enumerate() {
+        let u = wholeseek_core::LOCAL_USER;
+        if i % 5 != 4 && covers.cached(u, d).is_none() {
+            let png = wholeseek_core::cover::demo_png(1000 + i as u64, 64);
+            covers.store_embedded(u, d, &png).ok()?;
+        }
+    }
     Some(covers)
 }
 
@@ -230,6 +238,8 @@ impl App {
                 && self.art.embedded.ticket == Some(ticket)
                 && !self.art.embedded.fell_back
                 && let Some(p) = &self.playing
+                // A Library file's folder image is the scanner's job; never the network.
+                && !p.file.is_local()
             {
                 self.art.embedded.fell_back = true;
                 let (u, d) = (p.file.username.clone(), p.file.folder().to_string());
@@ -261,6 +271,8 @@ impl App {
                     ));
                 }
             }
+            // Library covers are stored by its scanner as it goes.
+            TabKind::Library => {}
         }
         let keys: Vec<(String, String)> = wanted
             .iter()

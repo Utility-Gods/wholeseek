@@ -52,7 +52,19 @@ pub struct RemoteFile {
     pub attrs: AudioAttrs,
 }
 
+/// The pseudo user of the user's own Library files ([`crate::library`]): `RemoteFile`s with
+/// it are local files at their absolute `path`, played in place. No Soulseek user has an
+/// empty name, and the core never sends a request for it ([`RemoteFile::is_local`]).
+pub const LOCAL_USER: &str = "";
+
 impl RemoteFile {
+    /// A Library file on this machine ([`LOCAL_USER`]), not a peer's: never fetched,
+    /// browsed or downloaded; `path` is where it is.
+    #[must_use]
+    pub fn is_local(&self) -> bool {
+        is_local_user(&self.username)
+    }
+
     /// Last path component (`01 Track.flac`).
     #[must_use]
     pub fn basename(&self) -> &str {
@@ -70,6 +82,12 @@ impl RemoteFile {
     pub fn extension(&self) -> String {
         crate::rank::extension(&self.path)
     }
+}
+
+/// Whether `username` is [`LOCAL_USER`] (the Library), never a peer.
+#[must_use]
+pub fn is_local_user(username: &str) -> bool {
+    username == LOCAL_USER
 }
 
 /// One search hit with the responding peer's slot/speed figures.
@@ -221,6 +239,9 @@ pub struct Settings {
     pub check_updates: bool,
     /// The release ("x.y.z") whose update notice was dismissed; a newer one shows again.
     pub dismissed_update: Option<String>,
+    /// Folders the Library indexes (read only: files play where they are). Default: the OS
+    /// music folder if it exists, plus the downloads folder. May be empty.
+    pub library_dirs: Vec<PathBuf>,
 }
 
 impl Settings {
@@ -244,10 +265,16 @@ impl Default for Settings {
     /// [`crate::config::APP_NAME`].
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let download_dir = dirs::download_dir()
+            .unwrap_or_else(|| home.join("Downloads"))
+            .join(crate::config::APP_NAME);
+        let library_dirs = dirs::audio_dir()
+            .filter(|d| d.is_dir())
+            .into_iter()
+            .chain(std::iter::once(download_dir.clone()))
+            .collect();
         Self {
-            download_dir: dirs::download_dir()
-                .unwrap_or_else(|| home.join("Downloads"))
-                .join(crate::config::APP_NAME),
+            download_dir,
             cache_dir: dirs::cache_dir()
                 .unwrap_or_else(|| home.join(".cache"))
                 .join(crate::config::APP_NAME),
@@ -265,6 +292,7 @@ impl Default for Settings {
                 .join(crate::config::APP_NAME),
             check_updates: true,
             dismissed_update: None,
+            library_dirs,
         }
     }
 }

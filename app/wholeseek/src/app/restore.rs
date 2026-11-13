@@ -57,6 +57,15 @@ impl App {
                 username: u.browse.username.clone(),
                 folder: u.browse.selected.clone(),
             },
+            TabKind::Library => SessionTab::Library {
+                view: Some(
+                    match self.library.view {
+                        crate::library::LibView::Albums => "albums",
+                        crate::library::LibView::Songs => "songs",
+                    }
+                    .to_string(),
+                ),
+            },
         });
         Session::new(tabs.collect(), self.active)
     }
@@ -77,6 +86,12 @@ impl App {
                 let id = self.next_tab;
                 self.next_tab += 1;
                 let mut tab = Tab::new(id, shell(t));
+                if let SessionTab::Library { view } = t {
+                    self.library.view = match view.as_deref() {
+                        Some("songs") => crate::library::LibView::Songs,
+                        _ => crate::library::LibView::Albums,
+                    };
+                }
                 if let SessionTab::Search { selected_group, .. } = t {
                     tab.group = selected_group
                         .as_deref()
@@ -162,6 +177,7 @@ impl App {
                 self.backend.user_profile(&name);
                 self.profiles.requested(&name);
             }
+            TabKind::Library => return false,
         }
         true
     }
@@ -215,5 +231,6 @@ fn shell(t: &SessionTab) -> TabKind {
             }
             TabKind::User(UserTab { browse })
         }
+        SessionTab::Library { .. } => TabKind::Library,
     }
 }

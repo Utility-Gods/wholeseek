@@ -46,6 +46,11 @@ pub enum SessionTab {
         #[serde(default)]
         folder: Option<String>,
     },
+    /// The Library (at most one); its view (`"albums"`, `"songs"`), `None` = default.
+    Library {
+        #[serde(default)]
+        view: Option<String>,
+    },
 }
 
 impl SessionTab {
@@ -73,6 +78,7 @@ impl SessionTab {
             SessionTab::Search { typed: s, .. } | SessionTab::User { username: s, .. } => {
                 !s.trim().is_empty()
             }
+            SessionTab::Library { .. } => true,
         }
     }
 }
@@ -242,16 +248,20 @@ impl RestoreAction {
     }
 }
 
-/// One action per tab: the active tab fetches now, every other tab when first
-/// shown — so at most one request (search or browse) at startup.
+/// One action per network tab: the active tab fetches now, every other tab when
+/// first shown — so at most one request (search or browse) at startup. The
+/// Library fetches nothing.
 pub fn restore_plan(session: &Session) -> Vec<RestoreAction> {
-    let plan = |(tab, t): (usize, &SessionTab)| match (t, tab == session.active) {
-        (SessionTab::Search { .. }, true) => RestoreAction::SearchNow { tab },
-        (SessionTab::User { .. }, true) => RestoreAction::BrowseNow { tab },
-        (SessionTab::Search { .. }, false) => RestoreAction::SearchWhenShown { tab },
-        (SessionTab::User { .. }, false) => RestoreAction::BrowseWhenShown { tab },
+    let plan = |(tab, t): (usize, &SessionTab)| {
+        Some(match (t, tab == session.active) {
+            (SessionTab::Search { .. }, true) => RestoreAction::SearchNow { tab },
+            (SessionTab::User { .. }, true) => RestoreAction::BrowseNow { tab },
+            (SessionTab::Search { .. }, false) => RestoreAction::SearchWhenShown { tab },
+            (SessionTab::User { .. }, false) => RestoreAction::BrowseWhenShown { tab },
+            (SessionTab::Library { .. }, _) => return None,
+        })
     };
-    session.tabs.iter().enumerate().map(plan).collect()
+    session.tabs.iter().enumerate().filter_map(plan).collect()
 }
 
 #[cfg(test)]

@@ -214,6 +214,8 @@ pub struct App {
     pub profiles: Profiles,
     /// Album covers: decoded images and which folders were asked for (`view::art`).
     pub art: crate::view::art::Art,
+    /// The Library tab's index, scanner and view state ([`crate::library`]).
+    pub library: crate::library::LibraryUi,
     /// The update check and what it found (`update`).
     pub updates: crate::update::Updates,
     /// The account signed in with this run, for Reconnect (memory only).
@@ -316,6 +318,7 @@ impl App {
             pending_credentials: None,
             profiles: Profiles::default(),
             art: crate::view::art::Art::default(),
+            library: Default::default(),
             updates: crate::update::Updates::new(demo),
             credentials: None,
             boot: None,
@@ -370,6 +373,7 @@ impl App {
         self.store.set_waker(wake.clone());
         self.profiles.set_waker(wake.clone());
         self.art.set_waker(wake.clone());
+        self.library.set_waker(wake.clone());
         self.backend.set_waker(wake.clone());
         self.player.set_waker(wake.clone());
         self.waker = Some(wake);
@@ -480,6 +484,7 @@ impl App {
         changed |= self.media_tick();
         let mut wake = self.backend.next_tick();
         changed |= self.tick_updates(&mut wake);
+        changed |= self.library_tick(&mut wake);
         let downloaded = self.backend.downloaded_keys();
         if !std::sync::Arc::ptr_eq(&downloaded, &self.downloaded) && *downloaded != *self.downloaded
         {
@@ -924,7 +929,7 @@ impl App {
 
     // ---- tabs ----------------------------------------------------------------------------
 
-    fn push_tab(&mut self, kind: TabKind) {
+    pub(crate) fn push_tab(&mut self, kind: TabKind) {
         let id = self.next_tab;
         self.next_tab += 1;
         let at = if self.tabs.is_empty() {
@@ -1085,6 +1090,7 @@ impl App {
                     self.profiles.forget(name);
                 }
             }
+            TabKind::Library => {}
         }
         if self.tabs.is_empty() {
             self.new_search_tab();

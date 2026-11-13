@@ -379,7 +379,42 @@ impl Worker {
         self.ids.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Backstop for the Library's pseudo user ([`crate::LOCAL_USER`]): what a command would
+    /// ask of the network for a local file, if anything. Such a request never leaves.
+    fn local_request(c: &Command) -> Option<&'static str> {
+        use crate::model::is_local_user;
+        match c {
+            Command::Browse { username } if is_local_user(username) => Some("browse"),
+            Command::Fetch { file, .. } if file.is_local() => Some("transfer"),
+            Command::DownloadFolder { username, .. }
+            | Command::DownloadFolderTo { username, .. }
+                if is_local_user(username) =>
+            {
+                Some("folder download")
+            }
+            Command::UserProfile(username) if is_local_user(username) => Some("user info"),
+            Command::CancelUpload { username, .. } if is_local_user(username) => {
+                Some("upload cancel")
+            }
+            Command::FetchCover { username, .. } if is_local_user(username) => Some("cover"),
+            _ => None,
+        }
+    }
+
     fn command(&mut self, c: Command) {
+        if let Some(what) = Self::local_request(&c) {
+            if cfg!(debug_assertions) {
+                eprintln!("wholeseek-core: dropped a {what} request for a Library file");
+            }
+            // A row the app already shows for it must not wait forever.
+            if let Command::Fetch { id, .. } = c {
+                self.emit(CoreEvent::TransferFailed {
+                    id,
+                    reason: "Library files play from disk".into(),
+                });
+            }
+            return;
+        }
         match c {
             Command::Login(creds) => self.login(creds),
             Command::Logout => self.logout(),

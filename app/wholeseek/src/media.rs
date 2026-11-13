@@ -124,11 +124,21 @@ pub fn state_of(s: &App) -> State {
     };
     let secs = |x: f64| Duration::from_secs_f64(x.max(0.0));
     let folder = p.file.folder();
+    // A Library file: its tags (never an empty "artist" from the pseudo user).
+    let (title, artist, album) = if p.file.is_local() {
+        s.library_names(&p.file)
+    } else {
+        (
+            crate::fmt::title(&p.file),
+            p.file.username.clone(),
+            wholeseek_core::paths::remote_basename(folder).to_string(),
+        )
+    };
     let track = Track {
         id: track_id(&p.file.username, &p.file.path),
-        title: crate::fmt::title(&p.file),
-        artist: p.file.username.clone(),
-        album: wholeseek_core::paths::remote_basename(folder).to_string(),
+        title,
+        artist,
+        album,
         length: snap.and_then(|s| s.duration_secs).map(secs),
         art: s
             .backend

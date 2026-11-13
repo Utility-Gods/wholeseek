@@ -11,6 +11,7 @@ pub mod cover;
 mod event;
 pub mod group;
 pub mod history;
+pub mod library;
 mod model;
 mod net;
 pub mod paths;
@@ -26,8 +27,8 @@ pub use cover::{CoverState, Covers};
 pub use event::{CoreEvent, DisconnectReason, PortMapOutcome};
 pub use history::{DownloadedKeys, HistoryEntry, HistoryQuery, Outcome};
 pub use model::{
-    AudioAttrs, BrowseDir, Credentials, PlayTicket, RemoteFile, SearchHit, SearchId, Settings,
-    TransferId, TransferKind, UploadRow, UploadState, UserProfile,
+    AudioAttrs, BrowseDir, Credentials, LOCAL_USER, PlayTicket, RemoteFile, SearchHit, SearchId,
+    Settings, TransferId, TransferKind, UploadRow, UploadState, UserProfile, is_local_user,
 };
 pub use paths::{DOWNLOAD_SKIP, is_download_junk};
 pub use query::{broaden_query, normalize_query};

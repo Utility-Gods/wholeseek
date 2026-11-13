@@ -10,6 +10,7 @@ pub(crate) mod art;
 mod details;
 mod files;
 pub mod icons;
+mod library;
 mod menu;
 mod onboarding;
 mod panels;
@@ -132,6 +133,7 @@ fn main(s: &App, t: &Theme) -> El {
     let content = match &s.tab().kind {
         TabKind::Search(st) => search::page(s, s.tab(), st, t),
         TabKind::User(u) => user::page(s, s.tab(), &u.browse, t),
+        TabKind::Library => library::page(s, t),
     };
     let mut body = col()
         .key("body")

@@ -11,6 +11,7 @@ pub mod growing;
 pub mod output;
 pub mod player;
 pub mod sink;
+pub mod tags;
 
 pub use artwork::{ArtLookup, Artwork, embedded_art};
 pub use formats::{PLAYABLE_EXTENSIONS, is_playable};
@@ -24,3 +25,4 @@ pub use player::{
     Player, PlayerEvent, PlayerSnapshot, QueueItem, SeekError, SinkFactory,
 };
 pub use sink::{AudioSink, CaptureData, CaptureSink, NullSink};
+pub use tags::{TrackTags, read_tags};

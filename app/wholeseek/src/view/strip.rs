@@ -146,7 +146,10 @@ pub fn view(s: &App, t: &Theme) -> El {
     if let Some(u) = super::update::pill(s, t) {
         right = right.child(u);
     }
-    let right = right.child(transfers).child(settings);
+    let right = right
+        .child(super::library::strip_button(s, t))
+        .child(transfers)
+        .child(settings);
     let mut strip = row()
         .key("strip")
         .h(TAB_H)
@@ -202,6 +205,10 @@ fn tab_el(s: &App, i: usize, tab: &Tab, t: &Theme) -> El {
             st.search.as_ref().map(|v| v.visible(&st.filters)),
         ),
         TabKind::User(_) => (icons::user(icons::MD, t.text_secondary), None),
+        TabKind::Library => (
+            icons::draw(&icons::LIBRARY, icons::MD, t.text_secondary),
+            None,
+        ),
     };
     let mut label = row()
         .gap(8.0)

@@ -76,6 +76,14 @@ pub enum MenuAction {
     CloseTab(usize),
     CloseOtherTabs(usize),
     CloseTabsRight(usize),
+    /// The Library: ▶ a song (by path) in the list it's shown in.
+    LibraryPlay(String),
+    /// The Library: ▶ an album (by key).
+    LibraryPlayAlbum(String),
+    /// The Library: star or unstar a song (by path).
+    LibraryStar(String),
+    /// The Library: star or unstar an album (by key).
+    LibraryStarAlbum(String),
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +154,7 @@ fn icon_for(id: &str) -> Option<&'static Icon> {
         "close-tabs-right" => &icons::ARROW_RIGHT_TO_LINE,
         "open-file" => &icons::EXTERNAL_LINK,
         "retry" => &icons::REFRESH_CW,
+        "star" => &icons::STAR,
         "cancel" => &icons::X,
         // Sort items: the view puts the check on the current one.
         _ => return None,
@@ -428,6 +437,64 @@ pub fn tree_items(
 
 /// The tab strip's menu on tab `i` of `n`: duplicate, then close it (as × does), the others
 /// (with others) and those to its right (when some are).
+/// A Library song: Play, Star/Unstar, Show in folder, Copy path.
+pub fn library_song_items(path: &str, starred: bool) -> Vec<MenuItem> {
+    vec![
+        item("play", "Play", MenuAction::LibraryPlay(path.to_string())),
+        item(
+            "star",
+            if starred { "Unstar" } else { "Star" },
+            MenuAction::LibraryStar(path.to_string()),
+        ),
+        MenuItem {
+            sep: true,
+            ..item(
+                "show-in-folder",
+                "Show in folder",
+                MenuAction::ShowInFolder(PathBuf::from(path)),
+            )
+        },
+        item(
+            "copy-path",
+            "Copy path",
+            MenuAction::CopyPath(path.to_string()),
+        ),
+    ]
+}
+
+/// A Library album: Play album, Star/Unstar, Show in folder, Copy path.
+pub fn library_album_items(key: &str, dir: &Path, starred: bool) -> Vec<MenuItem> {
+    vec![
+        item(
+            "play-album",
+            "Play album",
+            MenuAction::LibraryPlayAlbum(key.to_string()),
+        ),
+        item(
+            "star",
+            if starred {
+                "Unstar album"
+            } else {
+                "Star album"
+            },
+            MenuAction::LibraryStarAlbum(key.to_string()),
+        ),
+        MenuItem {
+            sep: true,
+            ..item(
+                "show-in-folder",
+                "Show in folder",
+                MenuAction::OpenFile(dir.to_path_buf()),
+            )
+        },
+        item(
+            "copy-path",
+            "Copy path",
+            MenuAction::CopyPath(dir.display().to_string()),
+        ),
+    ]
+}
+
 pub fn tab_items(i: usize, n: usize) -> Vec<MenuItem> {
     let mut v = vec![
         item(

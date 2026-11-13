@@ -948,6 +948,85 @@ fn choose_folder(
     }
 }
 
+/// Settings → Library folders: what the Library indexes (read only), with its counts.
+fn library_folders(s: &App, t: &Theme) -> El {
+    let cfg = s.backend.settings();
+    let ui = &s.library;
+    let totals = if ui.progress.scanning {
+        "scanning…".to_string()
+    } else if ui.index.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{} songs · {} albums",
+            ui.index.tracks.len(),
+            ui.index.albums.len()
+        )
+    };
+    let mut b = block("Library folders", &icons::LIBRARY, t).child(
+        row()
+            .w_full()
+            .center_y()
+            .child(
+                text(totals)
+                    .key("library-totals")
+                    .font(tnum(META))
+                    .color(t.text_secondary)
+                    .help("Files play where they are; nothing is copied or changed")
+                    .grow(1.0),
+            )
+            .child(
+                link_icon("library-rescan", &icons::REFRESH_CW, "Rescan", t)
+                    .on_press(|s: &mut App| s.rescan_library()),
+            ),
+    );
+    for (i, dir) in cfg.library_dirs.iter().enumerate() {
+        let path = dir.display().to_string();
+        let (open, remove) = (dir.clone(), dir.clone());
+        b = b.child(
+            line(
+                &format!("set-library-{i}"),
+                row()
+                    .gap(6.0)
+                    .center_y()
+                    .child(icons::folder(icons::MD, t.text_secondary))
+                    .child(label(fmt::home_short(&path), t).shrink().help(path.clone())),
+            )
+            .hover_group()
+            .child(
+                mini_icon("open", &icons::FOLDER_OPEN, "Open", t)
+                    .group_opacity(0.0, 1.0)
+                    .on_press(move |s: &mut App| s.desktop.open(&open)),
+            )
+            .child(
+                mini_icon("remove", &icons::X, "Remove", t)
+                    .group_opacity(0.0, 1.0)
+                    .help("Stop listing this folder (its files stay)")
+                    .on_press(move |s: &mut App| s.remove_library_dir(&remove)),
+            ),
+        );
+    }
+    if s.settings_form.manual.is_some() {
+        b.child(
+            field_box(
+                "set-library",
+                input(&ui.folder_input, "Folder path", t)
+                    .on_edit(|s: &mut App| &mut s.library.folder_input)
+                    .on_submit(|s: &mut App, _| s.add_typed_library_dir()),
+                t,
+            )
+            .w_full(),
+        )
+    } else {
+        b.child(
+            row().child(
+                mini_icon("add-library", &icons::PLUS, "Add folder…", t)
+                    .on_press_tx(choose_folder("Add a library folder", App::add_library_dir)),
+            ),
+        )
+    }
+}
+
 fn dirs_home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
@@ -1222,6 +1301,8 @@ pub fn settings(s: &App, t: &Theme) -> El {
             ),
         ),
     );
+    // Last, so the blocks above keep their place.
+    body = body.child(library_folders(s, t));
     body = body.child(super::update::version(t));
     panel("settings-panel", "Settings", saved, body, t)
 }

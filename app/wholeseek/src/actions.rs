@@ -97,6 +97,10 @@ impl App {
             }
             MenuAction::DuplicateTab(i) => self.duplicate_tab(i),
             MenuAction::CloseTab(i) => self.close_tab(i),
+            MenuAction::LibraryPlay(p) => self.play_library_song(&p),
+            MenuAction::LibraryPlayAlbum(k) => self.play_library_album(&k),
+            MenuAction::LibraryStar(p) => self.toggle_star_song(&p),
+            MenuAction::LibraryStarAlbum(k) => self.toggle_star_album(&k),
             MenuAction::CloseOtherTabs(i) => self.close_other_tabs(i),
             MenuAction::CloseTabsRight(i) => self.close_tabs_right(i),
         }
@@ -153,6 +157,11 @@ impl App {
                 }
                 let fetch = copy.dirs.is_none();
                 (TabKind::User(UserTab { browse: copy }), fetch)
+            }
+            // There is one Library: "duplicate" just shows it.
+            TabKind::Library => {
+                self.active = i;
+                return;
             }
         };
         let tab = self.insert_tab(i + 1, kind);
@@ -220,6 +229,7 @@ impl App {
                             .any(|d| d.files.iter().any(|f| f.path == file.path))
                     })
             }
+            crate::tabs::TabKind::Library => file.is_local(),
         };
         let from = self
             .play_from
@@ -283,6 +293,10 @@ impl App {
 
     /// Where a finished download of `file` is on disk.
     pub fn local_path_of(&self, file: &RemoteFile) -> Option<PathBuf> {
+        // A Library file plays where it is.
+        if file.is_local() {
+            return Some(PathBuf::from(&file.path));
+        }
         match &self.download_of(file)?.state {
             TState::Done(p) => Some(p.clone()),
             _ => None,

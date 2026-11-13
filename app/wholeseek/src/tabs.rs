@@ -32,6 +32,8 @@ pub struct Tab {
 pub enum TabKind {
     Search(SearchTab),
     User(UserTab),
+    /// The user's own music (at most one; its state is `App::library`).
+    Library,
 }
 
 pub struct SearchTab {
@@ -966,28 +968,28 @@ impl Tab {
     pub fn search(&self) -> Option<&SearchTab> {
         match &self.kind {
             TabKind::Search(s) => Some(s),
-            TabKind::User(_) => None,
+            TabKind::User(_) | TabKind::Library => None,
         }
     }
 
     pub fn search_mut(&mut self) -> Option<&mut SearchTab> {
         match &mut self.kind {
             TabKind::Search(s) => Some(s),
-            TabKind::User(_) => None,
+            TabKind::User(_) | TabKind::Library => None,
         }
     }
 
     pub fn browse(&self) -> Option<&BrowseView> {
         match &self.kind {
             TabKind::User(u) => Some(&u.browse),
-            TabKind::Search(_) => None,
+            TabKind::Search(_) | TabKind::Library => None,
         }
     }
 
     pub fn browse_mut(&mut self) -> Option<&mut BrowseView> {
         match &mut self.kind {
             TabKind::User(u) => Some(&mut u.browse),
-            TabKind::Search(_) => None,
+            TabKind::Search(_) | TabKind::Library => None,
         }
     }
 
@@ -1005,6 +1007,7 @@ impl Tab {
                 .or_else(|| self.restore.then(|| s.edit.text.clone()))
                 .unwrap_or_else(|| "New search".into()),
             TabKind::User(u) => u.browse.username.clone(),
+            TabKind::Library => "Library".into(),
         }
     }
 

@@ -53,21 +53,38 @@ pub fn strip(s: &App, t: &Theme) -> El {
     let kept = s.download_of(&p.file);
     // Second line: a notice or problem if there is one, else where the sound comes from.
     let user = p.file.username.clone();
-    let from = row()
-        .gap(4.0)
-        .center_y()
-        .child(text("from").font(META).color(t.text_secondary))
-        .child(
-            text(p.file.username.clone())
-                .key("now-user")
-                .font(META)
-                .color(t.text)
-                .cursor(Cursor::Pointer)
-                .role("link")
-                .help("Open this user in a tab")
-                .on_press(move |s: &mut App| s.open_user(&user)),
-        );
+    // A Library file: its tags, from disk; nobody to open.
+    let local = p.file.is_local().then(|| s.library_names(&p.file));
+    let from = match &local {
+        Some((_, artist, album)) => row().gap(4.0).center_y().child(
+            text(if album.is_empty() {
+                artist.clone()
+            } else {
+                format!("{artist} · {album}")
+            })
+            .key("now-artist")
+            .font(META)
+            .color(t.text)
+            .truncate()
+            .shrink(),
+        ),
+        None => row()
+            .gap(4.0)
+            .center_y()
+            .child(text("from").font(META).color(t.text_secondary))
+            .child(
+                text(p.file.username.clone())
+                    .key("now-user")
+                    .font(META)
+                    .color(t.text)
+                    .cursor(Cursor::Pointer)
+                    .role("link")
+                    .help("Open this user in a tab")
+                    .on_press(move |s: &mut App| s.open_user(&user)),
+            ),
+    };
     let source = match fetch.map(|x| &x.state) {
+        _ if local.is_some() => "Library",
         Some(TState::Done(_)) => "cached",
         _ if kept.is_some_and(|k| matches!(k.state, TState::Done(_))) => "cached",
         _ => "streaming",
@@ -128,16 +145,26 @@ pub fn strip(s: &App, t: &Theme) -> El {
                 .center_y()
                 .child(equalizer(s.now, running && p.opened, accent()))
                 .child(
-                    text(fmt::title(&p.file))
-                        .key("now-title")
-                        .font(type_::TITLE)
-                        .color(t.text)
-                        .truncate()
-                        .shrink()
-                        .cursor(rune::Cursor::Pointer)
-                        .role("link")
-                        .help("Show in list")
-                        .on_press(|s: &mut App| s.reveal_playing()),
+                    text(
+                        local
+                            .as_ref()
+                            .map_or_else(|| fmt::title(&p.file), |l| l.0.clone()),
+                    )
+                    .key("now-title")
+                    .font(type_::TITLE)
+                    .color(t.text)
+                    .truncate()
+                    .shrink()
+                    .cursor(rune::Cursor::Pointer)
+                    .role("link")
+                    .help("Show in list")
+                    .on_press_tx(|s: &mut App, tx| {
+                        if s.playing.as_ref().is_some_and(|p| p.file.is_local()) {
+                            s.reveal_library_playing(tx);
+                        } else {
+                            s.reveal_playing();
+                        }
+                    }),
                 ),
         )
         .child(second);
@@ -187,6 +214,8 @@ pub fn strip(s: &App, t: &Theme) -> El {
 
     let file = p.file.clone();
     let keep: El = match kept.map(|k| (&k.state, k.fraction())) {
+        // Already on disk: nothing to keep.
+        _ if p.file.is_local() => el().key("keep"),
         None | Some((TState::Cancelled | TState::Failed(_), _)) => {
             action("keep", "Keep", icons::down(icons::MD, t.text), t)
                 .help("Save this track to your downloads")

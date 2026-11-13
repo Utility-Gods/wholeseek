@@ -249,6 +249,11 @@ impl History {
         local_path: Option<PathBuf>,
         reason: Option<String>,
     ) -> io::Result<()> {
+        // Library files are played from disk, never downloaded: no history, and never an
+        // empty username in the file.
+        if file.is_local() {
+            return Ok(());
+        }
         let (username, remote_path, attrs) = (&file.username, &file.path, file.attrs);
         let mut res = Ok(());
         if let Some(old) = self.by_transfer.remove(&transfer) {
@@ -426,6 +431,25 @@ mod tests {
         assert_eq!(h.downloaded_keys().len(), 1);
         let text = fs::read_to_string(tmp.path().join(HISTORY_FILE)).unwrap();
         assert!(!text.to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn library_files_never_enter_the_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut h = History::open(tmp.path()).unwrap();
+        rec(
+            &mut h,
+            1,
+            crate::LOCAL_USER,
+            "/music/A/01.flac",
+            Outcome::Done,
+        );
+        rec(&mut h, 2, "alice", "a.flac", Outcome::Done);
+        let all = h.query(&HistoryQuery::default());
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].username, "alice");
+        drop(h);
+        assert_eq!(lines(tmp.path()), 1);
     }
 
     #[test]

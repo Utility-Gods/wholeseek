@@ -1387,11 +1387,16 @@ impl FakePlayer {
     }
 
     fn buffer(&self) -> Option<Buffer> {
-        self.world
-            .borrow()
-            .buffers
-            .get(self.path.as_ref()?)
-            .copied()
+        let path = self.path.as_ref()?;
+        if path.starts_with(crate::demo_library::ROOT) {
+            // The demo Library's files are "on disk": all there, ~4 min.
+            return Some(Buffer {
+                bytes: 1,
+                total: 1,
+                duration: 240.0,
+            });
+        }
+        self.world.borrow().buffers.get(path).copied()
     }
 }
 
