@@ -97,6 +97,9 @@ pub struct HistoryQuery {
 /// `(username, remote_path)` of downloads that completed.
 pub type DownloadedKeys = Arc<HashSet<(String, String)>>;
 
+/// One JSONL line, built and dropped per read/write, never stored: boxing `Add` buys nothing.
+/// (Windows' larger `PathBuf` pushes `HistoryEntry` over clippy's size threshold there.)
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Line {

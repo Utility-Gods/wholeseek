@@ -87,14 +87,38 @@ pub fn download_dir_for(download_dir: &Path, remote_path: &str) -> PathBuf {
 
 /// Make a remote name safe as a single local path component.
 fn sanitize(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| if c == '/' || c == '\0' { '_' } else { c })
-        .collect();
-    match s.trim() {
+    sanitize_for(name, cfg!(windows))
+}
+
+/// [`sanitize`]; `windows` also replaces what Windows forbids in a name (`<>:"\|?*`, control
+/// characters), drops a trailing dot or space (Windows strips them, so the folder would not be
+/// found again) and suffixes a device name (`CON`, `COM1`, …) with `_`.
+fn sanitize_for(name: &str, windows: bool) -> String {
+    let bad = |c: char| {
+        c == '/'
+            || c == '\0'
+            || (windows
+                && (c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*')))
+    };
+    let s: String = name.chars().map(|c| if bad(c) { '_' } else { c }).collect();
+    let t = if windows {
+        s.trim().trim_end_matches(['.', ' '])
+    } else {
+        s.trim()
+    };
+    match t {
         "." | ".." => String::new(),
+        t if windows && is_windows_device_name(t) => format!("{t}_"),
         t => t.to_string(),
     }
+}
+
+/// `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, with or without an extension.
+fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (matches!(stem.get(..3), Some("COM" | "LPT"))
+            && matches!(stem.as_bytes().get(3..), Some([b'1'..=b'9'])))
 }
 
 /// Files `Core::download_folder` leaves out: OS/file-manager junk, matched
@@ -183,6 +207,24 @@ mod tests {
             download_dir_for(d, r"x\a/b\01.flac"),
             PathBuf::from("/dl/b")
         );
+    }
+
+    #[test]
+    fn folder_names_are_made_valid_for_windows_there_only() {
+        let win = |s| sanitize_for(s, true);
+        assert_eq!(win("Live: 1999 <Remaster>?"), "Live_ 1999 _Remaster__");
+        assert_eq!(win("What \"Is\" | This*"), "What _Is_ _ This_");
+        assert_eq!(win("Vol. 2..."), "Vol. 2");
+        assert_eq!(win("Album "), "Album");
+        assert_eq!(win("con"), "con_");
+        assert_eq!(win("COM3.flac"), "COM3.flac_");
+        assert_eq!(win("Console"), "Console");
+        assert_eq!(win("COM0"), "COM0");
+        assert_eq!(win(".."), "");
+        assert_eq!(win("..."), "");
+        // Elsewhere only `/` and NUL are touched: a folder keeps its exact name.
+        assert_eq!(sanitize_for("Live: 1999?", false), "Live: 1999?");
+        assert_eq!(sanitize_for("Vol. 2...", false), "Vol. 2...");
     }
 
     #[test]

@@ -5,10 +5,15 @@
 //!   its own thread. No session bus: one log line, the app works as before.
 //! - macOS: `MPRemoteCommandCenter` handlers and `MPNowPlayingInfoCenter` (info + playback state,
 //!   so the keys come to us and not to Music.app).
+//! - Elsewhere (Windows for now): no media keys; [`Media::start`] gives `None` and the app works
+//!   as before. Windows' System Media Transport Controls are a later addition.
 //!
 //! Commands only ever travel over a channel (plus a window wake); [`App::media_tick`] applies
 //! them on the UI thread with the existing `toggle_pause` / `next_track` / `previous_track`, then
 //! publishes what plays. Nothing here blocks the UI thread.
+
+// Without a platform backend, the commands and metadata the backends share go unused.
+#![cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};

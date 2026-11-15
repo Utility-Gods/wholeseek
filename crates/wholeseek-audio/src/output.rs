@@ -204,7 +204,9 @@ impl AudioSink for CpalSink {
         // Not `cpal::default_host()`: it panics if the host cannot be initialised.
         #[cfg(target_os = "macos")]
         let host_id = cpal::HostId::CoreAudio;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        let host_id = cpal::HostId::Wasapi;
+        #[cfg(not(any(target_os = "macos", windows)))]
         let host_id = cpal::HostId::Alsa;
         let host =
             cpal::host_from_id(host_id).map_err(|e| format!("audio system unavailable: {e}"))?;

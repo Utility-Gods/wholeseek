@@ -14,6 +14,9 @@ pub enum StoreNote {
     Failed(String),
 }
 
+/// A short-lived request (and the demo's record of it): boxing the settings buys nothing.
+/// (Windows' larger `PathBuf` pushes `Settings` over clippy's size threshold there.)
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreCall {
     SaveSettings(Settings),

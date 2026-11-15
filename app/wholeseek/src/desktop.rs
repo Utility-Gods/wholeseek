@@ -34,28 +34,56 @@ fn background(job: impl FnOnce() + Send + 'static) {
 
 /// Run a helper; true when it exited successfully.
 fn run(program: &str, args: &[String]) -> bool {
-    Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
+    let mut cmd = Command::new(program);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .stderr(Stdio::null());
+    add_args(&mut cmd, args);
+    cmd.status()
+        .is_ok_and(|s| s.success() || exit_code_means_nothing(program))
+}
+
+#[cfg(not(windows))]
+fn add_args(cmd: &mut Command, args: &[String]) {
+    cmd.args(args);
+}
+
+/// Explorer parses `/select,<path>` itself and wants the path quoted after the comma
+/// (`/select,"C:\a b\x.flac"`), not the whole argument quoted as Rust would. A Windows path
+/// cannot contain `"`, so the raw form is safe.
+#[cfg(windows)]
+fn add_args(cmd: &mut Command, args: &[String]) {
+    use std::os::windows::process::CommandExt;
+    for a in args {
+        match a.strip_prefix("/select,") {
+            Some(path) => cmd.raw_arg(format!("/select,\"{path}\"")),
+            None => cmd.arg(a),
+        };
+    }
+}
+
+/// `explorer.exe` exits 1 even when it did what was asked, so starting it is success enough.
+fn exit_code_means_nothing(program: &str) -> bool {
+    program == "explorer"
 }
 
 /// Helper invocations, tried in order until one succeeds.
 pub type Commands = Vec<(&'static str, Vec<String>)>;
 
 /// The desktop this build talks to.
+#[allow(clippy::enum_variant_names)] // `MacOs` is the platform's name, not a suffix
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
     MacOs,
+    Windows,
     /// Linux and other freedesktop systems.
     Freedesktop,
 }
 
 pub const OS: Os = if cfg!(target_os = "macos") {
     Os::MacOs
+} else if cfg!(windows) {
+    Os::Windows
 } else {
     Os::Freedesktop
 };
@@ -65,7 +93,7 @@ pub const OS: Os = if cfg!(target_os = "macos") {
 pub fn shortcut(os: Os, key: &str) -> String {
     match os {
         Os::MacOs => format!("⌘{key}"),
-        Os::Freedesktop => format!("Ctrl+{key}"),
+        Os::Windows | Os::Freedesktop => format!("Ctrl+{key}"),
     }
 }
 
@@ -74,20 +102,24 @@ pub fn chord(key: &str) -> String {
     shortcut(OS, key)
 }
 
-/// How to open `path` with its default app (a folder: in the file manager).
+/// How to open `path` with its default app (a folder: in the file manager; a URL: in the
+/// browser). Windows: `explorer <path>`, a GUI program, so no console window flashes up as
+/// `cmd /c start` would from a windowless app.
 pub fn open_commands(os: Os, path: &Path) -> Commands {
     let p = path.display().to_string();
     match os {
         Os::MacOs => vec![("open", vec![p])],
+        Os::Windows => vec![("explorer", vec![p])],
         Os::Freedesktop => vec![("xdg-open", vec![p])],
     }
 }
 
-/// How to reveal `file` selected in the file manager: Finder's `open -R` on macOS; on
-/// Linux the FileManager1 D-Bus interface, else its folder opened.
+/// How to reveal `file` selected in the file manager: Finder's `open -R` on macOS, Explorer's
+/// `/select,` on Windows; on Linux the FileManager1 D-Bus interface, else its folder opened.
 pub fn show_item_commands(os: Os, file: &Path) -> Commands {
     match os {
         Os::MacOs => vec![("open", vec!["-R".into(), file.display().to_string()])],
+        Os::Windows => vec![("explorer", vec![format!("/select,{}", file.display())])],
         Os::Freedesktop => freedesktop_show_item(file),
     }
 }
