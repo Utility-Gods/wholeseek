@@ -15,7 +15,10 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 echo "wholeseek $version (windows x86_64)"
 
 if [ -z "${SKIP_BUILD:-}" ]; then
-  WHOLESEEK_REQUIRE_RESOURCES=1 cargo build --release --locked -p wholeseek
+  # Static C runtime: the exe must not need VCRUNTIME140.dll (the Visual C++ Redistributable is
+  # not on every Windows); the Universal CRT ships with Windows 10+.
+  RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static" \
+    WHOLESEEK_REQUIRE_RESOURCES=1 cargo build --release --locked -p wholeseek
 fi
 exe=target/release/wholeseek.exe
 [ -f "$exe" ] || { echo "no $exe" >&2; exit 1; }

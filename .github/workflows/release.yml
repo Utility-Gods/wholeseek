@@ -148,6 +148,8 @@ jobs:
           "PE subsystem: $sub"
           if ($sub -ne 2) { throw "wholeseek.exe is not a GUI-subsystem exe" }
           if ((Get-Item $exe).VersionInfo.ProductVersion -ne "${{ steps.zip.outputs.version }}") { throw "version info missing" }
+          # Static CRT: no Visual C++ Redistributable needed on the user's machine.
+          if ([Text.Encoding]::ASCII.GetString($b) -match 'VCRUNTIME140') { throw "wholeseek.exe needs VCRUNTIME140.dll" }
 
       - uses: actions/upload-artifact@v5
         with:
