@@ -51,3 +51,37 @@ jobs:
 
       - name: test
         run: cargo test --locked --workspace
+
+  windows:
+    # Windows builds, lints and passes the same tests (Unix-only ones are cfg-gated with a reason).
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add clippy
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-windows-x86_64
+
+      - name: ffmpeg (audio tests generate their fixtures with it)
+        run: |
+          command -v ffmpeg || choco install ffmpeg -y --no-progress
+          ffmpeg -version | head -1
+
+      - name: build
+        run: cargo build --locked --workspace
+
+      - name: clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --locked --workspace

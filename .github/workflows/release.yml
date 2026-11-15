@@ -47,8 +47,8 @@ jobs:
           TAG: ${{ github.ref_name }}
           DMG: ${{ steps.dmg.outputs.dmg }}
         run: |
-          # Race-safe with the linux job: whoever loses the create sees it exists.
-          # Draft until both builds are attached, so /releases/latest never points at a half release.
+          # Race-safe with the linux and windows jobs: whoever loses the create sees it exists.
+          # Draft until every build is attached, so /releases/latest never points at a half release.
           # Notes come from CHANGELOG.md (also shown on wholeseek.utilitygods.com/changelog).
           .github/scripts/release-notes.sh "$TAG" > notes.md
           gh release create "$TAG" --draft --title "wholeseek $TAG" --notes-file notes.md 2>/dev/null \
@@ -105,7 +105,7 @@ jobs:
           TAG: ${{ github.ref_name }}
           TARBALL: ${{ steps.tar.outputs.tarball }}
         run: |
-          # Draft until both builds are attached, so /releases/latest never points at a half release.
+          # Draft until every build is attached, so /releases/latest never points at a half release.
           # Notes come from CHANGELOG.md (also shown on wholeseek.utilitygods.com/changelog).
           .github/scripts/release-notes.sh "$TAG" > notes.md
           gh release create "$TAG" --draft --title "wholeseek $TAG" --notes-file notes.md 2>/dev/null \
@@ -115,10 +115,68 @@ jobs:
           cp "$TARBALL" "$stable"
           gh release upload "$TAG" "$TARBALL" "$stable" --clobber
 
+  windows:
+    runs-on: windows-latest # x86_64, MSVC toolchain; the Windows SDK's rc.exe embeds icon + version
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64
+
+      - name: Build zip
+        id: zip
+        run: packaging/windows/build-zip.sh
+
+      - name: Show the exe's version info and imports
+        shell: pwsh
+        run: |
+          $exe = "target/release/wholeseek.exe"
+          (Get-Item $exe).VersionInfo | Format-List FileDescription, FileVersion, ProductVersion, LegalCopyright
+          # Subsystem 2 = Windows GUI (no console window); 3 would be a console app.
+          $b = [IO.File]::ReadAllBytes($exe); $pe = [BitConverter]::ToInt32($b, 0x3c)
+          $sub = [BitConverter]::ToUInt16($b, $pe + 24 + 68)
+          "PE subsystem: $sub"
+          if ($sub -ne 2) { throw "wholeseek.exe is not a GUI-subsystem exe" }
+          if ((Get-Item $exe).VersionInfo.ProductVersion -ne "${{ steps.zip.outputs.version }}") { throw "version info missing" }
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.zip.outputs.name }}
+          path: ${{ steps.zip.outputs.zip }}
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ZIP: ${{ steps.zip.outputs.zip }}
+        run: |
+          # Draft until every build is attached, so /releases/latest never points at a half release.
+          # Notes come from CHANGELOG.md (also shown on wholeseek.utilitygods.com/changelog).
+          .github/scripts/release-notes.sh "$TAG" > notes.md
+          gh release create "$TAG" --draft --title "wholeseek $TAG" --notes-file notes.md 2>/dev/null \
+            || gh release view "$TAG" >/dev/null
+          # Stable name: .../releases/latest/download/wholeseek-windows-x86_64.zip
+          stable="$(dirname "$ZIP")/wholeseek-windows-x86_64.zip"
+          cp "$ZIP" "$stable"
+          gh release upload "$TAG" "$ZIP" "$stable" --clobber
+
   publish:
-    # Both builds are attached: publish the draft and make it the latest release in one step.
+    # Every build is attached: publish the draft and make it the latest release in one step.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [macos, linux]
+    needs: [macos, linux, windows]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -142,7 +200,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          for kind in mac linux; do
+          for kind in mac linux windows; do
             ok=
             for try in 1 2 3 4 5 6; do
               hops=$(curl -sIL "https://wholeseek.utilitygods.com/download/$kind" | tr -d '\r' | grep -i '^location:' || true)
