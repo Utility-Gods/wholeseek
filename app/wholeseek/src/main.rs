@@ -9,6 +9,10 @@
 //! settings, uploads, displaced, browse-profile(-minimal), onboarding-error, rejected,
 //! no-keyring.
 
+// Windows release builds are GUI programs: no console window opens alongside the app (debug
+// builds keep one for the log lines).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod actions;
 mod app;
 mod backend;
@@ -572,7 +576,11 @@ fn main() {
     // X11 WM_CLASS / Wayland app_id: the desktop matches the window to wholeseek.desktop
     // (Icon=wholeseek, StartupWMClass=wholeseek) and shows its icon. Rune's `set_app_icon` sets the
     // window/taskbar icon on macOS and Windows only; on Linux the .desktop entry provides it.
+    // Windows: the exe's own icon resource when build.rs embedded one (nothing decoded at launch).
     rune::set_app_id("wholeseek");
+    #[cfg(wholeseek_icon_resource)]
+    rune::set_app_icon_resource(1);
+    #[cfg(not(wholeseek_icon_resource))]
     if let Err(e) =
         rune::set_app_icon(include_bytes!("../../../assets/wholeseek-256.png").as_slice())
     {

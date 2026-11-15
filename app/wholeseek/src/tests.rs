@@ -1456,10 +1456,28 @@ fn desktop_commands_per_os() {
     );
     assert_eq!(open_commands(Os::Freedesktop, f), [("xdg-open", vec![p])]);
     assert_eq!(show_item_commands(Os::Freedesktop, f)[0].0, "gdbus");
+    let w = std::path::Path::new(r"C:\Users\n\Music\A b\01.flac");
+    assert_eq!(
+        open_commands(Os::Windows, w),
+        [(
+            "explorer",
+            vec![r"C:\Users\n\Music\A b\01.flac".to_string()]
+        )]
+    );
+    assert_eq!(
+        show_item_commands(Os::Windows, w),
+        [(
+            "explorer",
+            vec![r"/select,C:\Users\n\Music\A b\01.flac".to_string()]
+        )],
+        "Explorer opens the folder with the file selected"
+    );
     assert_eq!(
         crate::desktop::OS,
         if cfg!(target_os = "macos") {
             Os::MacOs
+        } else if cfg!(windows) {
+            Os::Windows
         } else {
             Os::Freedesktop
         }
@@ -2375,6 +2393,7 @@ fn shortcut_labels_follow_the_platform() {
     assert_eq!(shortcut(Os::MacOs, "T"), "⌘T");
     assert_eq!(shortcut(Os::MacOs, "→"), "⌘→");
     assert_eq!(shortcut(Os::Freedesktop, "T"), "Ctrl+T");
+    assert_eq!(shortcut(Os::Windows, "T"), "Ctrl+T");
     assert_eq!(chord("W"), shortcut(crate::desktop::OS, "W"));
 }
 
