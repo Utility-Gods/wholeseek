@@ -4856,7 +4856,7 @@ dependencies = [
 
 [[package]]
 name = "wholeseek"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "block2 0.6.2",
  "dirs",
@@ -4874,7 +4874,7 @@ dependencies = [
 
 [[package]]
 name = "wholeseek-audio"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "cpal",
  "symphonia 0.6.1",
@@ -4884,7 +4884,7 @@ dependencies = [
 
 [[package]]
 name = "wholeseek-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dirs",
  "igd-next",

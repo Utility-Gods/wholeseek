@@ -2,7 +2,7 @@
 
 # wholeseek
 
-A minimal native desktop client for [Soulseek](https://www.slsknet.org/), made for music.
+A minimal native desktop client for [Soulseek](https://www.slsknet.org/), and a music player for your own library.
 Search, browse, press ▶ to hear a track instantly, and press ↓ only if you want to keep it.
 
 - **Play before you download.** ▶ streams into a cache while the file arrives; nothing lands in
@@ -10,6 +10,8 @@ Search, browse, press ▶ to hear a track instantly, and press ↓ only if you w
 - **Any format.** Filter by FLAC, MP3, WAV or other; results are grouped by user and folder with length, size and quality, best-available sources first.
 - **Tabs.** Several searches and users open at once; click any username to browse their shares.
 - **Album playback.** Play a folder in order with the next track prefetched.
+- **Your library.** Albums, songs, instant search and stars for your own music folders, played
+  right where the files are: nothing is copied, and nothing is added to your shares.
 - **A good network citizen.** Logs in, shares your folders, serves uploads, maps its port.
 
 Linux only for now. Native GPU UI ([rune](https://github.com/anomalyco/rune)), protocol by

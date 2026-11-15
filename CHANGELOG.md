@@ -3,6 +3,14 @@
 Each release's section becomes its GitHub release notes and appears on
 https://wholeseek.utilitygods.com/changelog. Write for people using the app.
 
+## 0.1.5
+
+- Library: your own music in a tab. Albums, songs, instant search and stars (☆), with a Starred filter.
+- Play a song, an album or the whole list; Next, Previous and media keys work as usual.
+- Songs play right where they are: nothing is copied or downloaded, and the Library doesn't add anything to your shares.
+- Choose the folders in Settings → Library folders (Music and Downloads to start). Scanning runs in the background and only re-reads files that changed.
+- Users with thousands of folders open and scroll smoothly; long folder and file lists no longer lag.
+
 ## 0.1.4
 
 - Right-click menus everywhere, and a ⋯ button wherever a menu exists: on tabs, sidebar folders, songs and search results.
