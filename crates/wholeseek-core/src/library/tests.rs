@@ -301,7 +301,12 @@ fn walk_finds_audio_only_once_and_skips_hidden() {
     let found = walk(&roots, &AtomicBool::new(false));
     let mut names: Vec<String> = found
         .iter()
-        .map(|(p, ..)| p.strip_prefix(&root).unwrap().display().to_string())
+        .map(|(p, ..)| p.strip_prefix(&root).unwrap().to_path_buf())
+        .map(|p| {
+            // Compare by components: Windows separates them with `\`.
+            let parts: Vec<_> = p.iter().map(|c| c.to_string_lossy().into_owned()).collect();
+            parts.join("/")
+        })
         .collect();
     names.sort();
     assert_eq!(names, ["A/B/01.flac", "C/05.MP3"]);
