@@ -1,6 +1,6 @@
 # wholeseek — MVP
 
-Status: **final**. License: **MIT**. Platform: **Linux** (Rune is cross-platform; others later).
+Status: **final**. License: **MIT**. Platforms: **Linux** (x86_64), **macOS** (Apple Silicon), **Windows** (x86_64, 10+); Rune is cross-platform.
 
 ## Product
 
@@ -29,7 +29,7 @@ A minimal native desktop Soulseek client for music: **search, browse a user, pla
 
 ## Out of scope
 
-Chat/rooms, private messages, wishlist, buddies, playlists, tag editing, artist pages, themes, Windows builds.
+Chat/rooms, private messages, wishlist, buddies, playlists, tag editing, artist pages, themes, code signing, installers (MSI/MSIX), Windows media keys (SMTC; for now a no-op there).
 
 ## Layout
 
@@ -54,7 +54,7 @@ Chat/rooms, private messages, wishlist, buddies, playlists, tag editing, artist 
 | UI | [Rune](https://github.com/anomalyco/rune) (pinned `dev` rev) | Native GPU Rust UI, headless render/test. Pre-release accepted. |
 | Audio | symphonia (FLAC/MP3/OGG/M4A decode) + cpal (output) | Pure Rust. |
 | Secrets | `keyring` crate | Password not stored in plain config. |
-| Config | TOML in `~/.config/wholeseek/` | Simple. |
+| Config | TOML in `~/.config/wholeseek/` (macOS: `~/Library/Application Support/wholeseek/`, Windows: `%APPDATA%\wholeseek\`) | Simple. |
 
 Rejected: slskd sidecar (.NET runtime, second process, AGPL); writing our own protocol (unnecessary given soulseek-rs-lib).
 

@@ -14,8 +14,21 @@ Search, browse, press ▶ to hear a track instantly, and press ↓ only if you w
   right where the files are: nothing is copied, and nothing is added to your shares.
 - **A good network citizen.** Logs in, shares your folders, serves uploads, maps its port.
 
-Linux only for now. Native GPU UI ([rune](https://github.com/anomalyco/rune)), protocol by
+Runs on Linux (x86_64), macOS (Apple Silicon) and Windows (x86_64, Windows 10+); downloads are
+on the [website](https://wholeseek.utilitygods.com) and the
+[releases page](https://github.com/Utility-Gods/wholeseek/releases). Native GPU UI
+([rune](https://github.com/anomalyco/rune)), protocol by
 [soulseek-rs](https://github.com/michel/soulseek-rs), audio by symphonia + cpal.
+
+## Platforms
+
+| | Download | First launch | Media keys |
+|---|---|---|---|
+| Linux x86_64 | `.tar.gz` (`./install.sh`) | — | MPRIS |
+| macOS Apple Silicon | `.dmg` | System Settings → Privacy & Security → Open Anyway | Now Playing |
+| Windows x86_64 | `.zip` (run `wholeseek.exe`) | SmartScreen: More info → Run anyway | not yet |
+
+The Mac and Windows builds are not signed, which is why each asks once on first launch.
 
 ## Build
 
@@ -40,6 +53,19 @@ packaging/macos/build-dmg.sh
 
 The DMG lands in `target/macos-dist/`. It is unsigned, so open it the first time with
 right-click → Open.
+
+### Windows (x86_64)
+
+With [rustup](https://rustup.rs) and the Visual Studio C++ build tools (MSVC + Windows SDK),
+`cargo run --release -p wholeseek` works as above. The release zip comes from Git Bash:
+
+```sh
+packaging/windows/build-zip.sh
+```
+
+It lands in `target/windows-dist/`. The SDK's `rc.exe` embeds the icon and version info.
+Settings live in `%APPDATA%\wholeseek\`, the password in Windows Credential Manager,
+downloads go to `Downloads\wholeseek`.
 
 ## Layout
 
