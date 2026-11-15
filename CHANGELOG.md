@@ -3,6 +3,14 @@
 Each release's section becomes its GitHub release notes and appears on
 https://wholeseek.utilitygods.com/changelog. Write for people using the app.
 
+## 0.1.6
+
+- wholeseek for Windows: download the .zip, unzip it and run wholeseek.exe (Windows 10 or 11, 64-bit). Nothing else to install.
+- First launch on Windows: if SmartScreen says "Windows protected your PC", choose More info → Run anyway.
+- Show in folder opens Explorer with the file selected.
+- Folder names that Windows doesn't allow are adjusted when you download them.
+- Media keys aren't supported on Windows yet.
+
 ## 0.1.5
 
 - Library: your own music in a tab. Albums, songs, instant search and stars (☆), with a Starred filter.
