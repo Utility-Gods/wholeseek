@@ -6,6 +6,7 @@
 
 pub mod cache;
 pub mod config;
+pub mod control;
 mod core;
 pub mod cover;
 mod event;
