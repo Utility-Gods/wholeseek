@@ -14,7 +14,7 @@ pub struct TransferId(pub u64);
 /// Audio attributes a peer advertises for a file (Soulseek attribute codes
 /// 0 bitrate, 1 duration, 2 VBR, 4 sample rate, 5 bit depth). Every field is
 /// optional because peers send any subset.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AudioAttrs {
     pub bitrate_kbps: Option<u32>,
     pub duration_secs: Option<u32>,
@@ -44,7 +44,7 @@ impl AudioAttrs {
 
 /// One file on a remote peer. `path` is the peer's full virtual path
 /// (backslash-separated), exactly what the protocol needs to request it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RemoteFile {
     pub username: String,
     pub path: String,
@@ -91,7 +91,7 @@ pub fn is_local_user(username: &str) -> bool {
 }
 
 /// One search hit with the responding peer's slot/speed figures.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SearchHit {
     pub file: RemoteFile,
     /// Peer reports a free upload slot (no queue).
@@ -232,6 +232,10 @@ pub struct Settings {
     /// into `<dir>/` when false (default, as in Nicotine+). Folder downloads
     /// always keep the folder name.
     pub single_file_subfolder: bool,
+    /// Minimum interval between agent-issued searches; config only.
+    pub cli_search_min_interval_secs: u64,
+    /// Maximum agent-issued searches per rolling hour; config only.
+    pub cli_search_per_hour: usize,
     /// Where persistent app data lives (download history,
     /// `history::HISTORY_FILE`). Read once at `Core::start`.
     pub data_dir: PathBuf,
@@ -287,6 +291,8 @@ impl Default for Settings {
             wishlist: Vec::new(),
             recent_download_dirs: Vec::new(),
             single_file_subfolder: false,
+            cli_search_min_interval_secs: crate::control::DEFAULT_SEARCH_INTERVAL_SECS,
+            cli_search_per_hour: crate::control::DEFAULT_SEARCHES_PER_HOUR,
             data_dir: dirs::data_dir()
                 .unwrap_or_else(|| home.join(".local").join("share"))
                 .join(crate::config::APP_NAME),

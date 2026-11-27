@@ -278,6 +278,20 @@ impl Core {
         id
     }
 
+    /// Enqueue an agent download into an already resolved destination directory.
+    /// Uses the ordinary worker transfer path without changing recent directories.
+    #[must_use]
+    pub fn download_agent_file(&self, file: &RemoteFile, dir: &Path) -> TransferId {
+        let id = TransferId(self.next());
+        self.send(Command::Fetch {
+            id,
+            file: file.clone(),
+            dir: dir.to_path_buf(),
+            kind: crate::model::TransferKind::Download,
+        });
+        id
+    }
+
     /// Additive: ↓ `file` into `dir` instead of the downloads folder
     /// ("Download to…"); flat or in `<remote folder name>/` as for
     /// [`Core::download`] (`Settings::single_file_subfolder`). Staging, `.part` handling and

@@ -63,6 +63,34 @@ impl Endpoint {
         Stream::new(socket, Duration::from_secs(60 * 60))
     }
 
+    /// Remove only an owner socket that has no live listener. The caller
+    /// must hold the cross-process session lease.
+    pub fn remove_stale(&self) -> io::Result<()> {
+        match self.private_parent(false) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            result => result?,
+        }
+        let meta = match fs::symlink_metadata(&self.0) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if !meta.file_type().is_socket() || meta.uid() != effective_uid() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "will not replace non-control file",
+            ));
+        }
+        match UnixStream::connect(&self.0) {
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "control socket is live",
+            )),
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => fs::remove_file(&self.0),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn bind(&self) -> io::Result<Listener> {
         self.private_parent(true)?;
         let server = UnixListener::bind(&self.0)?;
@@ -91,7 +119,7 @@ pub struct Listener {
 }
 
 impl Listener {
-    pub fn accept(&self) -> io::Result<Option<Stream>> {
+    pub fn accept(&mut self) -> io::Result<Option<Stream>> {
         match self.server.accept() {
             Ok((socket, _)) => {
                 check_peer(&socket)?;
@@ -140,7 +168,7 @@ impl Write for Stream {
     }
 }
 
-fn effective_uid() -> u32 {
+pub(super) fn effective_uid() -> u32 {
     unsafe extern "C" {
         fn geteuid() -> u32;
     }
@@ -228,7 +256,7 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
-    fn accept(listener: &Listener) -> Stream {
+    fn accept(listener: &mut Listener) -> Stream {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             if let Some(stream) = listener.accept().unwrap() {
@@ -246,19 +274,19 @@ mod tests {
     fn unix_round_trip_and_whitelist_rejection() {
         let tmp = tempfile::tempdir().unwrap();
         let mut endpoint = Endpoint::new(&tmp.path().join("agent"), "control").unwrap();
-        let listener = endpoint.bind().unwrap();
+        let mut listener = endpoint.bind().unwrap();
         assert!(listener.accept().unwrap().is_none());
         assert_eq!(
             fs::symlink_metadata(&endpoint.0).unwrap().mode() & 0o777,
             0o600
         );
         let server = thread::spawn(move || {
-            transport::serve(&mut accept(&listener), |request| {
+            transport::serve(&mut accept(&mut listener), |request| {
                 assert_eq!(request.command, Operation::Status);
                 Response::success(json!({"mode": "app", "connected": true}))
             })
             .unwrap();
-            transport::serve(&mut accept(&listener), |_| {
+            transport::serve(&mut accept(&mut listener), |_| {
                 panic!("forbidden request dispatched")
             })
             .unwrap();

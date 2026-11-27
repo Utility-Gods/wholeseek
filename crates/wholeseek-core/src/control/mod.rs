@@ -2,6 +2,8 @@
 
 mod client;
 mod data;
+pub mod engine;
+pub mod ownership;
 mod protocol;
 mod state;
 pub mod transport;

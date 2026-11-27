@@ -498,6 +498,8 @@ pub(crate) mod tests {
             wishlist: vec!["wasn't me".into()],
             recent_download_dirs: vec!["/elsewhere".into()],
             single_file_subfolder: true,
+            cli_search_min_interval_secs: 20,
+            cli_search_per_hour: 50,
             data_dir: "/data".into(),
             check_updates: false,
             dismissed_update: Some("0.1.4".into()),
