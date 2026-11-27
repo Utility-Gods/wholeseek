@@ -36,7 +36,9 @@ struct Local {
 
 impl Local {
     fn system() -> io::Result<Self> {
-        let owner = Ownership::new(config::config_dir().join("agent-control"))?;
+        // A sibling of the settings directory: creating the lock must not
+        // suppress the first-run migration from the legacy config directory.
+        let owner = Ownership::new(config::BaseDirs::system().config.join("wholeseek-control"))?;
         #[cfg(unix)]
         let endpoint = Endpoint::new(
             &dirs::runtime_dir()
@@ -392,19 +394,56 @@ fn daemon_log(path: &std::path::Path, text: &str) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use wholeseek_core::control::{Operation, StatusData};
 
     #[test]
     fn existing_app_connection_never_starts_a_daemon_or_probes_the_login_lock() {
-        let socket = connect_or_start(
-            || Ok("existing app socket"),
-            || panic!("must never probe ownership when app is reachable"),
-            || panic!("must never start a second login"),
-            START_TIMEOUT,
-        )
-        .unwrap();
-        assert_eq!(socket, "existing app socket");
+        let root = std::env::temp_dir().join(format!(
+            "wc-{:x}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let local = Local {
+            endpoint: Endpoint::new(&root.join("s"), "c").unwrap(),
+            owner: Ownership::new(root.join("state")).unwrap(),
+        };
+        let lease = local.owner.session().unwrap().unwrap();
+        let app = local.bind_owned(&lease).unwrap();
+        let client = thread::spawn(move || {
+            let mut socket = connect_or_start(
+                || local.endpoint.connect(),
+                || panic!("must never probe ownership when app is reachable"),
+                || panic!("must never start a second login"),
+                START_TIMEOUT,
+            )
+            .unwrap();
+            control::transport::exchange(&mut socket, &Request::new(Operation::Status)).unwrap()
+        });
+        let (request, reply) = app.inbox.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(request.command, Operation::Status);
+        reply
+            .send(Response::success(
+                serde_json::to_value(StatusData {
+                    connected: true,
+                    mode: Mode::App,
+                    idle_timeout_secs: None,
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(client.join().unwrap().data.unwrap()["mode"], "app");
     }
 }
