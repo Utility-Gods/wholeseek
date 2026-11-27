@@ -3,6 +3,14 @@
 Each release's section becomes its GitHub release notes and appears on
 https://wholeseek.utilitygods.com/changelog. Write for people using the app.
 
+## 0.1.7
+
+- A command line for scripts and AI agents (Linux and macOS): search, browse a user, download, check transfers, try another source, cancel. Nothing else: no chat, settings, shares, uploads, library or playback.
+- It uses your saved login. If the app is open it works through the app; if not, a small background helper starts by itself and quits when idle. Only one Soulseek login is ever used.
+- Open the app while the helper is downloading and the downloads move over to the app.
+- Agent searches are rate limited so they stay polite to the network.
+- The guide for agents is in docs/CLI.md.
+
 ## 0.1.6
 
 - wholeseek for Windows: download the .zip, unzip it and run wholeseek.exe (Windows 10 or 11, 64-bit). Nothing else to install.
