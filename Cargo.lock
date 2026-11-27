@@ -4869,6 +4869,7 @@ dependencies = [
  "ureq",
  "wholeseek-audio",
  "wholeseek-core",
+ "windows-sys 0.61.2",
  "zbus 5.19.0",
 ]
 
