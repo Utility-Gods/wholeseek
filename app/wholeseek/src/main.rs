@@ -581,7 +581,9 @@ fn main() {
                 }
             });
         }
-        if cli::is_command(first) {
+        // Any bare word is a command attempt: the strict parser answers unknown ones (`chat`,
+        // `settings`...) with a usage error instead of opening the window. `-` flags stay Rune's.
+        if cli::is_command(first) || !first.starts_with('-') {
             let mut caller = control::SocketCaller;
             std::process::exit(cli::run(&args[1..], &mut caller));
         }
