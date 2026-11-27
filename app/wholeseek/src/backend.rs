@@ -175,7 +175,10 @@ impl RealBackend {
     /// # Errors
     /// If the core's worker thread cannot be spawned.
     pub fn start(settings: Settings) -> std::io::Result<Self> {
+        #[cfg(unix)]
         let control = crate::control::take_app_host()?;
+        #[cfg(windows)]
+        let control = crate::control::take_app_host();
         let (core, events) = Core::start(settings)?;
         Ok(Self {
             core,

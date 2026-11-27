@@ -16,6 +16,7 @@
 mod actions;
 mod app;
 mod backend;
+#[cfg(unix)]
 mod cli;
 mod control;
 mod demo;
@@ -569,6 +570,7 @@ fn main() {
     // argv[1] decides the path before anything else starts: Rune, logging, the demo flag. The
     // agent CLI never touches the window or the audio stack.
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(unix)]
     if let Some(first) = args.get(1) {
         if first == "daemon" {
             // Hidden process entry point, not listed in --help. `control::daemon` sets up its own
@@ -589,6 +591,19 @@ fn main() {
         }
     }
 
+    #[cfg(windows)]
+    if args
+        .get(1)
+        .is_some_and(|first| !first.starts_with('-') || first == "--help" || first == "-h")
+    {
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        // SAFETY: this only attempts to attach this process to its parent console.
+        // It is never called for a normal app launch.
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+        eprintln!("the command line isn't available on Windows yet");
+        std::process::exit(1);
+    }
+
     let demo = std::env::args().any(|a| a == "--demo");
     let _ = DEMO.set(demo);
     if !demo {
@@ -599,6 +614,7 @@ fn main() {
         }
         // One Soulseek login per machine: take the session lock (asking a running background
         // helper to hand over) before anything can log in.
+        #[cfg(unix)]
         if let Err(e) = control::prepare_app() {
             eprintln!("wholeseek: {e}");
             std::process::exit(1);
