@@ -20,6 +20,13 @@ on the [website](https://wholeseek.utilitygods.com) and the
 ([rune](https://github.com/anomalyco/rune)), protocol by
 [soulseek-rs](https://github.com/michel/soulseek-rs), audio by symphonia + cpal.
 
+## Command line for agents (Linux and macOS)
+
+`wholeseek search | browse | download | transfers | retry | status | cancel`, with `--json`.
+That is the whole surface: no chat, settings, shares, uploads, library or playback. It uses the
+login saved by the app and one Soulseek session at a time (the app, or a background helper that
+starts on demand). See [docs/CLI.md](docs/CLI.md).
+
 ## Platforms
 
 | | Download | First launch | Media keys |

@@ -396,6 +396,123 @@ fn dir(name: &str, files: &[&str]) -> SharedDirectory {
     }
 }
 
+#[test]
+fn daemon_handover_requeues_cli_download_in_app_and_preserves_origin() {
+    use crate::control::engine::Engine;
+    use crate::control::ownership::Ownership;
+    use crate::control::{
+        DownloadArgs, IdArgs, Mode, Operation, Request, Target, TransferOrigin, TransferState,
+        TransfersData,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let owner = Ownership::new(root.path().join("control")).unwrap();
+    let daemon_lease = owner.session().unwrap().unwrap();
+    let h = harness();
+    let session = Arc::new(FakeSession::default());
+    h.script(Ok(session.clone()));
+    h.core.login(creds());
+    let mut daemon = Engine::open(owner.directory(), Mode::Daemon, true).unwrap();
+    daemon.event(
+        &h.core,
+        &h.want("daemon login", |event| {
+            matches!(event, CoreEvent::Connected { .. })
+        }),
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let folder = r"Music\Album";
+    let path = r"Music\Album\01.flac";
+    daemon.request(
+        &h.core,
+        Request::new(Operation::Download(DownloadArgs {
+            target: Target::Path {
+                user: "alice".into(),
+                path: path.into(),
+            },
+            to: None,
+            wait: false,
+        })),
+        tx,
+    );
+    wait_until("browse requested", || {
+        session.st().browse_requests.len() == 1
+    });
+    session
+        .st()
+        .browses
+        .insert("alice".into(), vec![dir(folder, &["01.flac"])]);
+    let listing = h.want("remote listing", |event| {
+        matches!(event, CoreEvent::BrowseResult { .. })
+    });
+    daemon.event(&h.core, &listing);
+    let queued = h.want("daemon queued", |event| {
+        matches!(event, CoreEvent::TransferQueued { .. })
+    });
+    daemon.event(&h.core, &queued);
+    daemon.tick(&h.core);
+    let response = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let data: TransfersData = serde_json::from_value(response.data.unwrap()).unwrap();
+    let original = &data.transfers[0];
+    assert_eq!(original.state, TransferState::Queued);
+    assert_eq!(original.origin, TransferOrigin::Cli);
+
+    let intent = owner.app_intent().unwrap().unwrap();
+    assert!(owner.app_is_waiting().unwrap());
+    assert!(owner.session().unwrap().is_none());
+    let settings = h.core.settings().clone();
+    drop(h.core);
+    daemon.save_handover(&Default::default()).unwrap();
+    drop(daemon);
+    drop(daemon_lease);
+
+    let _app_lease = owner.session().unwrap().unwrap();
+    drop(intent);
+    assert!(!owner.app_is_waiting().unwrap());
+    let app = harness_with(|s, _| *s = settings);
+    let app_session = Arc::new(FakeSession::default());
+    app.script(Ok(app_session.clone()));
+    let mut control = Engine::open(owner.directory(), Mode::App, false).unwrap();
+    app.core.login(creds());
+    control.event(
+        &app.core,
+        &app.want("app login", |event| {
+            matches!(event, CoreEvent::Connected { .. })
+        }),
+    );
+    let queued = app.want("app queued", |event| {
+        matches!(event, CoreEvent::TransferQueued { .. })
+    });
+    assert!(matches!(&queued, CoreEvent::TransferQueued { file, .. } if file.path == path));
+    control.event(&app.core, &queued);
+    control.tick(&app.core);
+    assert!(!owner.handover_path().exists());
+    wait_until("app peer download", || {
+        app_session.st().downloads.len() == 1
+    });
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    control.request(
+        &app.core,
+        Request::new(Operation::Cancel(IdArgs {
+            id: original.id.clone(),
+        })),
+        tx,
+    );
+    control.event(
+        &app.core,
+        &app.want("app cancelled transferred work", |event| {
+            matches!(event, CoreEvent::TransferCancelled { .. })
+        }),
+    );
+    control.tick(&app.core);
+    let response = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let data: TransfersData = serde_json::from_value(response.data.unwrap()).unwrap();
+    assert_eq!(data.transfers[0].id, original.id);
+    assert_eq!(data.transfers[0].origin, TransferOrigin::Cli);
+    assert_eq!(data.transfers[0].state, TransferState::Cancelled);
+}
+
 /// Every regular file under `dir`, recursively.
 fn files_under(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();

@@ -2,7 +2,7 @@
 //! Both are driven the same way: commands return at once, events are drained each frame.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver};
 
 use wholeseek_core::{
     Core, CoreEvent, Credentials, DownloadedKeys, HistoryEntry, HistoryQuery, PlayTicket,
@@ -168,14 +168,23 @@ pub trait Backend {
 pub struct RealBackend {
     core: Core,
     events: Receiver<CoreEvent>,
+    control: crate::control::Host,
 }
 
 impl RealBackend {
     /// # Errors
     /// If the core's worker thread cannot be spawned.
     pub fn start(settings: Settings) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let control = crate::control::take_app_host()?;
+        #[cfg(windows)]
+        let control = crate::control::take_app_host();
         let (core, events) = Core::start(settings)?;
-        Ok(Self { core, events })
+        Ok(Self {
+            core,
+            events,
+            control,
+        })
     }
 }
 
@@ -275,14 +284,18 @@ impl Backend for RealBackend {
     }
     fn drain(&mut self, _now: f64) -> Vec<CoreEvent> {
         let mut out = Vec::new();
-        loop {
-            match self.events.try_recv() {
-                Ok(e) => out.push(e),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return out,
-            }
+        while let Ok(e) = self.events.try_recv() {
+            self.control.event(&self.core, &e);
+            out.push(e);
         }
+        self.control.step(&self.core);
+        out
+    }
+    fn next_tick(&self) -> Option<f64> {
+        self.control.next_tick()
     }
     fn set_waker(&mut self, wake: rune::Waker) {
+        self.control.set_waker(wake.clone());
         // Swap in a forwarded channel: the thread owns the core's receiver and blocks on it.
         let (tx, rx) = mpsc::channel();
         let from_core = std::mem::replace(&mut self.events, rx);

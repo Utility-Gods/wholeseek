@@ -16,6 +16,9 @@
 mod actions;
 mod app;
 mod backend;
+#[cfg(unix)]
+mod cli;
+mod control;
 mod demo;
 mod demo_big;
 mod demo_history;
@@ -564,6 +567,43 @@ fn scene_rejected(s: &mut App) {
 }
 
 fn main() {
+    // argv[1] decides the path before anything else starts: Rune, logging, the demo flag. The
+    // agent CLI never touches the window or the audio stack.
+    let args: Vec<String> = std::env::args().collect();
+    #[cfg(unix)]
+    if let Some(first) = args.get(1) {
+        if first == "daemon" {
+            // Hidden process entry point, not listed in --help. `control::daemon` sets up its own
+            // log file.
+            std::process::exit(match control::daemon() {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("wholeseek: daemon exited ({e})");
+                    1
+                }
+            });
+        }
+        // Any bare word is a command attempt: the strict parser answers unknown ones (`chat`,
+        // `settings`...) with a usage error instead of opening the window. `-` flags stay Rune's.
+        if cli::is_command(first) || !first.starts_with('-') {
+            let mut caller = control::SocketCaller;
+            std::process::exit(cli::run(&args[1..], &mut caller));
+        }
+    }
+
+    #[cfg(windows)]
+    if args
+        .get(1)
+        .is_some_and(|first| !first.starts_with('-') || first == "--help" || first == "-h")
+    {
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        // SAFETY: this only attempts to attach this process to its parent console.
+        // It is never called for a normal app launch.
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+        eprintln!("the command line isn't available on Windows yet");
+        std::process::exit(1);
+    }
+
     let demo = std::env::args().any(|a| a == "--demo");
     let _ = DEMO.set(demo);
     if !demo {
@@ -571,6 +611,13 @@ fn main() {
         // (the core, player and window all start after this). It only sets LOG_FILE (G13).
         if let Err(e) = unsafe { config::init_logging(&config::default_log_path()) } {
             eprintln!("wholeseek: protocol log stays on stderr ({e})");
+        }
+        // One Soulseek login per machine: take the session lock (asking a running background
+        // helper to hand over) before anything can log in.
+        #[cfg(unix)]
+        if let Err(e) = control::prepare_app() {
+            eprintln!("wholeseek: {e}");
+            std::process::exit(1);
         }
     }
     // X11 WM_CLASS / Wayland app_id: the desktop matches the window to wholeseek.desktop
