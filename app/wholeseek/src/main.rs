@@ -16,6 +16,8 @@
 mod actions;
 mod app;
 mod backend;
+mod cli;
+mod control;
 mod demo;
 mod demo_big;
 mod demo_history;
@@ -564,6 +566,27 @@ fn scene_rejected(s: &mut App) {
 }
 
 fn main() {
+    // argv[1] decides the path before anything else starts: Rune, logging, the demo flag. The
+    // agent CLI never touches the window or the audio stack.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(first) = args.get(1) {
+        if first == "daemon" {
+            // Hidden process entry point, not listed in --help. `control::daemon` sets up its own
+            // log file.
+            std::process::exit(match control::daemon() {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("wholeseek: daemon exited ({e})");
+                    1
+                }
+            });
+        }
+        if cli::is_command(first) {
+            let mut caller = control::SocketCaller;
+            std::process::exit(cli::run(&args[1..], &mut caller));
+        }
+    }
+
     let demo = std::env::args().any(|a| a == "--demo");
     let _ = DEMO.set(demo);
     if !demo {
@@ -571,6 +594,12 @@ fn main() {
         // (the core, player and window all start after this). It only sets LOG_FILE (G13).
         if let Err(e) = unsafe { config::init_logging(&config::default_log_path()) } {
             eprintln!("wholeseek: protocol log stays on stderr ({e})");
+        }
+        // One Soulseek login per machine: take the session lock (asking a running background
+        // helper to hand over) before anything can log in.
+        if let Err(e) = control::prepare_app() {
+            eprintln!("wholeseek: {e}");
+            std::process::exit(1);
         }
     }
     // X11 WM_CLASS / Wayland app_id: the desktop matches the window to wholeseek.desktop
